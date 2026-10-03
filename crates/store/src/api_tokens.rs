@@ -462,6 +462,13 @@ impl RawApiToken {
     /// This is `ody_` plus 4 base64 characters: **24 bits**. By the birthday
     /// bound roughly 4096 live tokens give a ≥50% chance of one prefix collision,
     /// which is exactly why a prefix maps to a *list* of candidates.
+    ///
+    /// Slices rather than using `.chars()`, which is only safe because
+    /// [`RawApiToken::from_client`] rejects any token containing a non-ASCII byte
+    /// and every token minted here is ASCII. Both invariants are asserted in tests;
+    /// a client token that reached this method unvalidated would panic on a
+    /// multi-byte boundary, and `panic = "abort"` in the release profile would take
+    /// the whole process down on an unauthenticated request.
     #[must_use]
     pub fn prefix(&self) -> &str {
         &self.0[..PREFIX_CHARS]
@@ -480,12 +487,28 @@ impl RawApiToken {
     ///
     /// # Errors
     ///
-    /// Returns [`TokenError::Hash`] if the string is outside `app.py:421`'s
-    /// `12 <= len <= 100` bound, which is a cheap pre-filter before any DB or
-    /// bcrypt work.
+    /// Returns [`TokenError::Hash`] unless the string is a plausible token:
+    /// outside `app.py:421`'s `12 <= len <= 100` bound, not starting with `ody_`,
+    /// or containing a non-ASCII byte.
+    ///
+    /// The last check is not cosmetic. `prefix()` slices at byte 8, and a token
+    /// like `ody_ああab` is 12 *bytes* — long enough to pass a length-only bound —
+    /// with byte 8 in the middle of a 3-byte character. Slicing there panics, and
+    /// `Cargo.toml` sets `panic = "abort"` for release, so an unauthenticated
+    /// `Authorization` header would abort the server. Python is immune: it slices
+    /// by character, yielding a prefix that simply matches nothing.
+    ///
+    /// Counting ASCII bytes also settles the bytes-vs-characters question, since for
+    /// an all-ASCII string the two agree.
     pub fn from_client(raw: &str) -> Result<Self, TokenError> {
         if !(MIN_TOKEN_LEN..=MAX_TOKEN_LEN).contains(&raw.len()) {
             return Err(TokenError::Hash("implausible token length".into()));
+        }
+        if !raw.is_ascii() {
+            return Err(TokenError::Hash("token contains non-ascii bytes".into()));
+        }
+        if !raw.starts_with(TOKEN_PREFIX) {
+            return Err(TokenError::Hash("token has the wrong prefix".into()));
         }
         Ok(Self(raw.into()))
     }
@@ -624,10 +647,15 @@ pub fn format_timestamp(secs: i64) -> String {
 
 /// Parses a SQLAlchemy naive-UTC timestamp back to Unix seconds.
 ///
-/// # Errors
+/// Returns `None` for anything unparseable **or out of range**; callers treat that
+/// as "no timestamp" rather than failing, because a `NULL` column is legitimate.
 ///
-/// Returns `None` for anything unparseable; callers treat that as "no timestamp"
-/// rather than failing, because a `NULL` column is legitimate.
+/// Range validation is not pedantry. `"2025-13-45 99:99:99"` parses as six separate
+/// integers, and without bounds checks `days_from_civil` would silently roll the
+/// overflow into the next day while this still returned `Some`. An absurd year is
+/// worse: `era * 146_097` overflows `i64`, which is a debug panic and a silent wrap
+/// in release. Both need a hand-edited database to reach, but this is a
+/// `Result`-shaped hole in code that otherwise looks total.
 #[must_use]
 pub fn parse_timestamp(text: &str) -> Option<i64> {
     let (date, time) = text.trim().split_once(' ')?;
@@ -649,6 +677,19 @@ pub fn parse_timestamp(text: &str) -> Option<i64> {
         .next()?
         .parse()
         .ok()?;
+
+    // The year range keeps `era * 146_097` well inside i64; the rest rejects the
+    // "13th month, 99th hour" shape that would otherwise be normalised away into a
+    // plausible-looking wrong instant.
+    if !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
 
     Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
 }
@@ -778,7 +819,7 @@ pub struct VerifiedToken {
 /// `app.py`.
 #[derive(Debug)]
 pub struct PrefixCache {
-    map: RwLock<HashMap<String, Box<[Candidate]>>>,
+    map: RwLock<HashMap<String, Arc<[Candidate]>>>,
     /// Generation the map in `map` was built for.
     built_at: AtomicU64,
     /// Generation of the newest mutation.
@@ -819,7 +860,25 @@ impl PrefixCache {
     }
 
     /// Installs a freshly built map, recording the generation it covers.
-    pub fn swap(&self, built: HashMap<String, Box<[Candidate]>>, for_generation: u64) {
+    pub fn swap(&self, built: HashMap<String, Arc<[Candidate]>>, for_generation: u64) {
+        // Refuse to install a map that a mutation has already made obsolete.
+        //
+        // Without this check there is a bounded fail-open window. Two rebuilds can
+        // overlap: R1 reads generation G and queries, a mutation commits and bumps
+        // to G+1, R2 queries the newer state and installs it, and then R1 installs
+        // its *older* snapshot over the top -- after which R1's own
+        // `candidates()` lookup can still authenticate a token the mutation
+        // revoked. Skipping the stale install leaves the cache stale, and the next
+        // request rebuilds again, which is the safe direction.
+        if for_generation != self.current.load(Ordering::SeqCst) {
+            tracing::debug!(
+                built_for = for_generation,
+                current = self.current.load(Ordering::SeqCst),
+                "discarding an obsolete api token cache rebuild"
+            );
+            return;
+        }
+
         // Build fully, then take the write lock once: a reader holding the read
         // lock can never observe a half-built map. This is what
         // `tests/test_token_cache_atomic_swap.py` checks.
@@ -830,17 +889,24 @@ impl PrefixCache {
         self.built_at.store(for_generation, Ordering::SeqCst);
     }
 
-    /// Candidates for a prefix. `None` when absent.
+    /// Candidates for a prefix, as a shared slice. `None` when absent.
+    ///
+    /// Returns the `Arc` rather than a `Vec<Candidate>` so the per-request cost is a
+    /// refcount bump instead of N string allocations. Python does
+    /// `list(_token_cache.get(prefix, ()))` -- a shallow copy -- but it holds
+    /// *references* to the rows rather than copies of the hashes, so cloning the
+    /// strings here would be strictly worse than the code being ported, and this is
+    /// the authentication hot path (AGENTS.md §12, §12.1 rule 6).
     ///
     /// Takes a read lock only; the guard is dropped before returning, so a caller
     /// cannot hold it across an `.await`.
     #[must_use]
-    pub fn candidates(&self, prefix: &str) -> Option<Vec<Candidate>> {
+    pub fn candidates(&self, prefix: &str) -> Option<Arc<[Candidate]>> {
         let map = self
             .map
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.get(prefix).map(|c| c.to_vec())
+        map.get(prefix).cloned()
     }
 
     /// How many prefixes are cached.
@@ -1059,6 +1125,17 @@ impl ApiTokenStore {
 
     /// Whether `token_id` grants `scope`. **Blocking.**
     ///
+    /// Requires `is_active = 1`. A revoked token's scopes are stored unchanged, so a
+    /// check that ignored the flag would keep reporting them as granted — and since
+    /// this is the natural call a scope guard makes, wiring it up naively would mean
+    /// `has_scope` returning `true` for a revoked token.
+    ///
+    /// It does **not** check ownership. `src/auth_helpers.py:60-75` additionally
+    /// requires a non-empty owner and returns 403 without it, which cannot be
+    /// expressed here because this takes a bare id. A caller acting on the answer
+    /// must therefore compare the token's owner itself, and the natural pairing is
+    /// [`ApiTokenStore::verify`] first, which resolves the owner in the same result.
+    ///
     /// Plain membership against the stored list, with **no** revalidation against
     /// [`Scope::ALL`]. That matches Python, and both halves matter:
     ///
@@ -1076,14 +1153,22 @@ impl ApiTokenStore {
     /// Propagates [`TokenError::NoSuchToken`] and [`TokenError::Store`].
     pub fn has_scope_blocking(&self, token_id: &str, scope: &Scope) -> Result<bool, TokenError> {
         let conn = self.store.connect()?;
-        let stored: Option<String> = conn
+        // `Option<i64>`, because the column is nullable with no `NOT NULL` and a
+        // NULL must deny. Reading it as `i64` would make the whole check error on a
+        // revoked-but-null row instead of refusing.
+        let row: Option<(String, Option<i64>)> = conn
             .query_row(
-                "SELECT scopes FROM api_tokens WHERE id = ?1",
+                "SELECT scopes, is_active FROM api_tokens WHERE id = ?1",
                 params![token_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let stored = stored.ok_or_else(|| TokenError::NoSuchToken(token_id.to_owned()))?;
+        let Some((stored, active)) = row else {
+            return Err(TokenError::NoSuchToken(token_id.to_owned()));
+        };
+        if active != Some(1) {
+            return Ok(false);
+        }
         Ok(split_scopes(Some(&stored))
             .iter()
             .any(|s| s.as_str() == scope.as_str()))
@@ -1326,7 +1411,7 @@ impl ApiTokenStore {
             return Ok(None);
         };
 
-        for candidate in &candidates {
+        for candidate in candidates.iter() {
             match candidate.verify(&token) {
                 Ok(true) => {
                     return Ok(Some(VerifiedToken {
@@ -1434,9 +1519,9 @@ impl ApiTokenStore {
             candidates.sort_by(|a, b| a.id.cmp(&b.id));
         }
 
-        let boxed: HashMap<String, Box<[Candidate]>> = built
+        let boxed: HashMap<String, Arc<[Candidate]>> = built
             .into_iter()
-            .map(|(prefix, candidates)| (prefix, candidates.into_boxed_slice()))
+            .map(|(prefix, candidates)| (prefix, Arc::from(candidates.into_boxed_slice())))
             .collect();
         self.cache.swap(boxed, target_generation);
         Ok(total)
@@ -1611,12 +1696,74 @@ mod tests {
     }
 
     #[test]
-    fn a_token_outside_the_length_bounds_is_refused_before_any_db_work() {
-        // app.py:421
-        assert!(RawApiToken::from_client(&"a".repeat(11)).is_err());
-        assert!(RawApiToken::from_client(&"a".repeat(101)).is_err());
-        assert!(RawApiToken::from_client(&"a".repeat(12)).is_ok());
-        assert!(RawApiToken::from_client(&"a".repeat(100)).is_ok());
+    fn a_client_token_must_be_plausible_before_any_db_work() {
+        // app.py:421 bounds the length as a cheap pre-filter.
+        assert!(
+            RawApiToken::from_client(&"a".repeat(11)).is_err(),
+            "too short"
+        );
+        assert!(
+            RawApiToken::from_client(&"a".repeat(101)).is_err(),
+            "too long"
+        );
+
+        // A well-formed token passes.
+        let good = mint_raw_token().expect("mint");
+        assert!(RawApiToken::from_client(good.expose()).is_ok());
+    }
+
+    #[test]
+    fn a_non_ascii_client_token_is_refused_rather_than_panicking() {
+        // Regression. `prefix()` slices at byte 8, and `from_client` used to accept
+        // any string within the length bounds. `"ody_ああab"` is 12 *bytes* -- long
+        // enough to pass -- with byte 8 inside a 3-byte character, so calling
+        // `prefix()` on it panicked. `panic = "abort"` in the release profile means
+        // an unauthenticated `Authorization` header would abort the process.
+        let sneaky = "ody_ああab";
+        assert_eq!(sneaky.len(), 12, "the attack needs to pass a length check");
+        assert!(
+            RawApiToken::from_client(sneaky).is_err(),
+            "a multi-byte token must be refused, not sliced"
+        );
+
+        // Every single-byte-mutation of a valid token must either be refused or safe
+        // to call `prefix()` on. This is the general form of the same hazard.
+        let good = mint_raw_token().expect("mint");
+        for byte in good.expose().bytes().chain([0x80, 0xff, 0xc3]) {
+            let mut raw = good.expose().as_bytes().to_vec();
+            let index = 5.min(raw.len() - 1);
+            raw[index] = byte;
+            // Non-UTF-8 input cannot even be constructed as a str, so only check the
+            // cases that do form a str.
+            if let Ok(text) = std::str::from_utf8(&raw)
+                && let Ok(token) = RawApiToken::from_client(text)
+            {
+                let _ = token.prefix();
+            }
+        }
+
+        // And the wrong scheme prefix is refused too.
+        assert!(
+            RawApiToken::from_client(&format!("xyz_{}", "a".repeat(43))).is_err(),
+            "a token without the ody_ prefix must be refused"
+        );
+    }
+
+    #[test]
+    fn a_client_token_without_the_scheme_prefix_is_refused() {
+        // Python does not check this -- an unknown prefix simply matches no
+        // candidates and 401s. Refusing here saves the DB round trip and makes the
+        // accept-set explicit.
+        for bad in [
+            "aaaaaaaaaaaa",
+            "odyXaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ODY_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(
+                RawApiToken::from_client(bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
     }
 
     // -- bcrypt input -------------------------------------------------------
@@ -2225,6 +2372,9 @@ mod tests {
     fn the_swap_never_exposes_a_partially_built_map() {
         // tests/test_token_cache_atomic_swap.py: a reader holding the read lock
         // sees either the whole old map or the whole new one.
+        const PREFIXES: usize = 8;
+        const PER_PREFIX: usize = 2;
+
         let cache = Arc::new(PrefixCache::new());
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -2234,10 +2384,15 @@ mod tests {
             std::thread::spawn(move || {
                 let mut observations = 0usize;
                 while !stop.load(Ordering::SeqCst) {
-                    // Any prefix present must have a complete candidate slice.
-                    for (prefix, candidates) in visible(&cache) {
-                        assert!(!prefix.is_empty());
-                        assert!(!candidates.is_empty(), "empty slice for {prefix}");
+                    // Wholly empty or wholly populated -- never in between.
+                    let seen = visible(&cache);
+                    assert!(
+                        seen.is_empty() || seen.len() == PREFIXES,
+                        "a reader saw {} of {PREFIXES} prefixes: {seen:?}",
+                        seen.len()
+                    );
+                    for (prefix, candidates) in seen {
+                        assert_eq!(candidates, PER_PREFIX, "partial slice for {prefix}");
                     }
                     observations += 1;
                 }
@@ -2245,29 +2400,23 @@ mod tests {
             })
         };
 
+        // The Python assertion being ported: `assert len(_token_cache) == 0` fails
+        // for any clear-then-refill implementation (`test_token_cache_atomic_swap.py:138`).
+        let mut built: HashMap<String, Arc<[Candidate]>> = HashMap::new();
         for round in 0..200u32 {
-            let mut built = HashMap::new();
-            for i in 0..8 {
-                built.insert(
-                    format!("p{i}"),
-                    vec![
-                        Candidate {
-                            id: format!("{round}-{i}a"),
-                            token_hash: "h".into(),
-                            owner: "alice".into(),
-                            scopes: Scope::ALL[..1].iter().map(|s| Scope((*s).into())).collect(),
-                        },
-                        Candidate {
-                            id: format!("{round}-{i}b"),
-                            token_hash: "h".into(),
-                            owner: "alice".into(),
-                            scopes: Scope::ALL[..2].iter().map(|s| Scope((*s).into())).collect(),
-                        },
-                    ]
-                    .into_boxed_slice(),
-                );
+            built.clear();
+            for i in 0..PREFIXES {
+                let candidates: Vec<Candidate> = (0..PER_PREFIX)
+                    .map(|slot| Candidate {
+                        id: format!("{round}-{i}-{slot}"),
+                        token_hash: "h".into(),
+                        owner: "alice".into(),
+                        scopes: Scope::ALL[..1].iter().map(|s| Scope((*s).into())).collect(),
+                    })
+                    .collect();
+                built.insert(format!("p{i}"), Arc::from(candidates.into_boxed_slice()));
             }
-            cache.swap(built, cache.current.load(Ordering::SeqCst));
+            cache.swap(built.clone(), cache.current.load(Ordering::SeqCst));
         }
 
         stop.store(true, Ordering::SeqCst);
@@ -2276,12 +2425,12 @@ mod tests {
     }
 
     /// Snapshot every prefix currently visible, for the atomic-swap test.
-    fn visible(cache: &PrefixCache) -> Vec<(String, Vec<Candidate>)> {
+    fn visible(cache: &PrefixCache) -> Vec<(String, usize)> {
         let map = cache
             .map
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.iter().map(|(k, v)| (k.clone(), v.to_vec())).collect()
+        map.iter().map(|(k, v)| (k.clone(), v.len())).collect()
     }
 
     #[test]
@@ -2571,5 +2720,168 @@ mod tests {
             api.list_blocking("alice").expect("list")[0].last_used_at,
             Some(1_758_000_000)
         );
+    }
+
+    #[test]
+    fn a_revoked_token_grants_no_scopes() {
+        // `has_scope` is the natural call a scope guard makes, so if it ignored
+        // `is_active` a revoked token would keep reporting its scopes as granted.
+        let (_dir, api) = store_with_clock();
+        let created = api
+            .create_blocking(new_token("n8n", "alice"), &owners(&tokens()))
+            .expect("create");
+        let chat = Scope::parse("chat").expect("scope");
+
+        assert!(
+            api.has_scope_blocking(&created.record.id, &chat)
+                .expect("has_scope"),
+            "an active token grants its scope"
+        );
+
+        api.set_active_blocking(&created.record.id, false)
+            .expect("revoke");
+        assert!(
+            !api.has_scope_blocking(&created.record.id, &chat)
+                .expect("has_scope"),
+            "a revoked token must grant nothing"
+        );
+
+        // And for the other non-1 values, including the NULL that fails Python's
+        // `is_active == True` predicate.
+        for raw in ["0", "NULL", "2"] {
+            let sql = if raw == "NULL" {
+                "UPDATE api_tokens SET is_active = NULL WHERE id = ?1".to_owned()
+            } else {
+                format!("UPDATE api_tokens SET is_active = {raw} WHERE id = ?1")
+            };
+            let conn = api.store.connect().expect("conn");
+            conn.execute(&sql, params![created.record.id])
+                .expect("write");
+            assert!(
+                !api.has_scope_blocking(&created.record.id, &chat)
+                    .expect("has_scope"),
+                "is_active = {raw} must grant nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cache_rebuild_obsoleted_by_a_mutation_is_discarded() {
+        // Two rebuilds overlap: R1 targets generation G and queries, a mutation bumps
+        // to G+1, R2 installs the newer map, and R1 then installs its older snapshot.
+        // Installing it would let R1's *own* following lookup authenticate a token the
+        // mutation revoked -- a bounded fail-open window, and the reason `swap` checks
+        // the generation rather than trusting the caller.
+        let (_dir, api) = store_with_clock();
+        let created = api
+            .create_blocking(new_token("n8n", "alice"), &owners(&tokens()))
+            .expect("create");
+        api.rebuild_cache_blocking(&owners(&tokens()))
+            .expect("rebuild");
+        let good_prefixes = api.cache().prefix_count();
+        assert_eq!(good_prefixes, 1, "one live prefix");
+
+        // The generation the "slow" rebuild captured, then a mutation lands.
+        let stale_generation = api.cache().current.load(Ordering::SeqCst);
+        api.set_active_blocking(&created.record.id, false)
+            .expect("revoke");
+
+        // The stale rebuild finishes late and tries to install a map that still
+        // carries the now-revoked token -- and, distinctly, more prefixes than the
+        // live map has. The shape difference matters: if the two maps happened to
+        // hold the same prefix count this assertion could not see the swap at all.
+        let hash = bcrypt::hash(created.raw.expose(), bcrypt::DEFAULT_COST).expect("hash");
+        let obsolete: HashMap<String, Arc<[Candidate]>> = (0..3)
+            .map(|i| {
+                (
+                    format!("ody_stale{i}"),
+                    Arc::from(
+                        vec![Candidate {
+                            id: created.record.id.clone(),
+                            token_hash: hash.clone(),
+                            owner: "alice".to_owned(),
+                            scopes: Scope::ALL[..1].iter().map(|s| Scope((*s).into())).collect(),
+                        }]
+                        .into_boxed_slice(),
+                    ),
+                )
+            })
+            .collect();
+        assert_ne!(
+            obsolete.len(),
+            good_prefixes,
+            "the obsolete map must differ in shape, or this test cannot see the swap"
+        );
+        api.cache().swap(obsolete, stale_generation);
+
+        // The load-bearing assertion: the obsolete map was NOT installed. Asserting
+        // only `is_stale()` would pass either way, because installing a map built for
+        // an older generation still leaves the cache stale -- which is why an earlier
+        // version of this test could not see the bug it was written for.
+        assert_eq!(
+            api.cache().prefix_count(),
+            good_prefixes,
+            "an obsolete rebuild must not replace the installed map"
+        );
+        assert!(
+            api.cache().is_stale(),
+            "and the cache must remain stale so the next read rebuilds"
+        );
+
+        // End to end: a revoked token must not authenticate.
+        assert!(
+            api.verify_blocking(created.raw.expose(), &owners(&tokens()))
+                .expect("verify")
+                .is_none(),
+            "a revoked token must not survive a stale rebuild"
+        );
+    }
+    #[test]
+    fn candidate_lookup_shares_rather_than_clones() {
+        // The auth path must not allocate per request (AGENTS.md §12). `candidates`
+        // hands back a shared slice, so two lookups of one prefix are one allocation.
+        let (_dir, api) = store_with_clock();
+        let created = api
+            .create_blocking(new_token("n8n", "alice"), &owners(&tokens()))
+            .expect("create");
+        api.rebuild_cache_blocking(&owners(&tokens()))
+            .expect("rebuild");
+
+        let first = api
+            .cache()
+            .candidates(created.raw.prefix())
+            .expect("prefix");
+        assert_eq!(Arc::strong_count(&first), 2, "the map plus one caller");
+        let second = api
+            .cache()
+            .candidates(created.raw.prefix())
+            .expect("prefix");
+        assert_eq!(Arc::strong_count(&second), 3, "two callers, one allocation");
+        assert!(Arc::ptr_eq(&first, &second), "must be the same allocation");
+    }
+
+    #[test]
+    fn out_of_range_timestamps_are_rejected_rather_than_normalised() {
+        // `"2025-13-45 99:99:99"` parses as six integers; without bounds checks the
+        // civil-from-days maths rolls the overflow into a plausible wrong instant,
+        // and an absurd year overflows `era * 146_097` outright.
+        for bad in [
+            "2025-13-45 00:00:00.000000",
+            "2025-00-01 00:00:00.000000",
+            "2025-01-00 00:00:00.000000",
+            "2025-01-01 99:00:00.000000",
+            "2025-01-01 00:99:00.000000",
+            "99999999999999999-01-01 00:00:00.000000",
+            "-500000-01-01 00:00:00.000000",
+        ] {
+            assert_eq!(parse_timestamp(bad), None, "{bad:?} must be rejected");
+        }
+
+        // The leap day and the epoch still round-trip.
+        assert_eq!(
+            parse_timestamp("2000-02-29 00:00:00.000000"),
+            Some(951_782_400)
+        );
+        assert_eq!(parse_timestamp("1970-01-01 00:00:00.000000"), Some(0));
     }
 }

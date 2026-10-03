@@ -109,7 +109,6 @@ pub enum TotpError {
 ///
 /// Returns [`TotpError::Entropy`] if the OS entropy source fails.
 pub fn generate_secret() -> Result<Secret, TotpError> {
-    let _ = Algorithm::SHA1;
     // `Secret::generate` is infallible in totp-rs 6 and draws from the OS, but the
     // value is still checked so a future version cannot hand back a short secret.
     let secret = Secret::generate();
@@ -237,21 +236,32 @@ pub fn generate_backup_codes() -> Result<Vec<String>, TotpError> {
 /// Single-use, matching `auth.py:539-546`: a match is removed and the caller
 /// persists the result.
 ///
-/// Comparison is constant-time, unlike Python's `code in backup`. The stored
-/// format is untouched; only the comparison changed. Length is compared first,
-/// which leaks nothing meaningful — every code is the same width by construction.
+/// Comparison is constant-time, unlike Python's `code in backup` on a list, which
+/// leaks the matching index through timing. The stored format is untouched; only
+/// the comparison changed.
 ///
-/// Returns `None` when nothing matched, and the input unchanged.
+/// Stored entries of the wrong width are skipped before comparing. A user copies
+/// their codes off the enrolment screen, so a correctly-shaped code always has the
+/// right width, and a narrower one in a hand-edited file would otherwise let a
+/// blank submission match an empty entry — the fail-open direction.
+///
+/// Returns `None` when nothing matched, leaving the caller's list untouched.
 #[must_use]
 pub fn consume_backup_code(stored: &[String], presented: &str) -> Option<Vec<String>> {
     let mut matched: Option<usize> = None;
 
     for (index, code) in stored.iter().enumerate() {
-        // `ConstantTimeEq::ct_eq` returns 0 for a length mismatch, which is the
-        // right answer: a different-width code cannot be the one presented.
+        if code.len() != BACKUP_CODE_BYTES * 2 {
+            continue;
+        }
+        // `ct_eq` yields 0 on a length mismatch, which is the right answer.
         let equal = code.as_bytes().ct_eq(presented.as_bytes());
-        // Fold without branching so the comparison cost does not depend on which
-        // element matched.
+        // Every element is visited and no early exit is taken, so the iteration
+        // count cannot depend on which one matched. The branch below is on the
+        // comparison *outcome*, which the caller already knows -- they chose the
+        // code being presented. That is the honest scope of the "constant-time"
+        // claim here; `remove` below is likewise a memmove whose length depends on
+        // the matched index.
         matched = if bool::from(equal) {
             Some(index)
         } else {

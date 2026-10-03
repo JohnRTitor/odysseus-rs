@@ -843,8 +843,18 @@ impl AuthStore {
     // -- TOTP (core/auth.py:483-562) ---------------------------------------
     //
     // The logic lives in `crate::totp`; these are the `auth.json` mutations.
-    // Every one takes `config_lock` for the whole read-modify-write, matching
-    // Python's `_config_lock` usage in the same methods.
+    //
+    // Locking note, because it is not uniform and the difference matters: the cheap
+    // reads take no lock, which is safe because writes land by atomic rename. Every
+    // method that decides *and then writes* does the deciding under `config_lock`,
+    // rather than reusing an unlocked snapshot. That is what stops `totp_verify`
+    // spending a backup code twice and `totp_confirm_enable` promoting a secret the
+    // user never scanned. Python has the same shape with no window, because it has
+    // no `await` inside these functions; moving the work to a thread pool is a real
+    // weakening and is compensated for structurally, not by convention.
+    //
+    // `totp_disable` also runs bcrypt (cost 12, ~250 ms) and must therefore be called
+    // from the blocking pool -- see its `**Blocking.**` marker.
 
     /// Whether a user has enrolled a second factor.
     ///
@@ -865,8 +875,23 @@ impl AuthStore {
     /// Starts enrolment: mints a secret, stores it as *pending*, and returns it
     /// alongside the `otpauth://` URI to render as a QR code.
     ///
-    /// The user is **not** enabled yet — `totp_confirm_enable` does that, so a
+    /// The user is **not** enabled yet -- `totp_confirm_enable` does that, so a
     /// secret the user never scanned cannot lock them out.
+    ///
+    /// # Blocking.
+    ///
+    /// Entropy plus an fsync-ing write. Call from the blocking pool.
+    ///
+    /// # A route-level gate this store deliberately does NOT enforce
+    ///
+    /// `routes/auth_routes.py:251-252` refuses to start enrolment when 2FA is
+    /// already enabled, and Python has no path that re-enrols an enabled user. This
+    /// store permits it, because refusing here would make legitimate re-enrolment
+    /// unrepresentable -- which means the control now exists *only* in a route that
+    /// has not been written. If that gate is omitted, an attacker holding a stolen
+    /// session (no password, no TOTP) could enrol their own authenticator and take
+    /// over 2FA, invalidating the victim's codes. Whoever writes the route must
+    /// reproduce the check.
     ///
     /// # Errors
     ///
@@ -891,6 +916,15 @@ impl AuthStore {
 
     /// The `otpauth://` URI for a known secret, for re-rendering a QR code.
     ///
+    /// Prefers the **pending** secret over the live one. During a re-enrolment
+    /// `totp_generate_secret` has just returned a URI for the new secret, and this
+    /// method must render that same one; preferring `totp_secret` would hand back a
+    /// QR for the old secret and the scan would silently do nothing.
+    ///
+    /// # Blocking.
+    ///
+    /// Cheap, but reads the file. Call from the blocking pool.
+    ///
     /// # Errors
     ///
     /// Returns [`AuthError::Totp`] if the stored secret does not decode, which is
@@ -903,9 +937,9 @@ impl AuthStore {
             .get(&key)
             .ok_or_else(|| AuthError::NoSuchUser(username.to_owned()))?;
         let stored = user
-            .totp_secret
+            .totp_secret_pending
             .as_deref()
-            .or(user.totp_secret_pending.as_deref())
+            .or(user.totp_secret.as_deref())
             .ok_or_else(|| {
                 AuthError::Totp(crate::totp::TotpError::MalformedSecret(
                     "no secret has been generated".into(),
@@ -920,8 +954,12 @@ impl AuthStore {
     /// Completes enrolment: verifies `code` against the *pending* secret, enables
     /// 2FA, and mints [`crate::totp::BACKUP_CODE_COUNT`] backup codes.
     ///
-    /// Returns the backup codes, which are shown once and stored hashed-by-obscurity
-    /// only — `auth.json` holds them in the clear, as it does in Python.
+    /// Returns the backup codes, which are shown once and stored in the clear in
+    /// `auth.json`, as they are in Python.
+    ///
+    /// # Blocking.
+    ///
+    /// An fsync-ing write. Call from the blocking pool.
     ///
     /// # Errors
     ///
@@ -935,33 +973,46 @@ impl AuthStore {
     ) -> Result<Vec<String>, AuthError> {
         let key = normalise_username(username);
 
-        let secret = {
-            let file = self.load_auth()?;
-            let user = file
-                .users
-                .get(&key)
-                .ok_or_else(|| AuthError::NoSuchUser(username.to_owned()))?;
-            user.totp_secret_pending
-                .clone()
-                .ok_or_else(|| AuthError::Denied("no pending totp secret".into()))?
-        };
+        // Mint the codes *before* taking the lock: entropy is the slow part and there
+        // is no reason to hold `config_lock` across it.
+        let backup = crate::totp::generate_backup_codes()?;
 
-        let parsed = crate::totp::parse_secret(&secret)?;
-        if !crate::totp::verify_code(&parsed, code, now) {
+        // Read, verify and write all under one lock, so the secret that is verified
+        // is provably the secret that gets promoted.
+        //
+        // Verifying before taking the lock was a TOCTOU: two `totp_generate_secret`
+        // calls (two tabs, a double-click) leave the *second* secret pending, so a
+        // confirm that read the first, verified against it, then wrote it under the
+        // lock would promote a secret the user never scanned and delete the pending
+        // copy they did -- leaving `totp_enabled: true` with a live secret nobody
+        // holds codes for, and the recovery copy destroyed.
+        //
+        // `verify_code` is an HMAC over one 30-second step, microseconds of work, so
+        // holding the lock across it costs nothing. The expensive operation in this
+        // file is bcrypt, and that is in `totp_disable`, not here.
+        let _guard = self.lock_config()?;
+        let mut file = self.load_auth()?;
+        let user = file
+            .users
+            .get(&key)
+            .ok_or_else(|| AuthError::NoSuchUser(username.to_owned()))?;
+        let secret = user
+            .totp_secret_pending
+            .clone()
+            .ok_or_else(|| AuthError::Denied("no pending totp secret".into()))?;
+
+        if !crate::totp::verify_code(&crate::totp::parse_secret(&secret)?, code, now) {
             return Err(AuthError::Denied("totp code is incorrect".into()));
         }
 
-        let backup = crate::totp::generate_backup_codes()?;
-
-        let _guard = self.lock_config()?;
-        let mut file = self.load_auth()?;
-        let Some(user) = file.users.get_mut(&key) else {
-            return Err(AuthError::NoSuchUser(username.to_owned()));
-        };
+        let user = file
+            .users
+            .get_mut(&key)
+            .ok_or_else(|| AuthError::NoSuchUser(username.to_owned()))?;
         user.totp_secret = Some(secret);
         user.totp_enabled = true;
         // The pending copy is dropped: keeping it would leave two live secrets, and
-        // `totp-disable` clearing only one of them is how a stale secret survives.
+        // `totp_disable` clearing only one of them is how a stale secret survives.
         user.totp_secret_pending = None;
         user.totp_backup_codes = Some(backup.clone());
         self.save_auth(&file)?;
@@ -970,6 +1021,11 @@ impl AuthStore {
     }
 
     /// The login-time check: is this user allowed in with `code`?
+    ///
+    /// # Blocking.
+    ///
+    /// Reads and parses `auth.json` on every call, and may write when a backup code
+    /// is spent. Call from the blocking pool.
     ///
     /// # Errors
     ///
@@ -1006,15 +1062,13 @@ impl AuthStore {
         // Step 3: backup codes, *before* the secret is decoded. Python checks them
         // first (`auth.py:539-546`), which is what lets an enrolled user locked out
         // by a corrupt secret still spend a code.
-        let backup = user.totp_backup_codes.clone().unwrap_or_default();
-        if let Some(remaining) = crate::totp::consume_backup_code(&backup, code) {
-            let _guard = self.lock_config()?;
-            let mut file = self.load_auth()?;
-            if let Some(user) = file.users.get_mut(&key) {
-                user.totp_backup_codes = Some(remaining);
-                self.save_auth(&file)?;
-            }
-            tracing::info!(user = %key, "backup code consumed");
+        //
+        // The check is repeated against the list loaded *under the lock*. Computing
+        // the removal from an unlocked snapshot would let two threads presenting the
+        // same code both see a match and both succeed, spending a single-use code
+        // twice -- and would write a stale list back over a concurrent
+        // re-enrolment's fresh codes.
+        if self.consume_backup_code_locked(&key, code)? {
             return Ok(true);
         }
 
@@ -1028,10 +1082,41 @@ impl AuthStore {
         Ok(crate::totp::verify_code(&parsed, code, now))
     }
 
+    /// Spends a backup code, deciding under `config_lock`.
+    ///
+    /// Returns `true` when the code was presented and has been consumed. A user who
+    /// disappeared between the caller's read and this write is a refusal, not a
+    /// silent success: the account is gone, so there is nothing to admit.
+    fn consume_backup_code_locked(&self, key: &str, code: &str) -> Result<bool, AuthError> {
+        let _guard = self.lock_config()?;
+        let mut file = self.load_auth()?;
+        let Some(user) = file.users.get(key) else {
+            return Ok(false);
+        };
+
+        let stored = user.totp_backup_codes.clone().unwrap_or_default();
+        let Some(remaining) = crate::totp::consume_backup_code(&stored, code) else {
+            return Ok(false);
+        };
+
+        if let Some(user) = file.users.get_mut(key) {
+            user.totp_backup_codes = Some(remaining);
+        }
+        self.save_auth(&file)?;
+        tracing::info!(user = %key, "backup code consumed");
+        Ok(true)
+    }
+
     /// Disables 2FA after verifying the password.
     ///
     /// The secrets and the flag are cleared in one write, so no reader can observe
     /// `totp_enabled == false` next to a live secret (`auth.py:556-559`).
+    ///
+    /// # Blocking.
+    ///
+    /// Runs bcrypt at cost 12 (~250 ms) plus an fsync-ing write. Calling this from an
+    /// async handler parks a runtime worker for a quarter of a second (AGENTS.md D11);
+    /// see [`AuthStore::verify_password_blocking`] for the pattern.
     ///
     /// # Errors
     ///

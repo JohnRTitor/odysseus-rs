@@ -503,6 +503,150 @@ fn the_enrolment_survives_a_reopen_of_the_store() -> TestResult {
 }
 
 #[test]
+fn a_backup_code_cannot_be_spent_twice_under_concurrency() -> TestResult {
+    // Regression. The removal was computed from an *unlocked* snapshot and then
+    // written back, so two threads presenting the same code both saw a match and
+    // both succeeded — spending a single-use code twice, and writing a stale list
+    // over a concurrent re-enrolment's fresh codes. The decision is now made
+    // against the list loaded under `config_lock`.
+    let (_dir, auth) = with_alice()?;
+    let codes = enrol(&auth)?;
+    let target = codes[0].clone();
+
+    let accepted = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let auth = auth.clone();
+            let target = target.clone();
+            let accepted = &accepted;
+            scope.spawn(move || {
+                if auth.totp_verify("alice", &target, NOW).unwrap_or(false) {
+                    accepted.lock().expect("lock").push(target);
+                }
+            });
+        }
+    });
+
+    let wins = accepted.into_inner().expect("lock").len();
+    assert_eq!(
+        wins, 1,
+        "a single-use backup code must admit exactly one login, got {wins}"
+    );
+    assert_eq!(
+        auth.totp_remaining_backup_codes("alice")?.len(),
+        BACKUP_CODE_COUNT - 1,
+        "exactly one code must have been removed"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_confirm_is_refused_if_the_pending_secret_moved_underneath_it() -> TestResult {
+    // Regression. The promoted secret came from a read taken *before* the lock, so
+    // two `totp_generate_secret` calls (two tabs, a double-click) let the first
+    // confirm promote its own secret and delete the pending copy the user actually
+    // scanned — leaving `totp_enabled: true` with a live secret nobody holds codes
+    // for, and the recovery copy destroyed.
+    let (_dir, auth) = with_alice()?;
+
+    let (first, _uri) = auth.totp_generate_secret("alice")?;
+    let first_code = totp::current_code(&totp::parse_secret(&first)?, NOW)?;
+
+    // The user re-opens the setup page, so a second secret becomes pending.
+    let (second, _uri) = auth.totp_generate_secret("alice")?;
+    let second_code = totp::current_code(&totp::parse_secret(&second)?, NOW)?;
+    assert_ne!(first, second, "the two secrets must differ");
+
+    // The confirm for the *stale* first secret must be refused, not silently
+    // promote a secret the user never scanned.
+    let err = auth
+        .totp_confirm_enable("alice", &first_code, NOW)
+        .expect_err("must refuse");
+    assert!(matches!(err, AuthError::Denied(_)), "{err:?}");
+    assert!(
+        !auth.totp_enabled("alice")?,
+        "a refused confirm must not enable 2FA"
+    );
+
+    // The pending secret is intact, so confirming *that* one still works.
+    auth.totp_confirm_enable("alice", &second_code, NOW)?;
+    assert!(auth.totp_enabled("alice")?);
+    assert!(auth.totp_verify("alice", &second_code, NOW)?);
+    Ok(())
+}
+
+#[test]
+fn a_re_rendered_qr_shows_the_pending_secret_not_the_old_one() -> TestResult {
+    // During a re-enrolment, `totp_generate_secret` has just returned a URI for the
+    // new secret. A re-render that preferred the live secret would hand back a QR
+    // for the old one, and the scan would silently do nothing.
+    let (_dir, auth) = with_alice()?;
+    enrol(&auth)?;
+
+    let (new_secret, new_uri) = auth.totp_generate_secret("alice")?;
+    let rendered = auth.totp_provisioning_uri("alice")?;
+    assert_eq!(
+        rendered, new_uri,
+        "the re-rendered URI must match the one just handed out"
+    );
+    assert!(
+        rendered.contains(&new_secret),
+        "the re-rendered URI must carry the pending secret: {rendered}"
+    );
+    Ok(())
+}
+
+#[test]
+fn two_factor_enabled_with_the_secret_key_absent_refuses_entry() -> TestResult {
+    // The literal state in `tests/test_totp_failclosed.py:9-14`, and the regression
+    // this whole feature exists for. `totp_secret` is `skip_serializing_if =
+    // Option::is_none`, so producing it means removing the key rather than blanking
+    // its value -- which is the state the earlier tests did not cover.
+    let (_dir, auth) = with_alice()?;
+    enrol(&auth)?;
+
+    plant(&auth, |doc| {
+        doc["users"]["alice"]
+            .as_object_mut()
+            .expect("alice object")
+            .remove("totp_secret");
+    })?;
+
+    assert!(
+        auth.totp_enabled("alice")?,
+        "the flag is still set, so this is the fail-closed path"
+    );
+    assert!(
+        !auth.totp_verify("alice", "123456", NOW)?,
+        "enabled with the key entirely absent must refuse, not admit"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_blank_backup_code_in_a_corrupt_file_admits_nothing() -> TestResult {
+    // A stored empty string would match a presented empty string under a plain
+    // membership test -- which is what `auth.py:540` does. Codes are always exactly
+    // 8 hex characters, so a wrong-width stored entry is corrupt by definition.
+    let (_dir, auth) = with_alice()?;
+    enrol(&auth)?;
+
+    plant(&auth, |doc| {
+        doc["users"]["alice"]["totp_backup_codes"] = serde_json::json!(["", "bbbbbbbb"]);
+    })?;
+
+    assert!(
+        !auth.totp_verify("alice", "", NOW)?,
+        "a blank code must not match a blank stored entry"
+    );
+    assert!(
+        auth.totp_verify("alice", "bbbbbbbb", NOW)?,
+        "a real code still works"
+    );
+    Ok(())
+}
+
+#[test]
 fn concurrent_enrolment_leaves_exactly_one_live_secret() -> TestResult {
     // Eight threads each generating then confirming. Whatever interleaving occurs,
     // the file must end with 2FA enabled, no pending secret, and one code list.
