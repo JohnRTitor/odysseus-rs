@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 30 / 489 complete · Phase 0 in progress
+**Status:** 32 / 489 complete · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — S1/S2 and S7 resolved, 9 pending.
 
@@ -52,8 +52,8 @@ is written.**
 - [x] T0003 Add workspace lints: `#![deny(clippy::all)]`, forbid `unwrap()`/`expect()` in library crates
 - [ ] T0004 Set up `cargo-deny` (advisories, licenses, bans) + `cargo-audit`
 - [ ] T0005 Add `criterion`, `proptest`, `insta`, `tempfile`, `pretty_assertions`, `mockall` as workspace dev-deps
-- [ ] T0006 Set up `cargo-nextest` with a `ci` profile target < 30 s
-- [ ] T0007 Write `crates/*/README.md` stating each crate's concern and what it must not import
+- [x] T0006 Set up `cargo-nextest` with a `ci` profile target < 30 s
+- [x] T0007 Write `crates/*/README.md` stating each crate's concern and what it must not import
 - [ ] T0008 Add a CI job enforcing the dependency rules in `SOURCE_MAPPING.md` §9 (no `rusqlite` in `odysseus-ui`, no `axum` in `odysseus-agent`, etc.)
 
 ### 0.2 Dependency spikes (**blocking** — resolve before T0100)

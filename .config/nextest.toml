@@ -1,0 +1,60 @@
+# cargo-nextest repository configuration.
+#
+# AGENTS.md §13 makes `cargo nextest run --profile ci` a precondition for every
+# commit, so this profile is the one the whole team and CI share. Anything set
+# here applies to every contributor.
+#
+# This profile runs the WHOLE suite. It contains no `default-filter`, no
+# filter-expression, and no `test-groups` override that deselects anything.
+# Narrowing what the gate runs is the same as deleting the tests it skips
+# (AGENTS.md §0 N4), and a profile whose failures are invisible is worse than no
+# gate at all. The < 30 s target from TASKS.md T0006 is a budget to meet by
+# making tests fast, not by making them fewer.
+
+[profile.ci]
+
+# Stop at the first failure. In a local pre-commit gate the first failure is
+# almost always the one you need to look at, and the rest of the suite is
+# usually a cascade of it (a failed migration makes every store test fail too).
+# Running to completion here costs minutes and tells you nothing new.
+fail-fast = true
+
+# AGENTS.md §0 N4: never weaken a test to reach green. A retry does not weaken
+# the assertion, but it hides the difference between "this test passes" and
+# "this test passed on the second try" -- and that difference is exactly the
+# flake a security or timing invariant has introduced. With `retries > 0` a
+# genuine flake ships green in CI while failing on a developer's machine, which
+# is the worst of both outcomes. Zero is also the nextest default, so this is
+# stated explicitly to document that it is a decision, not an oversight.
+retries = 0
+
+# nextest runs one process per test, so this bounds concurrent processes, not
+# just threads. `auto` (the default) means "one per CPU", which is 12 on a
+# developer workstation but an unpredictable number on a shared CI runner --
+# and the tests that dominate this suite are CPU-bound (bcrypt cost 12, TOTP,
+# and SQLite baseline builds against real temp databases), so oversubscribing
+# the runner turns into contention rather than throughput.
+#
+# 8 is pinned rather than derived so the wall-clock time is comparable between
+# a laptop and a 4-core CI box. Raise it if the suite grows and the budget
+# starts to bite; do not lower it towards 1 (AGENTS.md §12.2 warns that a
+# `#[global_allocator]` counting test needs `--test-threads=1`, which is a
+# reason such tests exist, not a reason to serialise everything).
+test-threads = 8
+
+# Label a test SLOW once it has been running this long. This is
+# reporting-only: no `terminate-after` is set, so a slow test is annotated and
+# reported, never killed. That asymmetry is deliberate -- a terminate-after on a
+# loaded CI runner turns "this machine was slow" into a spurious failure, and
+# suppressing a timeout to hide it would be the N4 violation in the other
+# direction.
+#
+# 10 s is a real threshold, not an aspiration: the current suite runs in roughly
+# 13 s wall on an idle box, so 10 s flags a genuine outlier rather than ordinary
+# variance. It is doing its job -- the flagged tests are the `odysseus-store`
+# bcrypt cost-12 and concurrency tests, which dominate this suite (200 of 227
+# tests live in that one crate, and each `bcrypt::hashpw` at cost 12 is
+# hundreds of milliseconds of deliberate CPU burn). What the flag buys is the
+# diagnostic that makes the T0006 budget actionable: profile those tests, do not
+# shrink the run.
+slow-timeout = { period = "10s" }
