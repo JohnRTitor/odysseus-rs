@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 34 / 489 complete · Phase 0 in progress
+**Status:** 35 / 489 complete · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — S1/S2 and S7 resolved, 9 pending.
 
@@ -97,7 +97,7 @@ is written.**
 - [x] T0067 14 scopes + 4 profiles; write scope auto-inserts its read scope
 - [x] T0068 TOTP 2FA — **fails closed** when enabled but secret missing; 8 single-use backup codes
 - [x] T0069 Privileges: 7 booleans + `max_messages_per_day` + `allowed_models`; refuse to demote the last admin
-- [ ] T0070 User CRUD; delete revokes API tokens **first** (fail-closed), then sessions; rename rewrites live sessions
+- [x] T0070 User CRUD; delete revokes API tokens **first** (fail-closed), then sessions; rename rewrites live sessions
 
 ### 0.5 Web layer
 

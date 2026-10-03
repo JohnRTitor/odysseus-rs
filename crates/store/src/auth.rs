@@ -111,6 +111,13 @@ pub enum AuthError {
     /// The TOTP layer refused something.
     #[error(transparent)]
     Totp(#[from] crate::totp::TotpError),
+
+    /// The API token store refused something.
+    ///
+    /// Reachable from [`AuthStore::delete_user`], where it is deliberately
+    /// load-bearing: a failure to revoke tokens aborts the whole delete.
+    #[error(transparent)]
+    Token(#[from] crate::api_tokens::TokenError),
 }
 
 /// A user's stored record.
@@ -1626,65 +1633,116 @@ impl AuthStore {
         Ok(doomed.len())
     }
 
-    /// Deletes a user and every **browser session** belonging to them.
+    /// Deletes a user, revoking their API tokens **first** and then their sessions.
     ///
-    /// # Not yet complete — T0070
+    /// The ordering is the whole point, and it is fail-closed. `core/auth.py:301-318`
+    /// deletes the `ApiToken` rows before touching the auth row, and on any failure
+    /// returns `False` with the user and their sessions completely untouched, so an
+    /// admin can retry. The bearer path authenticates from `ApiToken` rows and does
+    /// **not** require the owner to still exist (`app.py:321-333` only skips a row
+    /// whose owner fails to resolve, so a deleted owner's tokens are dropped from
+    /// the cache rather than refused at lookup) — so a delete that left tokens
+    /// behind would hand out working credentials for an account that no longer
+    /// exists.
     ///
-    /// API tokens are **not** revoked here, because they are not implemented (T0065).
-    /// `core/auth.py:301-318` deletes the `ApiToken` rows *first* and returns without
-    /// touching the user if the token store is unavailable, precisely so a token
-    /// cannot outlive its owner. Until that exists, a deleted user's bearer tokens
-    /// would keep working — so a caller must not treat this as full revocation.
+    /// # Partial-failure note
+    ///
+    /// If the token delete succeeds and the subsequent `save_auth` fails, the result
+    /// is tokens-revoked-but-user-intact. That is the safe direction, and Python has
+    /// the identical window. The reverse — user gone, tokens live — is unreachable.
+    ///
+    /// # Locking
+    ///
+    /// `config_lock` covers the checks, the token delete and the auth write;
+    /// `sessions_lock` is taken afterwards and separately, matching Python, which
+    /// releases `_config_lock` before purging sessions. Holding both at once is not
+    /// required and would widen the contention window on the login path.
     ///
     /// # Errors
     ///
-    /// Returns [`AuthError::Denied`] for the last administrator,
-    /// [`AuthError::NoSuchUser`] for an unknown account, and propagates IO failures.
-    pub fn delete_user(&self, username: &str, requester: &str) -> Result<(), AuthError> {
-        let _config = self.lock_config()?;
-        // Held for the whole operation, so the account edit and the session revocation
-        // cannot interleave with another rename or delete.
-        let sessions = self.lock_sessions()?;
+    /// Returns [`AuthError::Denied`] for the last administrator or the only user,
+    /// [`AuthError::NotAuthorized`] when `requester` is not an admin,
+    /// [`AuthError::NoSuchUser`] for an unknown account, and propagates a
+    /// [`TokenError`] from the token delete — in which case **nothing is modified**.
+    pub fn delete_user(
+        &self,
+        username: &str,
+        requester: &str,
+        tokens: &crate::api_tokens::ApiTokenStore,
+    ) -> Result<(), AuthError> {
         let key = normalise_username(username);
-        let mut file = self.load_auth()?;
-        // `core/auth.py:297-300` refuses self-deletion and a non-admin requester.
-        Self::require_admin(requester, &file)?;
-        if key == normalise_username(requester) {
-            return Err(AuthError::Denied(
-                "an administrator cannot delete themselves".into(),
-            ));
-        }
-        if !file.users.contains_key(&key) {
-            return Err(AuthError::NoSuchUser(username.to_owned()));
-        }
 
-        // The last admin is not deletable, for the same reason they are not
-        // demotable. `set_admin` enforces one half of that invariant; this is the
-        // other half.
-        if file.users.get(&key).is_some_and(|u| u.is_admin)
-            && file.users.values().filter(|u| u.is_admin).count() <= 1
         {
-            return Err(AuthError::Denied(
-                "cannot delete the last administrator".into(),
-            ));
+            let _config = self.lock_config()?;
+            let mut file = self.load_auth()?;
+            Self::require_admin(requester, &file)?;
+
+            if !file.users.contains_key(&key) {
+                return Err(AuthError::NoSuchUser(username.to_owned()));
+            }
+            if key == normalise_username(requester) {
+                return Err(AuthError::Denied(
+                    "an administrator cannot delete themselves".into(),
+                ));
+            }
+
+            // The last admin is not deletable, for the same reason they are not
+            // demotable. `set_admin` enforces one half of that invariant; this is
+            // the other half.
+            if file.users.get(&key).is_some_and(|u| u.is_admin)
+                && file.users.values().filter(|u| u.is_admin).count() <= 1
+            {
+                return Err(AuthError::Denied(
+                    "cannot delete the last administrator".into(),
+                ));
+            }
+
+            // Nor may the table become *empty*. Deleting the only non-admin user
+            // would otherwise empty it just as effectively: `is_configured` flips
+            // false and the first-run setup path reopens, handing admin to whoever
+            // reaches it next.
+            if file.users.len() <= 1 {
+                return Err(AuthError::Denied(
+                    "cannot delete the only user; an instance always has at least one".into(),
+                ));
+            }
+
+            // API tokens first. A failure here propagates and aborts the delete with
+            // the user and their sessions untouched, which is the fail-closed
+            // behaviour `auth.py:311-318` implements with a bare `return False`.
+            let revoked = tokens.delete_for_owner_blocking(&key)?;
+            if revoked > 0 {
+                tracing::info!(user = %key, revoked, "revoked api tokens for deleted user");
+            }
+
+            file.users.remove(&key);
+            self.save_auth(&file)?;
         }
 
-        // Nor may the table become *empty*. Deleting the only non-admin user would
-        // otherwise empty it just as effectively: `is_configured` flips false and the
-        // first-run setup path reopens, handing admin to whoever reaches it next.
-        if file.users.len() <= 1 {
-            return Err(AuthError::Denied(
-                "cannot delete the only user; an instance always has at least one".into(),
-            ));
-        }
-
-        file.users.remove(&key);
-        self.save_auth(&file)?;
-        self.revoke_user_sessions_locked(&sessions, &key, None)?;
+        // Then sessions. `validate_token` does an orphan check, but purging is still
+        // what keeps `sessions.json` from growing and stops the cookies at the source.
+        self.revoke_user_sessions(&key, None)?;
         Ok(())
     }
 
     /// Renames a user, carrying their sessions across.
+    ///
+    /// # API tokens are NOT carried across — deliberately
+    ///
+    /// `core/auth.py:rename_user` (337-366) never touches `ApiToken`. It renames the
+    /// auth key and the live sessions, and leaves the token rows holding the *old*
+    /// owner string. Those rows then fail owner resolution in
+    /// [`crate::api_tokens::ApiTokenStore::rebuild_cache_blocking`], which skips a row
+    /// whose owner is not a live account, so the tokens stop authenticating.
+    ///
+    /// That is the correct security outcome and this port reproduces it: a rename is
+    /// an identity change, and a long-lived bearer credential issued to the old
+    /// identity should not silently follow the account to the new one. What this
+    /// port does *not* reproduce is Python's leak -- the dead rows stay in
+    /// `api_tokens` forever, invisible but present. Reclaiming them is a cleanup
+    /// concern, not a correctness one, so it is left visible rather than papered
+    /// over; see `delete_for_owner_blocking` for the mechanism an admin-triggered
+    /// cleanup would use.
     ///
     /// # Errors
     ///
@@ -1987,6 +2045,35 @@ mod tests {
         (dir, store)
     }
 
+    /// An `AuthStore` plus the `ApiTokenStore` over the same directory, since
+    /// `delete_user` now needs both to enforce its revocation ordering.
+    fn store_with_tokens() -> (
+        tempfile::TempDir,
+        AuthStore,
+        crate::api_tokens::ApiTokenStore,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth = AuthStore::new(dir.path());
+        let db = crate::Store::open(dir.path().join("app.db"));
+        db.migrate().expect("migrate");
+        let tokens = crate::api_tokens::ApiTokenStore::new(db);
+        (dir, auth, tokens)
+    }
+
+    /// Owner resolver over the accounts `store_with_tokens` creates.
+    #[derive(Debug)]
+    struct Owners(std::collections::BTreeSet<String>);
+
+    impl crate::api_tokens::OwnerResolver for Owners {
+        fn known_owners(&self) -> Result<std::collections::BTreeSet<String>, crate::StoreError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn owners(names: &[&str]) -> Owners {
+        Owners(names.iter().map(|n| (*n).to_owned()).collect())
+    }
+
     /// The live session map, for tests that need to age a token out.
     fn read_sessions(store: &AuthStore) -> SessionFile {
         store.load_sessions().expect("load")
@@ -2209,7 +2296,7 @@ mod tests {
     /// The orphan check: a token whose user has been deleted must not survive.
     #[test]
     fn deleting_a_user_invalidates_their_sessions() {
-        let (_dir, store) = store();
+        let (_dir, store, tokens) = store_with_tokens();
         // A second account, so the delete is not refused by the "table must not be
         // emptied" guard -- that refusal is covered separately.
         store
@@ -2221,11 +2308,155 @@ mod tests {
         let token = store.issue_token("alice").expect("issue");
         assert!(store.validate_token(&token).expect("valid before"));
 
-        store.delete_user("alice", "root").expect("delete");
+        store.delete_user("alice", "root", &tokens).expect("delete");
 
         assert!(
             !store.validate_token(&token).expect("valid after"),
-            "a token for a deleted user must not authenticate"
+            "a session token for a deleted user must not authenticate"
+        );
+    }
+
+    #[test]
+    fn deleting_a_user_revokes_their_api_tokens() {
+        // T0070. `core/auth.py:301-318` deletes the `ApiToken` rows *before* the auth
+        // row because the bearer path authenticates from `ApiToken` rows and does not
+        // require the owner to still exist -- so a delete that skipped this would
+        // hand out working credentials for an account that no longer exists.
+        let (_dir, auth, tokens) = store_with_tokens();
+        auth.create_user("root", "hunter2hunter2", true)
+            .expect("root");
+        auth.create_user("alice", "hunter2hunter2", false)
+            .expect("alice");
+        auth.create_user("bob", "hunter2hunter2", false)
+            .expect("bob");
+
+        let mine = crate::api_tokens::ApiTokenStore::create_blocking(
+            &tokens,
+            crate::api_tokens::NewToken {
+                name: "n8n".to_owned(),
+                owner: "alice".to_owned(),
+                scopes: crate::api_tokens::ScopeRequest::Unset,
+                profile: None,
+            },
+            &owners(&["root", "alice", "bob"]),
+        )
+        .expect("create alice token");
+        let theirs = crate::api_tokens::ApiTokenStore::create_blocking(
+            &tokens,
+            crate::api_tokens::NewToken {
+                name: "make".to_owned(),
+                owner: "bob".to_owned(),
+                scopes: crate::api_tokens::ScopeRequest::Unset,
+                profile: None,
+            },
+            &owners(&["root", "alice", "bob"]),
+        )
+        .expect("create bob token");
+
+        auth.delete_user("alice", "root", &tokens).expect("delete");
+
+        assert!(
+            tokens
+                .verify_blocking(mine.raw.expose(), &owners(&["root", "bob"]))
+                .expect("verify")
+                .is_none(),
+            "a deleted user's bearer token must stop working"
+        );
+        assert!(
+            tokens
+                .verify_blocking(theirs.raw.expose(), &owners(&["root", "bob"]))
+                .expect("verify")
+                .is_some(),
+            "another user's token must survive"
+        );
+        assert_eq!(
+            tokens.list_blocking("alice").expect("list").len(),
+            0,
+            "the rows must be deleted, not merely orphaned"
+        );
+    }
+
+    #[test]
+    fn a_token_store_failure_aborts_the_whole_delete() {
+        // The fail-closed half of `auth.py:311-318`: if the token store is
+        // unavailable, the delete returns without touching the user or their
+        // sessions, so the admin can retry. Getting this wrong in the other
+        // direction leaves live bearer tokens for a user who is still present.
+        let (dir, auth, tokens) = store_with_tokens();
+        auth.create_user("root", "hunter2hunter2", true)
+            .expect("root");
+        auth.create_user("alice", "hunter2hunter2", false)
+            .expect("alice");
+        let session = auth.issue_token("alice").expect("issue");
+
+        // Drop the token table so the DELETE inside `delete_user` fails. A second
+        // `Store` handle over the same file would simply reopen it, so the schema
+        // itself has to change.
+        crate::Store::open(dir.path().join("app.db"))
+            .connect()
+            .expect("conn")
+            .execute("DROP TABLE api_tokens", [])
+            .expect("drop");
+
+        let err = auth
+            .delete_user("alice", "root", &tokens)
+            .expect_err("must fail closed");
+        assert!(matches!(err, AuthError::Token(_)), "{err:?}");
+
+        assert!(
+            auth.user_exists("alice").expect("the user must survive"),
+            "a failed token revocation must not delete the user"
+        );
+        assert!(
+            auth.validate_token(&session).expect("validate"),
+            "and must not touch their sessions"
+        );
+    }
+
+    #[test]
+    fn renaming_a_user_orphans_their_api_tokens_rather_than_carrying_them() {
+        // `core/auth.py:rename_user` (337-366) never touches `ApiToken`: the rows keep
+        // the old owner, fail owner resolution, and stop authenticating. That is the
+        // right outcome -- a bearer credential issued to the old identity should not
+        // silently follow the account to the new one.
+        let (_dir, auth, tokens) = store_with_tokens();
+        auth.create_user("root", "hunter2hunter2", true)
+            .expect("root");
+        auth.create_user("alice", "hunter2hunter2", false)
+            .expect("alice");
+        let api = crate::api_tokens::ApiTokenStore::create_blocking(
+            &tokens,
+            crate::api_tokens::NewToken {
+                name: "n8n".to_owned(),
+                owner: "alice".to_owned(),
+                scopes: crate::api_tokens::ScopeRequest::Unset,
+                profile: None,
+            },
+            &owners(&["root", "alice"]),
+        )
+        .expect("create");
+        let session = auth.issue_token("alice").expect("issue");
+
+        auth.rename_user("alice", "bob", "root").expect("rename");
+
+        // The session follows, so the user is not logged out.
+        assert!(
+            auth.validate_token(&session).expect("validate"),
+            "a browser session must survive a rename"
+        );
+        // The bearer token does not, and the row lingers with a stale owner.
+        assert!(
+            tokens
+                .verify_blocking(api.raw.expose(), &owners(&["root", "bob"]))
+                .expect("verify")
+                .is_none(),
+            "a bearer token must not follow a rename"
+        );
+        assert_eq!(
+            tokens.list_blocking("alice").expect("list").len(),
+            1,
+            "Python leaves the dead row behind; this port reproduces that, and the \
+             owner no longer resolves to anyone"
         );
     }
 
@@ -2525,12 +2756,14 @@ mod tests {
         // The other half of the invariant `set_admin` protects. Without it the user
         // table can reach zero, `is_configured` flips false, and the first-run setup
         // path reopens — handing admin to whoever reaches it next.
-        let (_dir, store) = store();
+        let (_dir, store, tokens) = store_with_tokens();
         store
             .create_user("root", "hunter2hunter2", true)
             .expect("create");
 
-        let err = store.delete_user("root", "root").expect_err("must refuse");
+        let err = store
+            .delete_user("root", "root", &tokens)
+            .expect_err("must refuse");
         assert!(matches!(err, AuthError::Denied(_)), "{err:?}");
         assert!(store.user_exists("root").expect("root survives"));
 
@@ -2538,7 +2771,7 @@ mod tests {
         store
             .create_user("bob", "hunter2hunter2", false)
             .expect("create");
-        store.delete_user("bob", "root").expect("delete");
+        store.delete_user("bob", "root", &tokens).expect("delete");
         assert!(!store.user_exists("bob").expect("gone"));
     }
 
@@ -2703,7 +2936,7 @@ mod tests {
         // `core/auth.py:430-431` returns NOT_AUTHORIZED for a non-admin requester;
         // `tests/test_set_admin.py:106` pins it. The check is in the signature so a
         // handler cannot forget it.
-        let (_dir, store) = store();
+        let (_dir, store, tokens) = store_with_tokens();
         store
             .create_user("root", "hunter2hunter2", true)
             .expect("create");
@@ -2719,7 +2952,9 @@ mod tests {
 
         // The same for the other administrative operations.
         assert!(matches!(
-            store.delete_user("bob", "bob").expect_err("must refuse"),
+            store
+                .delete_user("bob", "bob", &tokens)
+                .expect_err("must refuse"),
             AuthError::NotAuthorized(_)
         ));
         assert!(matches!(
@@ -2734,7 +2969,7 @@ mod tests {
     #[test]
     fn an_admin_cannot_delete_themselves() {
         // `core/auth.py:297-298`.
-        let (_dir, store) = store();
+        let (_dir, store, tokens) = store_with_tokens();
         store
             .create_user("root", "hunter2hunter2", true)
             .expect("create");
@@ -2742,7 +2977,9 @@ mod tests {
             .create_user("bob", "hunter2hunter2", false)
             .expect("create");
 
-        let err = store.delete_user("root", "root").expect_err("must refuse");
+        let err = store
+            .delete_user("root", "root", &tokens)
+            .expect_err("must refuse");
         assert!(matches!(err, AuthError::Denied(_)), "{err:?}");
         assert!(store.user_exists("root").expect("root survives"));
     }
@@ -3044,7 +3281,7 @@ mod tests {
         // Deleting the only *non-admin* emptied the table just as effectively as
         // deleting the last admin: `is_configured` flips false and first-run setup
         // reopens.
-        let (_dir, store) = store();
+        let (_dir, store, tokens) = store_with_tokens();
         store
             .create_user("root", "hunter2hunter2", true)
             .expect("create");
@@ -3053,11 +3290,13 @@ mod tests {
             .expect("create");
 
         store
-            .delete_user("bob", "root")
+            .delete_user("bob", "root", &tokens)
             .expect("delete the middle user");
         assert!(store.is_configured().expect("still configured"));
 
-        let err = store.delete_user("root", "root").expect_err("last admin");
+        let err = store
+            .delete_user("root", "root", &tokens)
+            .expect_err("last admin");
         assert!(matches!(err, AuthError::Denied(_)), "{err:?}");
 
         // A sole non-admin is equally protected. `delete_user` is admin-only, so the
@@ -3074,9 +3313,11 @@ mod tests {
             .create_user("solo", "hunter2hunter2", false)
             .expect("create");
         single
-            .delete_user("solo", "root")
+            .delete_user("solo", "root", &tokens)
             .expect("delete the only non-admin");
-        let err = single.delete_user("root", "root").expect_err("only user");
+        let err = single
+            .delete_user("root", "root", &tokens)
+            .expect_err("only user");
         assert!(matches!(err, AuthError::Denied(_)), "{err:?}");
         assert!(single.is_configured().expect("still configured"));
     }

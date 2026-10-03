@@ -1299,19 +1299,19 @@ impl ApiTokenStore {
 
     /// Deletes every token owned by `owner`, returning how many went.
     ///
-    /// # Contract with `auth::AuthStore::delete_user` — read before wiring
+    /// # How `auth::AuthStore::delete_user` uses this
     ///
     /// `core/auth.py:306-318` deletes the `ApiToken` rows **inside**
-    /// `_config_lock`, *before* removing the user, and on failure logs a warning
-    /// and returns `False` having touched nothing — so the admin can retry. A
-    /// caller must therefore:
+    /// `_config_lock`, *before* removing the user, and on failure logs a warning and
+    /// returns `False` having touched nothing, so an admin can retry.
+    /// [`crate::auth::AuthStore::delete_user`] does exactly that: it takes
+    /// `config_lock`, runs its checks, calls this, and only then removes the auth
+    /// row. An `Err` from here propagates as [`crate::auth::AuthError::Token`] and
+    /// aborts the delete with the user and their sessions intact.
     ///
-    /// 1. call this **before** removing the auth row and before any `save_auth`;
-    /// 2. treat an `Err` here as fatal to the whole delete, leaving the user and
-    ///    their sessions untouched;
-    /// 3. not hold `auth`'s `config_lock` in a way that deadlocks — the guard is
-    ///    a plain non-reentrant `Mutex`, so prefer the
-    ///    `revoke_user_sessions_locked(&guard, …)` idiom already used there.
+    /// Note what is *not* claimed: this does not take any of `auth`'s locks, so it
+    /// cannot deadlock against `config_lock`. It touches only its own database and
+    /// its own prefix cache.
     ///
     /// The owner predicate stays a bare equality so `ix_api_tokens_owner` is used.
     ///
