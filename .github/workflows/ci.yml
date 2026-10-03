@@ -1,0 +1,46 @@
+name: CI
+
+# The gate for every push and PR. Steps run in the order AGENTS.md §13 lists,
+# each one failing the job before the next starts.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        # rust-toolchain.toml pins the channel, so `rustup show` installs it
+        # automatically; this step only adds the components CI needs on top.
+        run: |
+          rustup show active-toolchain
+          rustup component add rustfmt clippy
+          cargo install cargo-nextest --locked
+
+      # AGENTS.md §3: the full command with the explicit `--config`, then
+      # `git diff --exit-code`. A bare `cargo fmt --check` silently ignores
+      # unstable options from a config file, so it passes on code that is not
+      # actually formatted the way this repo formats it.
+      - name: Format
+        run: |
+          cargo fmt -- --config imports_granularity=One,unstable_features=true
+          git diff --exit-code
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo nextest run --profile ci
+
+      # T0008. The rules are also asserted by an integration test, so this step
+      # is a second, explicit gate that names the failure directly in the CI log
+      # rather than as one FAIL line among the suite.
+      - name: Dependency rules
+        run: cargo nextest run --profile ci --test dependency_rules
