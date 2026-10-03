@@ -1,0 +1,24 @@
+[package]
+name = "odysseus-server"
+description = "The single Odysseus process: one Axum server for SSR, APIs, SSE, and auth."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "odysseus-server"
+path = "src/main.rs"
+
+[dependencies]
+odysseus-domain = { workspace = true }
+odysseus-store = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

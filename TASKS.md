@@ -23,7 +23,11 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 0 / 231 complete · Phase 0 in progress
+**Status:** 9 / 231 complete · Phase 0 in progress
+
+**Spike outcomes:** see `SPIKE_RESULTS.md` — S1/S2 and S7 resolved, 9 pending.
+
+**Spike outcomes:** see `SPIKE_RESULTS.md`. S1/S2 and S7 resolved; 9 pending.
 
 ---
 
@@ -43,9 +47,9 @@ is written.**
 
 ### 0.1 Workspace & tooling
 
-- [ ] T0001 Create the cargo workspace: `crates/{domain,store,llm,agent,tools,services,integrations,web,ui,ml}`, `apps/{odysseus-server,odysseus-cli}`
-- [ ] T0002 Pin toolchain + edition (2024). Add `rust-toolchain.toml`
-- [ ] T0003 Add workspace lints: `#![deny(clippy::all)]`, forbid `unwrap()`/`expect()` in library crates
+- [x] T0001 Create the cargo workspace: `crates/{domain,store,llm,agent,tools,services,integrations,web,ui,ml}`, `apps/{odysseus-server,odysseus-cli}`
+- [x] T0002 Pin toolchain + edition (2024). Add `rust-toolchain.toml`
+- [x] T0003 Add workspace lints: `#![deny(clippy::all)]`, forbid `unwrap()`/`expect()` in library crates
 - [ ] T0004 Set up `cargo-deny` (advisories, licenses, bans) + `cargo-audit`
 - [ ] T0005 Add `criterion`, `proptest`, `insta`, `tempfile`, `pretty_assertions`, `mockall` as workspace dev-deps
 - [ ] T0006 Set up `cargo-nextest` with a `ci` profile target < 30 s
@@ -54,13 +58,13 @@ is written.**
 
 ### 0.2 Dependency spikes (**blocking** — resolve before T0100)
 
-- [ ] T0020 **S1** `ort` EPs — are `TensorRTExecutionProvider`/`CUDAExecutionProvider` in the OSS crate, or gated behind `api-22`? Record the answer in `INCOMPLETE.md`
-- [ ] T0021 **S2** `ort` version — confirm `2.0.0-rc.13` builds; pin it. Confirm the session-build API shape
+- [x] T0020 **S1** `ort` EPs — **RESOLVED: not gated.** `api-22` is a version-gating feature (alongside `api-17`…`api-28`), not a paid tier. `cuda`/`tensorrt`/`coreml`/`directml` are all in the OSS crate. **Correction:** EP types are `ort::ep::TensorRT` / `ort::ep::CUDA`, not `*ExecutionProvider`. CUDA runtime still unverified (no GPU here)
+- [x] T0021 **S2** `ort` version — confirm `2.0.0-rc.13` builds; pin it. Confirm the session-build API shape
 - [ ] T0022 **S3** SAM ONNX — produce `image_encoder.onnx` (ViT-B) + `mask_decoder.onnx`; measure the encoder pass
 - [ ] T0023 **S4** `any-tts` — does it provide a Kokoro backend? If yes, `kokoroxide` becomes moot (F338)
 - [ ] T0024 **S5** `rembg-rs` — load U2Net, produce an alpha matte. Fail ⇒ F169 REMOVE
 - [ ] T0025 **S6** `whisper-rs` — faster-whisper parity on CPU and CUDA. Fail ⇒ F339 REMOVE
-- [ ] T0026 **S7** `rusqlite` — FTS5 enabled? `sqlite-vec` loads as an extension? **Blocks F125 and F124**
+- [x] T0026 **S7** `rusqlite` — FTS5 enabled? `sqlite-vec` loads as an extension? **Blocks F125 and F124**
 - [ ] T0027 **S8** `lettre`/`async-imap`/`mailparse` — Gmail OAuth IMAP + STARTTLS SMTP round-trip. Fail ⇒ re-plan Phase 15
 - [ ] T0028 **S9** SD scope decision — is local SD needed given the inpaint/harmonize proxy path exists? Record the decision
 - [ ] T0029 **S10** `mupdf`/`poppler-rs`/`lopdf` — PDF rasterisation + AcroForm fill
@@ -68,13 +72,13 @@ is written.**
 
 ### 0.3 Storage layer
 
-- [ ] T0040 `odysseus-store`: `rusqlite` pool with a `spawn_blocking` discipline (D11). **No DB call on the async runtime**
-- [ ] T0041 `PRAGMA foreign_keys=ON` on every connection (matches `database.py:142-147`)
-- [ ] T0042 `PRAGMA busy_timeout` set — required once real concurrency exists
+- [x] T0040 `odysseus-store`: `rusqlite` pool with a `spawn_blocking` discipline (D11). **No DB call on the async runtime**
+- [x] T0041 `PRAGMA foreign_keys=ON` on every connection (matches `database.py:142-147`)
+- [x] T0042 `PRAGMA busy_timeout` set — required once real concurrency exists
 - [ ] T0043 Emit `0001_baseline.sql` from **live `sqlite_master`**, not from the models
 - [ ] T0044 Diff baseline against each SQLAlchemy model; record every discrepancy as a fixture (`DATA_MIGRATION.md` §2.2)
 - [ ] T0045 `chat_messages_fts` + 3 triggers, scrubbing base64 media from the index
-- [ ] T0046 Fernet encrypt/decrypt at the column boundary for the 7 encrypted columns. **`.app_key` must stay readable**
+- [x] T0046 Fernet encrypt/decrypt at the column boundary for the 7 encrypted columns. **`.app_key` must stay readable**
 - [ ] T0047 Naive-UTC datetime conversion helpers; round-trip tests on every datetime column
 - [ ] T0048 `chmod 0600` on the DB **and** its `-journal`/`-wal`/`-shm` sidecars
 - [ ] T0049 **TEST: open a copy of the real `app.db`; `PRAGMA table_info` matches for all 27 tables + FTS5**

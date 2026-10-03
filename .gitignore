@@ -1,1 +1,15 @@
 /target
+
+# Rust build output
+/target
+**/*.rs.bk
+
+# Cargo.lock IS committed for an application workspace (reproducible builds).
+# It is deliberately not ignored here.
+
+# Benchmark output
+/target/criterion
+
+# Runtime data directory (DATABASE_URL / DATA_DIR). Never committed -- this
+# holds the real app.db, .app_key, uploads, and secrets.
+/data/

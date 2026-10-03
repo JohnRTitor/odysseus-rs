@@ -1,0 +1,20 @@
+[package]
+name = "odysseus-cli"
+description = "Command-line access to the same operations as the web UI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+odysseus-domain = { workspace = true }
+tracing = { workspace = true }
+
+[[bin]]
+name = "odysseus"
+path = "src/main.rs"

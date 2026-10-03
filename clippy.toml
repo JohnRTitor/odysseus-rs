@@ -1,0 +1,9 @@
+# AGENTS.md §0 N5 requires a clean `clippy -D warnings`. Tests legitimately use
+# unwrap/expect; library code must not.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true
+# The workspace lints deny these outright. Keep MSRV 1.88 to match
+# `workspace.package.rust-version`.
+msrv = "1.88"

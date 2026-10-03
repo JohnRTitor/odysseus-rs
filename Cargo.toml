@@ -1,6 +1,156 @@
-[package]
-name = "odysseus-rs"
+[workspace]
+resolver = "3"
+members = [
+    "crates/domain",
+    "crates/store",
+    "crates/llm",
+    "crates/agent",
+    "crates/tools",
+    "crates/services",
+    "crates/integrations",
+    "crates/web",
+    "crates/ui",
+    "crates/ml",
+    "apps/odysseus-server",
+    "apps/odysseus-cli",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/odysseus-dev/odysseus"
+publish = false
 
-[dependencies]
+# Lints are defined ONCE here and inherited with `lints.workspace = true`.
+# See AGENTS.md §0 N5: `clippy -D warnings` must pass before any commit.
+[workspace.lints.rust]
+unsafe_code = { level = "deny", priority = -1 }
+missing_debug_implementations = { level = "warn", priority = -1 }
+unreachable_pub = { level = "warn", priority = -1 }
+rust_2018_idioms = { level = "warn", priority = -2 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# AGENTS.md §7: fail closed, no silent swallowing. These are library-wide denials.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# AGENTS.md §5.1: a blocking call held across an await is the classic async bug.
+await_holding_lock = "deny"
+# AGENTS.md §1.4: control flow must stay shallow.
+collapsible_if = "deny"
+collapsible_else_if = "deny"
+collapsible_match = "deny"
+
+[workspace.dependencies]
+# --- internal ---
+odysseus-domain = { path = "crates/domain", version = "0.1.0" }
+odysseus-store = { path = "crates/store", version = "0.1.0" }
+odysseus-llm = { path = "crates/llm", version = "0.1.0" }
+odysseus-agent = { path = "crates/agent", version = "0.1.0" }
+odysseus-tools = { path = "crates/tools", version = "0.1.0" }
+odysseus-services = { path = "crates/services", version = "0.1.0" }
+odysseus-integrations = { path = "crates/integrations", version = "0.1.0" }
+odysseus-web = { path = "crates/web", version = "0.1.0" }
+odysseus-ui = { path = "crates/ui", version = "0.1.0" }
+odysseus-ml = { path = "crates/ml", version = "0.1.0" }
+
+# --- runtime ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# --- web ---
+axum = { version = "0.8", features = ["macros", "http2"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["cors", "compression-gzip", "trace", "fs"] }
+http = "1"
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+    "charset",
+    "http2",
+] }
+futures-util = "0.3"
+
+# --- persistence ---
+rusqlite = { version = "0.40", features = ["bundled"] }
+sqlite-vec = "0.1.9"
+# `fernet` defaults to the OpenSSL backend, which would put a native libssl
+# dependency in a project whose goal is one self-contained binary. The
+# `rustcrypto` feature uses pure-Rust AES/HMAC instead. Output is byte-identical,
+# so `data/.app_key` compatibility (DATA_MIGRATION.md §6) is unaffected.
+# `fernet` defaults to the OpenSSL backend, which would put a native libssl
+# dependency in a project whose goal is one self-contained binary. The
+# `rustcrypto` feature uses pure-Rust AES/HMAC instead. Output is byte-identical,
+# so `data/.app_key` compatibility (DATA_MIGRATION.md §6) is unaffected.
+# Pinned to 0.2.1: the published 0.2.2 manifest has a duplicate `[package]`
+# section and fails to download.
+fernet = { version = "=0.2.1", default-features = false, features = ["rustcrypto"] }
+
+# --- serialisation ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# AGENTS.md §7: thiserror in libraries, anyhow only in main and tests.
+thiserror = "2"
+toml = "0.9"
+
+# --- crypto ---
+bcrypt = "0.19"
+subtle = "2.6"
+secrecy = "0.10"
+totp-rs = { version = "6", features = ["secret_container"] }
+
+# --- observability ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# --- frontend ---
+leptos = "0.8"
+leptos_router = "0.8"
+leptos_meta = "0.8"
+leptos_axum = "0.8"
+leptos-use = "0.8"
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+gloo-net = "0.6"
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+# --- dev / test ---
+criterion = "0.8"
+insta = "1"
+proptest = "1"
+tempfile = "3"
+pretty_assertions = "1"
+mockall = "0.15"
+wiremock = "0.6"
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+# Debug builds of the agent loop get very deep async stacks.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

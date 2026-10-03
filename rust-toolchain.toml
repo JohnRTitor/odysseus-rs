@@ -1,0 +1,6 @@
+# Pinned so every contributor and CI run the exact toolchain the lints were
+# tuned against. AGENTS.md: MSRV is not a constraint, but we still pin the
+# version we develop on.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,21 @@
+[package]
+name = "odysseus-store"
+description = "SQLite persistence via rusqlite + sqlite-vec. Owns the 27-table schema and the migration chain."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+odysseus-domain = { workspace = true }
+rusqlite = { workspace = true }
+sqlite-vec = { workspace = true }
+fernet = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

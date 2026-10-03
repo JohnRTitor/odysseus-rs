@@ -33,15 +33,17 @@
 |---|---|
 | Total features inventoried | 300 |
 | **IMPLEMENTED** | **0** |
-| **PARTIAL** | **0** |
-| **UNIMPLEMENTED** | **286** |
+| **PARTIAL** | **1** |
+| **UNIMPLEMENTED** | **285** |
 | **REMOVED** | 10 |
 | **REPLACED** | 4 |
 | Phases complete | 0 of 24 |
 | Blocked by a failed spike | 4 (conditional) |
+| Spikes resolved | 2 of 11 (S1/S2, S7) — see `SPIKE_RESULTS.md` |
 
-**Every feature is currently incomplete because implementation has not started.** That
-is the honest state. This file shrinks as phases land.
+**No feature is IMPLEMENTED.** One feature is PARTIAL (F118, blocked on the S11 golden
+set) and the remaining 285 are UNIMPLEMENTED, because implementation has only just
+begun. This file shrinks as phases land.
 
 ---
 
@@ -58,8 +60,8 @@ fails, the item becomes REMOVED with the spike result as the documented reason.
 | F169 Image remove-bg | UNIMPLEMENTED | Rust U2Net alpha-matte inference | **Spike S5** — `rembg-rs` 0.1.4 is minimally maintained (14 commits, 1 issue, 0 PRs). HOLD → REMOVE if it fails | 0 (S5) → 17 |
 | F338 Kokoro local TTS | UNIMPLEMENTED | Native Kokoro inference | **Spike S4** — `kokoroxide` 0.1.5 is explicitly **WIP** (7 stars, 0 issues). If `any-tts` provides a Kokoro backend, this is resolved; otherwise `kokoroxide` becomes REMOVE | 0 (S4) → 22 |
 | F176 Local diffusion generation | UNIMPLEMENTED | Full SD pipeline in Rust: CLIP tokenizer + `text_encoder` + `unet` + `vae_decoder` + scheduler port. **No ONNX equivalent exists for the scheduler** (~200–400 lines of stateful math) | **Spike S9** — scope decision. `/api/image/inpaint` and `/api/image/harmonize` already proxy to a registered `ModelEndpoint`, so a local SD pipeline may duplicate existing capability. `ort` is pinned to `2.0.0-rc.13` (an RC); TensorRT engine cache is required for the claimed 1.5–2.5 s | 0 (S9) → 17 |
-| F124 Local embeddings | UNIMPLEMENTED | Rust embedding runtime replacing Python `fastembed` | **Spike S7** — `rusqlite` must have FTS5 **and** `sqlite-vec` must load as an extension. All 4 vector collections depend on this | 0 (S7) → 7 |
-| F118 Vector threshold re-tuning | UNIMPLEMENTED | Re-tuned thresholds for the sqlite-vec distance metric | **Spike S11** — golden-set validation (`DATA_MIGRATION.md` §5.3). ChromaDB-calibrated values do not transfer | 0 (S11) → 7 |
+| F124 Local embeddings | UNIMPLEMENTED | Rust embedding runtime replacing Python `fastembed` | **S7 RESOLVED** — FTS5 and `sqlite-vec` both work with `rusqlite` 0.40 `bundled`. Remaining: the embedding runtime itself | 7 |
+| F118 Vector threshold re-tuning | PARTIAL | Golden-set validation not yet run | **S7 RESOLVED the metric question.** sqlite-vec defaults to **L2, same as ChromaDB**, so calibrated values are directly comparable and this becomes verification rather than rediscovery. **S11 still required and time-critical** — capture while ChromaDB still runs | 0 (S11) → 7 |
 | F140 PDF page rasterisation | UNIMPLEMENTED | PyMuPDF replacement | **Spike S10** — `mupdf`/`poppler-rs` FFI. Introduces a C dependency, partially undercutting the no-toolchain goal | 0 (S10) → 8 |
 | F148 AcroForm fill + PDF export | UNIMPLEMENTED | AcroForm field population + annotation stamping | **Spike S10** — `lopdf`. Signature rows must stay owner-filtered; temp files must be unlinked after response | 0 (S10) → 8 |
 | F262 Email IMAP/SMTP parity | UNIMPLEMENTED | Working Gmail OAuth IMAP + STARTTLS SMTP round-trip | **Spike S8** — `lettre` (SMTP), `async-imap` (IMAP), `mailparse` (MIME). Adequate in principle; must be proven against a real server | 0 (S8) → 15 |
