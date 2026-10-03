@@ -1,0 +1,17 @@
+# Not a workspace member. Regenerates `crates/store/migrations/0001_baseline.sql`
+# from a live `app.db`, per decision D6 in REWRITE_PLAN.md.
+#
+#   cargo run --manifest-path tools/dump-baseline/Cargo.toml -- <app.db> <out-dir>
+#
+# Kept out of the workspace so its dependency on a hand-supplied database path
+# never becomes part of the shipped binary's build graph.
+[package]
+name = "dump-baseline"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[workspace]

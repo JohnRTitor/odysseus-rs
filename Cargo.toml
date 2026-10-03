@@ -135,7 +135,7 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 criterion = "0.8"
 insta = "1"
 proptest = "1"
-tempfile = "3"
+tempfile = { version = "3", features = ["getrandom"] }
 pretty_assertions = "1"
 mockall = "0.15"
 wiremock = "0.6"

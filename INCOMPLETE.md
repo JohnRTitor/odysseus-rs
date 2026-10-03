@@ -209,6 +209,31 @@ reach zero.** That inverts the whole point of this file.
 
 ---
 
+## 6. Data-migration acceptance criteria — status
+
+`DATA_MIGRATION.md` §11 lists 12 criteria for the data migration. Progress:
+
+| # | Criterion | Status |
+|---|---|---|
+| 1 | A copy of a real `app.db` opens without error | **MET** — `crates/store/tests/baseline.rs` |
+| 2 | `PRAGMA table_info` matches for all 27 tables + FTS5 | **MET** — 28 tables created, 5 FTS5 shadows auto-created = 33 in `sqlite_master` |
+| 3 | `PRAGMA index_list` matches for every table | **MET** — 81 explicit indexes |
+| 4 | `PRAGMA foreign_key_check` returns zero rows | **MET** |
+| 5 | Sessions, messages, documents, memories, notes, tasks, calendar readable and owner-scoped | **PARTIAL** — column-shape round-trip proven; owner-scoping queries land in Phase 1 |
+| 6 | Login works against the real `auth.json` + `sessions.json` | UNIMPLEMENTED (T0060) |
+| 7 | A previously-encrypted column decrypts with the real `.app_key` | **MET for the key** — the install's real `.app_key` loads and round-trips. The install currently holds **0 encrypted rows**, so decrypting a stored value is untested against real data |
+| 8 | `data/settings.json` keys are honoured | UNIMPLEMENTED (Phase 20) |
+| 9 | Golden-set vector agreement at chosen thresholds | UNIMPLEMENTED (spike S11) |
+| 10 | File permissions on DB and sidecars are 0600 | **MET** — asserted in `store_migrates_a_file_backed_database_and_restricts_its_permissions` |
+| 11 | Golden-set vector agreement threshold | UNIMPLEMENTED (S11) |
+| 12 | Every encrypted column round-trips with the existing `.app_key` | **PARTIAL** — Fernet round-trip proven with the real key; needs a populated install to cover all 7 columns |
+
+**Note on the live database:** it is a fresh install — 0 sessions, 0 encrypted rows.
+Criteria 7 and 12 therefore validate the *key format*, not populated secrets. Re-run
+against a populated install before release.
+
+---
+
 ## 7. Change log
 
 | Date | Change | By |

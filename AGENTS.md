@@ -177,6 +177,7 @@ allow-expect-in-tests = true
 - Inject a resolver and a `Clock`: tests never touch the network or wall clock. No `sleep`-based sync; use `tokio::time::pause()` or channels/notify.
 - Tests must be deterministic and independent of order.
 - Every new feature has a test that **would fail if the feature were stubbed**.
+- A new stored/cached type gets a layout test: a `size_of::<T>()` ceiling, or an allocation-count assertion when §12.1 changed its representation. Silent growth of a per-item struct is a regression, not a style preference.
 - Write the Python-suite test first where one exists; it is the specification.
 
 ## 12. Dependencies and performance
@@ -184,6 +185,58 @@ allow-expect-in-tests = true
 - Optimise for local/LAN: low idle RSS, low allocation, fast startup, low latency. Measure before and after; record in `docs/baseline/`.
 - No allocation per streamed token in hot paths (streaming renderer uses append-mode inside an open fence, `UI_MIGRATION.md` §3.3.1).
 - Pre-size collections when the length is known; avoid `format!` in hot loops; prefer `&str`/`Cow` over `String`.
+
+### 12.1 Data layout for stored things
+
+Rules 1–5 restate the five changes Cloudflare made to the 1.1.1.1 cache
+(blog.cloudflare.com/dns-cache-memory-optimization-1111), which reported −56% bytes/entry, +43%
+insert throughput and −19% lookup latency. **Those are their numbers, not ours** — an Odysseus
+claim still needs `docs/baseline/` (N7). The transferable lesson: in a long-lived, many-instance
+type, the bookkeeping around a value costs more than the value. It applies to session messages,
+cached LLM responses, tool results, approval records, and vector rows (`PERFORMANCE_PLAN.md` §4).
+
+1. **Immutable data is `Box<[T]>`/`Box<str]`, never `Vec`/`String`.** A `Vec` carries a capacity
+   field that means nothing once the value is stored, and its slack tail is unreclaimable. Build
+   with `Vec`/`with_capacity`, convert at the boundary with `.into_boxed_slice()`. Never
+   `shrink_to_fit` a `Vec` you are about to store — the allocator keeps the block.
+2. **One buffer, not N collections.** Parallel `Vec`s cost a pointer + length each, plus padding
+   between them. Store one `Box<[T]>` or one `Box<[u8]>` and reach sections through `u16`/`u32`
+   offsets, sized against the measured maximum (§11 requires bounding that input).
+3. **Drop what the reader already has.** Fields repeated on every child (session id, parent turn
+   id, a record's owner, a re-sent content type) live once on the container and are inferred on
+   read; "same as parent" is `Option::None`, never an empty string. **Exception:** anything an
+   authz or ownership decision reads is stored and checked — inference there violates §7 and N6.
+4. **Size enums by traffic, not by the worst case.** An enum is as large as its largest variant.
+   Box the rare large variants, keep the hot ones inline. `clippy::large_enum_variant` is a floor,
+   not a target. State stays an enum (§4); independent metadata booleans collapse into one
+   `bitflags` field, which also deletes the struct padding that surrounded them.
+5. **Keep bytes as bytes.** If a value was serialized once, store the serialized form and
+   re-parse only where the fields are used. Build it in a reusable scratch buffer, then copy into
+   one exact-size `Box<[u8]>`; accept sequential iteration over random indexing.
+6. **Boxing is a last resort.** Every box is a separate allocation, rounds up to an allocator size
+   class, and costs a pointer hop that breaks CPU locality. Rule 5 usually beats rule 4's boxing.
+7. **Verify with `size_of`.** `assert!(size_of::<T>() <= N)` in a test is worth more than a comment
+   claiming a struct is small.
+
+### 12.2 Proving a layout change
+
+- **Bytes are not RSS.** Report per-entry footprint *and* allocation count; a counting
+  `GlobalAlloc` wrapper is what makes the second number obtainable, and "no extra allocation" is
+  the goal, not "fewer bytes".
+- Count allocations in `benches/` under criterion, or in an integration test run with
+  `--test-threads=1`; a `#[global_allocator]` in a parallel test binary interleaves other tests'
+  counts.
+- Benchmark inputs approximate production — state the mix (type distribution, size range, count per
+  entry) in the file — then confirm in resident memory on a real run, since per-entry savings
+  dilute across the rest of the process.
+- **A memory win is not a latency licence.** Report bytes, allocations, throughput and p50/p95
+  latency for both arms. Contiguity usually buys speed back; if a layout change is *slower*, it
+  needs the same baseline evidence as any other claim.
+- Re-capture `docs/baseline/` after a layout change; the budget in `PERFORMANCE_PLAN.md` §4 is
+  denominated in those numbers.
+
+### 12.3 Dependencies
+
 - Check whether the stdlib or an existing dependency covers a need before adding a crate. Declare versions in `[workspace.dependencies]`; set `default-features = false` and enable only what is used.
 - Run `cargo deny check advisories licenses bans` and `cargo audit` before committing dependency changes.
 

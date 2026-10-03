@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 9 / 231 complete · Phase 0 in progress
+**Status:** 13 / 231 complete · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — S1/S2 and S7 resolved, 9 pending.
 
@@ -75,14 +75,14 @@ is written.**
 - [x] T0040 `odysseus-store`: `rusqlite` pool with a `spawn_blocking` discipline (D11). **No DB call on the async runtime**
 - [x] T0041 `PRAGMA foreign_keys=ON` on every connection (matches `database.py:142-147`)
 - [x] T0042 `PRAGMA busy_timeout` set — required once real concurrency exists
-- [ ] T0043 Emit `0001_baseline.sql` from **live `sqlite_master`**, not from the models
+- [x] T0043 Emit `0001_baseline.sql` from **live `sqlite_master`**, not from the models. Regenerable via `tools/dump-baseline`
 - [ ] T0044 Diff baseline against each SQLAlchemy model; record every discrepancy as a fixture (`DATA_MIGRATION.md` §2.2)
-- [ ] T0045 `chat_messages_fts` + 3 triggers, scrubbing base64 media from the index
+- [x] T0045 `chat_messages_fts` + 3 triggers, scrubbing base64 media from the index
 - [x] T0046 Fernet encrypt/decrypt at the column boundary for the 7 encrypted columns. **`.app_key` must stay readable**
 - [ ] T0047 Naive-UTC datetime conversion helpers; round-trip tests on every datetime column
 - [ ] T0048 `chmod 0600` on the DB **and** its `-journal`/`-wal`/`-shm` sidecars
-- [ ] T0049 **TEST: open a copy of the real `app.db`; `PRAGMA table_info` matches for all 27 tables + FTS5**
-- [ ] T0050 **TEST: `PRAGMA foreign_key_check` returns zero rows**
+- [x] T0049 **TEST: open a copy of the real `app.db`** — 33 tables, 81 indexes, 3 triggers, 0 FK violations, `.app_key` loads and round-trips
+- [x] T0050 **TEST: `PRAGMA foreign_key_check` returns zero rows**
 - [ ] T0051 **TEST: an existing encrypted column decrypts with the real `.app_key`**
 
 ### 0.4 Auth
