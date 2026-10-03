@@ -104,6 +104,10 @@ pub enum AuthError {
     /// A mutation lock was poisoned by a panic in another thread.
     #[error("auth lock for {0} is poisoned; refusing to continue")]
     Lock(String),
+
+    /// The requester is not permitted to perform this action.
+    #[error("not authorized: {0}")]
+    NotAuthorized(String),
 }
 
 /// A user's stored record.
@@ -116,7 +120,7 @@ pub enum AuthError {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct User {
     /// bcrypt hash, never the plaintext.
-    #[serde(deserialize_with = "null_as_default")]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub password_hash: String,
     /// Unix creation time.
     #[serde(default, deserialize_with = "null_as_default")]
@@ -138,19 +142,35 @@ pub struct User {
     /// `set_admin` ever touches this field. Without it a temporary admin stint
     /// would leak the admin map — including `can_use_bash` — into the user's
     /// permanent privileges on demotion.
-    #[serde(default, deserialize_with = "null_as_default")]
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub privileges_before_admin: Option<BTreeMap<String, serde_json::Value>>,
     /// Base32 TOTP secret.
-    #[serde(default, deserialize_with = "null_as_default")]
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub totp_secret: Option<String>,
     /// Whether TOTP is active.
     #[serde(default, deserialize_with = "null_as_default")]
     pub totp_enabled: bool,
     /// A secret awaiting confirmation, discarded once confirmed.
-    #[serde(default, deserialize_with = "null_as_default")]
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub totp_secret_pending: Option<String>,
     /// Single-use recovery codes.
-    #[serde(default, deserialize_with = "null_as_default")]
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub totp_backup_codes: Option<Vec<String>>,
     /// Any key this build does not know about.
     ///
@@ -487,7 +507,36 @@ impl AuthStore {
         &self.sessions_path
     }
 
-    /// Reads `auth.json`, applying legacy migrations and normalisation.
+    /// Prepares the auth files for use. Call once at startup.
+    ///
+    /// Three things must happen before the first request, and none of them can be
+    /// deferred to a read path:
+    ///
+    /// * [`AuthStore::harden_permissions`] — writes already land at 0600, but a file
+    ///   created before that was true stays world-readable until something rewrites
+    ///   it, and the read paths never do.
+    /// * [`AuthStore::migrate_and_persist`] — Python persists each migration as it
+    ///   applies it. Reads must not write (see [`AuthStore::load_auth`]), so this is
+    ///   the one place a legacy file is rewritten.
+    /// * [`AuthStore::prune_sessions`] — the only bounded-growth guarantee for
+    ///   `sessions.json`. `validate_token` prunes just the presented token, so
+    ///   without this an abandoned login is never removed and every authenticated
+    ///   request re-parses a document that only grows.
+    ///
+    /// Order matters: harden before anything writes, so a migration cannot recreate a
+    /// loose file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first of [`AuthError::Io`] or [`AuthError::Malformed`] encountered.
+    pub fn prepare(&self) -> Result<(), AuthError> {
+        self.harden_permissions()?;
+        self.migrate_and_persist()?;
+        self.prune_sessions()?;
+        Ok(())
+    }
+
+    /// Reads `auth.json`, applying legacy migrations and normalisation in memory.
     ///
     /// Migrations, all from `core/auth.py`:
     /// * the single-user `{username, password_hash}` shape becomes a `users` map;
@@ -572,9 +621,24 @@ impl AuthStore {
                     changed = true;
                     continue;
                 }
-                // A collision means two spellings of one account; last write wins,
-                // matching the dict comprehension in `_load`.
+                // A collision means two spellings of one account (`{"Alice": …,
+                // " alice ": …}`), which only a hand-edit or a bad restore produces.
+                //
+                // The winner is whichever key sorts last, *not* whichever appears last
+                // in the file: `serde_json` is built without `preserve_order`, so
+                // `Map` is a `BTreeMap` and file order was already lost at parse time.
+                // Python's dict comprehension would keep the last one in *insertion*
+                // order. So on a collision this can keep the other password hash —
+                // worth stating plainly, because the alternative (honouring file
+                // order) would mean enabling `preserve_order` globally to serve a
+                // malformed-file case. The losing record is dropped on write, so an
+                // operator who hits this should restore from backup rather than
+                // re-save.
                 if normalised.insert(key.clone(), user).is_some() {
+                    tracing::warn!(
+                        username = %key,
+                        "duplicate username differing only by case or whitespace in auth file"
+                    );
                     changed = true;
                 }
                 if key != name {
@@ -632,6 +696,20 @@ impl AuthStore {
                 keep
             });
             changed |= users.len() != before;
+
+            // A purge that empties the table is not written back. `delete_user`
+            // refuses to empty it for the same reason: `is_configured` would flip
+            // false, first-run setup would reopen, and admin would go to whoever
+            // reaches it next. A file whose *only* user is reserved is a hand-edited
+            // or restored-from-backup case, so the safe outcome is to keep it on disk
+            // for an operator to look at rather than silently persist an unconfigured
+            // instance.
+            if users.is_empty() && before > 0 {
+                tracing::error!(
+                    "auth file contains only reserved or empty usernames; refusing to persist the purge"
+                );
+                changed = false;
+            }
         }
 
         // 4. `setup.py`'s `role: "admin"` marker, per user. Only when `is_admin` is
@@ -802,14 +880,24 @@ impl AuthStore {
         self.save_auth(&file)
     }
 
-    /// Sets a user's password.
+    /// Changes a user's password, verifying the current one first.
+    ///
+    /// `core/auth.py:468-477` requires `current_password`. Without it this is an
+    /// unauthenticated reset of any account, so the parameter is part of the signature
+    /// rather than a convention a handler might forget -- AGENTS.md §4.
     ///
     /// # Errors
     ///
-    /// Returns [`AuthError::NoSuchUser`] if the account does not exist, and
-    /// propagates password and IO failures.
-    pub fn set_password(&self, username: &str, password: &str) -> Result<(), AuthError> {
-        let hash = Self::hash_password(password)?;
+    /// Returns [`AuthError::NoSuchUser`] for an unknown account,
+    /// [`AuthError::Denied`] when `current_password` does not match, and propagates
+    /// password and IO failures.
+    pub fn set_password(
+        &self,
+        username: &str,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<(), AuthError> {
+        let hash = Self::hash_password(new_password)?;
         // bcrypt is deliberately run before taking the lock: it is slow enough
         // that holding the config lock across it would serialise every other
         // mutation behind one password hash.
@@ -820,22 +908,65 @@ impl AuthStore {
             .users
             .get_mut(&key)
             .ok_or_else(|| AuthError::NoSuchUser(username.to_owned()))?;
+
+        // A malformed stored hash is an error, so `?` denies rather than passing.
+        if !Self::verify_password(current_password, &user.password_hash)? {
+            return Err(AuthError::Denied("current password is incorrect".into()));
+        }
+
         user.password_hash = hash;
         self.save_auth(&file)
     }
 
-    /// Grants or revokes admin.
-    ///
-    /// Refuses to demote the last admin, which would leave the instance with no
-    /// way to manage users.
+    /// Whether `username` administers the instance.
     ///
     /// # Errors
     ///
-    /// Returns [`AuthError::Denied`] when demoting the last admin, and
+    /// Returns [`AuthError`] if the file cannot be read.
+    pub fn is_admin(&self, username: &str) -> Result<bool, AuthError> {
+        let key = normalise_username(username);
+        Ok(self
+            .load_auth()?
+            .users
+            .get(&key)
+            .is_some_and(|u| u.is_admin))
+    }
+
+    /// Fails unless `requester` is an administrator.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`AuthError`] from reading the file.
+    fn require_admin(requester: &str, file: &AuthFile) -> Result<(), AuthError> {
+        let key = normalise_username(requester);
+        if file.users.get(&key).is_some_and(|u| u.is_admin) {
+            return Ok(());
+        }
+        Err(AuthError::NotAuthorized(format!(
+            "{requester} may not perform an administrative action"
+        )))
+    }
+
+    /// Grants or revokes admin. Admin-only, and refuses to demote the last admin.
+    ///
+    /// `core/auth.py:430-431` returns `NOT_AUTHORIZED` unless the requester is an
+    /// admin. That check lives in the signature so it cannot be forgotten by a handler
+    /// -- AGENTS.md §4 -- rather than being left to a convention nothing enforces.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::NotAuthorized`] when `requester` is not an admin,
+    /// [`AuthError::Denied`] when demoting the last admin, and
     /// [`AuthError::NoSuchUser`] for an unknown account.
-    pub fn set_admin(&self, username: &str, is_admin: bool) -> Result<(), AuthError> {
+    pub fn set_admin(
+        &self,
+        username: &str,
+        is_admin: bool,
+        requester: &str,
+    ) -> Result<(), AuthError> {
         let _guard = self.lock_config()?;
         let mut file = self.load_auth()?;
+        Self::require_admin(requester, &file)?;
         let key = normalise_username(username);
         let Some(currently_admin) = file.users.get(&key).map(|u| u.is_admin) else {
             return Err(AuthError::NoSuchUser(username.to_owned()));
@@ -902,26 +1033,77 @@ impl AuthStore {
     }
 
     /// Resolves privileges from an already-loaded record.
+    ///
+    /// `allowed_models` is handled here rather than in [`AuthStore::apply_privilege`]
+    /// because Python combines it with `allowed_models_restricted` through an `or`
+    /// (`routes/chat_helpers.py:167`), and an `or` is order-independent in Python but
+    /// *not* here: `BTreeMap` iterates sorted, so `allowed_models` is visited before
+    /// `allowed_models_restricted`, which would then overwrite the flag it had set.
     #[must_use]
     pub fn privileges_for(user: &User) -> Privileges {
         if user.is_admin {
             return Privileges::admin();
         }
         let mut p = Privileges::default();
+        // Python: `restricted = bool(privs.get("allowed_models_restricted")) or
+        // bool(allowed)`, so a non-empty `allowed_models` restricts on its own.
+        let mut restricted_by_list = false;
+
         for (key, value) in &user.privileges {
-            Self::apply_privilege(&mut p, key, value);
+            if key == "allowed_models" {
+                restricted_by_list = Self::apply_allowed_models(&mut p, value);
+            } else {
+                Self::apply_privilege(&mut p, key, value);
+            }
+        }
+
+        if restricted_by_list {
+            p.allowed_models_restricted = true;
         }
         p
     }
 
+    /// Applies `allowed_models`, returning whether it restricts on its own.
+    ///
+    /// `_allowed_models_from_privileges` (`routes/chat_helpers.py:163-169`) is:
+    ///
+    /// ```python
+    /// allowed_raw = privs.get("allowed_models")
+    /// allowed = allowed_raw if isinstance(allowed_raw, list) else []
+    /// restricted = bool(privs.get("allowed_models_restricted")) or bool(allowed)
+    /// return frozenset(m for m in allowed if isinstance(m, str)) if restricted else None
+    /// ```
+    ///
+    /// Three consequences that are easy to get backwards:
+    ///
+    /// * A **non-list is coerced to `[]` before** `bool()` is applied, so a truthy
+    ///   object like `{"x": 1}` leaves the user unrestricted. Treating it as a
+    ///   restriction would block a user Python lets through.
+    /// * A non-empty list **restricts even when every element is unusable**: the
+    ///   `frozenset` comprehension filters non-strings, so `[1, 2]` restricts to the
+    ///   empty set and blocks *every* model. Decoding that as "no restriction" would
+    ///   grant every model — the fail-open direction.
+    /// * An empty list does not restrict, so a file predating
+    ///   `allowed_models_restricted` keeps working, which is why `get_privileges`
+    ///   merges `{**DEFAULT_PRIVILEGES, **stored}`.
+    fn apply_allowed_models(target: &mut Privileges, value: &serde_json::Value) -> bool {
+        let Some(list) = value.as_array().filter(|l| !l.is_empty()) else {
+            return false;
+        };
+        target.allowed_models = list
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        true
+    }
+
     /// Applies one stored privilege override.
     ///
-    /// A value of the wrong JSON type is **denied**, not silently replaced by the
-    /// default. The permissive fallback would be the wrong direction: for the six
-    /// capabilities that default to `true`, a corrupt `"can_use_agent": 0` would
-    /// decode as *permitted*, and a corrupt `max_messages_per_day` would decode as
-    /// `0` — an unlimited quota. `auth_helpers.py:186` denies in the same cases
-    /// (`not privs.get(key, True)`).
+    /// A value of the wrong JSON type is **denied**, not silently replaced by the default.
+    /// The permissive fallback would be the wrong direction: for the capabilities that
+    /// default to `true`, a corrupt `"can_use_agent": 0` would decode as *permitted*,
+    /// and a corrupt `max_messages_per_day` would decode as `0` -- an unlimited quota.
     ///
     /// An unrecognised *key* is still ignored, so a newer build's privilege does
     /// not stop an older one from starting.
@@ -949,25 +1131,6 @@ impl AuthStore {
             "max_messages_per_day" => {
                 target.max_messages_per_day = value.as_u64().unwrap_or(1);
             }
-            // `_allowed_models_from_privileges` (`routes/chat_helpers.py:163-169`)
-            // computes `restricted = bool(privs.get("allowed_models_restricted")) or
-            // bool(allowed)`. Python truthiness, not JSON booleanness, is the rule.
-            "allowed_models" => match value {
-                serde_json::Value::Array(_) => {
-                    target.allowed_models =
-                        serde_json::from_value::<Vec<String>>(value.clone()).unwrap_or_default();
-                }
-                // A truthy non-list is a restriction under `bool(...)`, so honour it as
-                // one. Decoding it as "no restriction" would grant more than Python.
-                other if !is_falsy(other) => {
-                    target.allowed_models = Vec::new();
-                    target.allowed_models_restricted = true;
-                }
-                // Empty list or empty container: Python's `bool([])` is False, so this
-                // is *unrestricted*. Forcing `restricted` here would lock a legacy user
-                // out of every model while Python permits all of them.
-                _ => {}
-            },
             // These two are restrictions, so the direction of a wrong-typed value
             // matters: `"block_all_models": "yes"` is truthy in Python and blocks every
             // model, whereas decoding it as `false` would grant *more*.
@@ -1156,13 +1319,20 @@ impl AuthStore {
     ///
     /// Returns [`AuthError::Denied`] for the last administrator,
     /// [`AuthError::NoSuchUser`] for an unknown account, and propagates IO failures.
-    pub fn delete_user(&self, username: &str) -> Result<(), AuthError> {
+    pub fn delete_user(&self, username: &str, requester: &str) -> Result<(), AuthError> {
         let _config = self.lock_config()?;
         // Held for the whole operation, so the account edit and the session revocation
         // cannot interleave with another rename or delete.
         let sessions = self.lock_sessions()?;
         let key = normalise_username(username);
         let mut file = self.load_auth()?;
+        // `core/auth.py:297-300` refuses self-deletion and a non-admin requester.
+        Self::require_admin(requester, &file)?;
+        if key == normalise_username(requester) {
+            return Err(AuthError::Denied(
+                "an administrator cannot delete themselves".into(),
+            ));
+        }
         if !file.users.contains_key(&key) {
             return Err(AuthError::NoSuchUser(username.to_owned()));
         }
@@ -1199,7 +1369,7 @@ impl AuthStore {
     ///
     /// Returns [`AuthError::Denied`] when the target name is empty, taken, or
     /// reserved, and propagates IO failures.
-    pub fn rename_user(&self, from: &str, to: &str) -> Result<(), AuthError> {
+    pub fn rename_user(&self, from: &str, to: &str, requester: &str) -> Result<(), AuthError> {
         let _config = self.lock_config()?;
         let _sessions = self.lock_sessions()?;
         let from_key = normalise_username(from);
@@ -1218,6 +1388,8 @@ impl AuthStore {
         }
 
         let mut file = self.load_auth()?;
+        // `core/auth.py:349-351` refuses a non-admin requester.
+        Self::require_admin(requester, &file)?;
         let Some(user) = file.users.remove(&from_key) else {
             return Err(AuthError::NoSuchUser(from.to_owned()));
         };
@@ -1500,10 +1672,6 @@ mod tests {
     }
 
     /// A store over a temp dir seeded with one raw `auth.json`.
-    fn new_store() -> (tempfile::TempDir, AuthStore) {
-        store()
-    }
-
     /// A store over a temp dir seeded with one raw `auth.json`.
     fn store_with_raw(contents: &str) -> (tempfile::TempDir, AuthStore) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1732,7 +1900,7 @@ mod tests {
         let token = store.issue_token("alice").expect("issue");
         assert!(store.validate_token(&token).expect("valid before"));
 
-        store.delete_user("alice").expect("delete");
+        store.delete_user("alice", "root").expect("delete");
 
         assert!(
             !store.validate_token(&token).expect("valid after"),
@@ -1819,12 +1987,16 @@ mod tests {
     #[test]
     fn rename_carries_sessions_across() {
         let (_dir, store) = store();
+        // rename is admin-only, so a requester has to exist.
+        store
+            .create_user("root", "hunter2hunter2", true)
+            .expect("create admin");
         store
             .create_user("alice", "hunter2hunter2", false)
             .expect("create");
         let token = store.issue_token("alice").expect("issue");
 
-        store.rename_user("alice", "bob").expect("rename");
+        store.rename_user("alice", "bob", "root").expect("rename");
 
         assert!(store.validate_token(&token).expect("token survives rename"));
         assert_eq!(
@@ -1844,7 +2016,7 @@ mod tests {
             .create_user("bob", "hunter2hunter2", false)
             .expect("create");
 
-        assert!(store.rename_user("alice", "bob").is_err());
+        assert!(store.rename_user("alice", "bob", "root").is_err());
         assert!(
             store.user_exists("alice").expect("alice must still exist"),
             "a refused rename must not lose the account"
@@ -1857,7 +2029,9 @@ mod tests {
         store
             .create_user("root", "hunter2hunter2", true)
             .expect("create");
-        let err = store.set_admin("root", false).expect_err("must refuse");
+        let err = store
+            .set_admin("root", false, "root")
+            .expect_err("must refuse");
         assert!(matches!(err, AuthError::Denied(_)));
         assert!(store.user("root").expect("root").is_admin, "still admin");
 
@@ -1865,7 +2039,7 @@ mod tests {
         store
             .create_user("second", "hunter2hunter2", true)
             .expect("create");
-        store.set_admin("second", false).expect("demote");
+        store.set_admin("second", false, "root").expect("demote");
         assert!(!store.user("second").expect("second").is_admin);
     }
 
@@ -1884,10 +2058,10 @@ mod tests {
 
         // `bob` is not an admin, so this must succeed even though `root` is the
         // only admin.
-        store.set_admin("bob", true).expect("promote");
+        store.set_admin("bob", true, "root").expect("promote");
         assert!(store.user("bob").expect("bob").is_admin);
 
-        store.set_admin("bob", false).expect("demote back");
+        store.set_admin("bob", false, "root").expect("demote back");
         assert!(!store.user("bob").expect("bob").is_admin);
         assert!(store.user("root").expect("root").is_admin, "root untouched");
     }
@@ -1909,13 +2083,13 @@ mod tests {
 
         assert!(!store.privileges("bob").expect("privs").can_use_bash);
 
-        store.set_admin("bob", true).expect("promote");
+        store.set_admin("bob", true, "root").expect("promote");
         assert!(
             store.privileges("bob").expect("privs").can_use_bash,
             "an admin does get bash while promoted"
         );
 
-        store.set_admin("bob", false).expect("demote");
+        store.set_admin("bob", false, "root").expect("demote");
         let after = store.privileges("bob").expect("privs");
         assert!(!after.can_use_bash, "bash must not survive demotion");
         assert!(after.can_use_agent, "ordinary privileges must come back");
@@ -1934,7 +2108,7 @@ mod tests {
             .create_user("second", "hunter2hunter2", true)
             .expect("create second admin");
 
-        store.set_admin("second", false).expect("demote");
+        store.set_admin("second", false, "root").expect("demote");
         assert_eq!(
             store.privileges("second").expect("privs"),
             Privileges::default(),
@@ -1964,11 +2138,11 @@ mod tests {
         ]);
         store.save_auth(&file).expect("save");
 
-        store.set_admin("bob", true).expect("promote");
+        store.set_admin("bob", true, "root").expect("promote");
         store
-            .set_admin("bob", true)
+            .set_admin("bob", true, "root")
             .expect("redundant promote is a no-op");
-        store.set_admin("bob", false).expect("demote");
+        store.set_admin("bob", false, "root").expect("demote");
 
         let after = store.privileges("bob").expect("privs");
         assert!(!after.can_use_agent, "narrowed agent access must survive");
@@ -2014,7 +2188,9 @@ mod tests {
             .expect("create");
 
         for bad in ["", "   ", "\t\n "] {
-            let err = store.rename_user("root", bad).expect_err("must refuse");
+            let err = store
+                .rename_user("root", bad, "root")
+                .expect_err("must refuse");
             assert!(matches!(err, AuthError::Denied(_)), "{bad:?} gave {err:?}");
         }
 
@@ -2033,7 +2209,7 @@ mod tests {
             .create_user("root", "hunter2hunter2", true)
             .expect("create");
 
-        let err = store.delete_user("root").expect_err("must refuse");
+        let err = store.delete_user("root", "root").expect_err("must refuse");
         assert!(matches!(err, AuthError::Denied(_)), "{err:?}");
         assert!(store.user_exists("root").expect("root survives"));
 
@@ -2041,14 +2217,14 @@ mod tests {
         store
             .create_user("bob", "hunter2hunter2", false)
             .expect("create");
-        store.delete_user("bob").expect("delete");
+        store.delete_user("bob", "root").expect("delete");
         assert!(!store.user_exists("bob").expect("gone"));
     }
 
     #[test]
     fn a_malformed_privilege_value_denies_rather_than_defaulting() {
         // Fail-open risk: `can_use_agent` defaults to true, so a corrupt non-boolean
-        // would decode as *permitted*. Python denies (`not privs.get(key, True)`).
+        // would decode as *permitted*.
         let (_dir, store) = store();
         let mut file = store.load_auth().expect("load");
         file.users.insert(
@@ -2058,7 +2234,6 @@ mod tests {
                     ("can_use_agent".into(), json!(0)),
                     ("can_use_bash".into(), json!("yes")),
                     ("max_messages_per_day".into(), json!("lots")),
-                    ("allowed_models".into(), json!({"not": "a list"})),
                 ]),
                 ..User::new("$2b$12$abc".to_owned(), false)
             },
@@ -2072,9 +2247,254 @@ mod tests {
             privs.max_messages_per_day, 1,
             "a corrupt quota must deny, not become unlimited"
         );
+    }
+
+    #[test]
+    fn an_allowed_models_list_of_non_strings_restricts_to_nothing() {
+        // `chat_helpers.py:168` builds `frozenset(m for m in allowed if isinstance(m,
+        // str))`, so `[1, 2]` restricts to the *empty* set and blocks every model. An
+        // implementation that instead decodes the list as `Vec<String>`, fails, and
+        // falls back to "no restriction" would grant every model -- the fail-open
+        // direction. The plausible UI bug that produces this is `[{"id": "gpt-4"}]`.
+        let (_dir, store) = store_with_raw(
+            r#"{"users": {"alice": {"password_hash": "$2b$12$abc", "is_admin": false,
+                "privileges": {"allowed_models": [1, 2]}}}}"#,
+        );
+
+        let privs = store.privileges("alice").expect("privs");
         assert!(
             privs.allowed_models_restricted,
-            "an undecodable model list must not mean 'no restriction'"
+            "a non-empty list restricts even when no element is usable"
+        );
+        assert!(
+            privs.allowed_models.is_empty(),
+            "and it restricts to nothing, so every model is blocked"
+        );
+    }
+
+    #[test]
+    fn a_non_list_allowed_models_leaves_the_user_unrestricted() {
+        // `chat_helpers.py:165-167` coerces a non-list to `[]` *before* applying
+        // `bool()`, so a truthy object never restricts. Treating it as a restriction
+        // would block a user Python lets through.
+        let (_dir, store) = store_with_raw(
+            r#"{"users": {"alice": {"password_hash": "$2b$12$abc", "is_admin": false,
+                "privileges": {"allowed_models": {"gpt-4": true}}}}}"#,
+        );
+
+        let privs = store.privileges("alice").expect("privs");
+        assert!(
+            !privs.allowed_models_restricted,
+            "a non-list is coerced to [], and bool([]) is False"
+        );
+    }
+
+    #[test]
+    fn a_non_empty_allowed_models_restricts_even_when_the_flag_says_otherwise() {
+        // `restricted = bool(privs.get("allowed_models_restricted")) or bool(allowed)`
+        // is an `or`, so it is order-independent in Python. Here `BTreeMap` iterates
+        // sorted, so `allowed_models` is visited *before*
+        // `allowed_models_restricted` -- computing this inside the walk would let the
+        // explicit `false` overwrite it.
+        let (_dir, store) = store_with_raw(
+            r#"{"users": {"alice": {"password_hash": "$2b$12$abc", "is_admin": false,
+                "privileges": {"allowed_models": ["gpt-4"], "allowed_models_restricted": false}}}}"#,
+        );
+
+        let privs = store.privileges("alice").expect("privs");
+        assert!(
+            privs.allowed_models_restricted,
+            "a non-empty allowed_models restricts regardless of the sibling flag"
+        );
+        assert_eq!(privs.allowed_models, vec!["gpt-4".to_owned()]);
+    }
+
+    #[test]
+    fn the_promote_demote_cycle_is_stable_and_leaves_no_stash() {
+        // `tests/test_set_admin.py:162`. Two full cycles must preserve the original
+        // privilege map exactly, and must not leave `privileges_before_admin` on the
+        // row: the stash is promotion-time bookkeeping, and Python's spec asserts
+        // `assert "privileges_before_admin" not in mgr.users["bob"]`.
+        let (_dir, store) = store();
+        store
+            .create_user("root", "hunter2hunter2", true)
+            .expect("create");
+        store
+            .create_user("bob", "hunter2hunter2", false)
+            .expect("create");
+
+        let original = store.privileges("bob").expect("privs");
+
+        for cycle in 1..=2 {
+            store.set_admin("bob", true, "root").expect("promote");
+            assert!(store.privileges("bob").expect("promoted").can_use_bash);
+
+            store.set_admin("bob", false, "root").expect("demote");
+            assert_eq!(
+                store.privileges("bob").expect("demoted"),
+                original,
+                "cycle {cycle} must restore the original map"
+            );
+        }
+
+        // The stash must be gone from disk, not merely inert.
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(store.auth_path()).expect("read"))
+                .expect("json");
+        assert!(
+            on_disk["users"]["bob"]
+                .get("privileges_before_admin")
+                .is_none(),
+            "the stash must not linger on the row: {on_disk}"
+        );
+    }
+
+    #[test]
+    fn the_stashed_privileges_survive_a_reopen() {
+        // `tests/test_set_admin.py:195`. The stash lives in the file, so it has to
+        // round-trip through `auth.json`, not just sit in memory.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = AuthStore::new(dir.path());
+        store
+            .create_user("root", "hunter2hunter2", true)
+            .expect("create");
+        store
+            .create_user("bob", "hunter2hunter2", false)
+            .expect("create");
+        let original = store.privileges("bob").expect("privs");
+
+        store.set_admin("bob", true, "root").expect("promote");
+
+        // A fresh store over the same directory, as a process restart would build.
+        let reopened = AuthStore::new(dir.path());
+        reopened
+            .set_admin("bob", false, "root")
+            .expect("demote after reopen");
+        assert_eq!(
+            reopened.privileges("bob").expect("privs"),
+            original,
+            "the stash must survive a reopen"
+        );
+    }
+
+    #[test]
+    fn only_an_admin_may_change_admin_status() {
+        // `core/auth.py:430-431` returns NOT_AUTHORIZED for a non-admin requester;
+        // `tests/test_set_admin.py:106` pins it. The check is in the signature so a
+        // handler cannot forget it.
+        let (_dir, store) = store();
+        store
+            .create_user("root", "hunter2hunter2", true)
+            .expect("create");
+        store
+            .create_user("bob", "hunter2hunter2", false)
+            .expect("create");
+
+        let err = store
+            .set_admin("bob", true, "bob")
+            .expect_err("must refuse");
+        assert!(matches!(err, AuthError::NotAuthorized(_)), "{err:?}");
+        assert!(!store.user("bob").expect("bob").is_admin);
+
+        // The same for the other administrative operations.
+        assert!(matches!(
+            store.delete_user("bob", "bob").expect_err("must refuse"),
+            AuthError::NotAuthorized(_)
+        ));
+        assert!(matches!(
+            store
+                .rename_user("bob", "robert", "bob")
+                .expect_err("must refuse"),
+            AuthError::NotAuthorized(_)
+        ));
+        assert!(store.user_exists("bob").expect("bob survives"));
+    }
+
+    #[test]
+    fn an_admin_cannot_delete_themselves() {
+        // `core/auth.py:297-298`.
+        let (_dir, store) = store();
+        store
+            .create_user("root", "hunter2hunter2", true)
+            .expect("create");
+        store
+            .create_user("bob", "hunter2hunter2", false)
+            .expect("create");
+
+        let err = store.delete_user("root", "root").expect_err("must refuse");
+        assert!(matches!(err, AuthError::Denied(_)), "{err:?}");
+        assert!(store.user_exists("root").expect("root survives"));
+    }
+
+    #[test]
+    fn changing_a_password_requires_the_current_one() {
+        // `core/auth.py:472`. Without the parameter this is an unauthenticated reset
+        // of any account, and a username-existence oracle for anyone who can reach it.
+        let (_dir, store) = store();
+        store
+            .create_user("alice", "hunter2hunter2", false)
+            .expect("create");
+
+        let err = store
+            .set_password("alice", "wrong-password", "newpassword1")
+            .expect_err("must refuse");
+        assert!(matches!(err, AuthError::Denied(_)), "{err:?}");
+
+        let unchanged = store.user("alice").expect("alice");
+        assert!(
+            AuthStore::verify_password("hunter2hunter2", &unchanged.password_hash).expect("verify"),
+            "the old password must still work"
+        );
+
+        store
+            .set_password("alice", "hunter2hunter2", "newpassword1")
+            .expect("change");
+        let changed = store.user("alice").expect("alice");
+        assert!(AuthStore::verify_password("newpassword1", &changed.password_hash).expect("v"));
+        assert!(!AuthStore::verify_password("hunter2hunter2", &changed.password_hash).expect("v"));
+    }
+
+    #[test]
+    fn a_migration_that_would_empty_the_table_is_not_persisted() {
+        // `delete_user` refuses to empty the user table; the reserved-name purge must
+        // not do it either. A file whose only account is reserved is a hand-edit or a
+        // bad restore, so the safe outcome is to leave it for an operator.
+        let (_dir, store) = store_with_raw(
+            r#"{"users": {"api": {"password_hash": "$2b$12$x", "is_admin": true}}}"#,
+        );
+
+        assert!(
+            !store
+                .user_exists("api")
+                .expect("api is not honoured in memory")
+        );
+        store.migrate_and_persist().expect("migrate");
+
+        let on_disk = std::fs::read_to_string(store.auth_path()).expect("read");
+        assert!(
+            on_disk.contains("\"api\""),
+            "the purge must not be written back: {on_disk}"
+        );
+    }
+
+    #[test]
+    fn a_missing_password_hash_does_not_brick_the_instance() {
+        // The field has no `#[serde(default)]`-equivalent for absence in an earlier
+        // revision, so `{"users": {"alice": {"is_admin": false}}}` made every auth
+        // operation fail permanently. Python tolerates it until login.
+        let (_dir, store) = store_with_raw(
+            r#"{"users": {"alice": {"is_admin": false}, "root": {"is_admin": true}}}"#,
+        );
+
+        assert!(store.is_configured().expect("configured"));
+        assert!(store.user_exists("alice").expect("alice exists"));
+        assert!(store.user_exists("root").expect("root exists"));
+
+        // It fails closed at verification rather than at load.
+        let user = store.user("alice").expect("alice");
+        assert!(
+            AuthStore::verify_password("anything", &user.password_hash).is_err(),
+            "an empty stored hash must not verify anything"
         );
     }
 
@@ -2121,7 +2541,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_sessions_are_pruned_from_disk_without_any_token_being_presented() {
+    fn prune_sessions_drops_an_abandoned_login_that_is_never_presented() {
         // Python prunes at load (`_load_sessions:143-146`). Pruning only on
         // presentation would leave every abandoned login in the file forever.
         let (_dir, store) = store();
@@ -2246,10 +2666,10 @@ mod tests {
         // mutation — for any user — silently erased every undeclared per-user field
         // for *every* user on the next save.
         let (_dir, store) = store_with_raw(
-            r#"{"users": {"alice": {"password_hash": "$2b$12$abc", "is_admin": false, "future_field": {"nested": [1, 2]}}}}"#,
+            r#"{"users": {"alice": {"password_hash": "$2b$12$abc", "is_admin": false, "future_field": {"nested": [1, 2]}}, "root": {"password_hash": "$2b$12$abc", "is_admin": true}}}"#,
         );
 
-        store.set_admin("alice", true).expect("promote");
+        store.set_admin("alice", true, "root").expect("promote");
 
         let on_disk: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(store.auth_path()).expect("read"))
@@ -2311,18 +2731,31 @@ mod tests {
             .create_user("bob", "hunter2hunter2", false)
             .expect("create");
 
-        store.delete_user("bob").expect("delete the middle user");
+        store
+            .delete_user("bob", "root")
+            .expect("delete the middle user");
         assert!(store.is_configured().expect("still configured"));
 
-        let err = store.delete_user("root").expect_err("last admin");
+        let err = store.delete_user("root", "root").expect_err("last admin");
         assert!(matches!(err, AuthError::Denied(_)), "{err:?}");
 
-        // A sole non-admin is equally protected.
-        let (_d2, single) = new_store();
+        // A sole non-admin is equally protected. `delete_user` is admin-only, so the
+        // table needs a second, non-admin account for there to be a legal requester.
+        let (_d2, single) = {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let s = AuthStore::new(dir.path());
+            (dir, s)
+        };
+        single
+            .create_user("root", "hunter2hunter2", true)
+            .expect("create admin");
         single
             .create_user("solo", "hunter2hunter2", false)
             .expect("create");
-        let err = single.delete_user("solo").expect_err("only user");
+        single
+            .delete_user("solo", "root")
+            .expect("delete the only non-admin");
+        let err = single.delete_user("root", "root").expect_err("only user");
         assert!(matches!(err, AuthError::Denied(_)), "{err:?}");
         assert!(single.is_configured().expect("still configured"));
     }
@@ -2391,6 +2824,9 @@ mod tests {
     fn rename_moves_a_hand_edited_mixed_case_session() {
         let (_dir, store) = store();
         store
+            .create_user("root", "hunter2hunter2", true)
+            .expect("create admin");
+        store
             .create_user("alice", "hunter2hunter2", false)
             .expect("create");
         let token = store.issue_token("alice").expect("issue");
@@ -2398,7 +2834,7 @@ mod tests {
         doc.tokens.get_mut(&token).expect("entry").username = "ALICE".to_owned();
         store.save_sessions(&doc).expect("write");
 
-        store.rename_user("alice", "bob").expect("rename");
+        store.rename_user("alice", "bob", "root").expect("rename");
         assert!(
             store
                 .validate_token(&token)
@@ -2432,6 +2868,55 @@ mod tests {
                 mode & 0o777
             );
         }
+    }
+
+    #[test]
+    fn prepare_hardens_migrates_and_prunes_in_one_startup_step() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // A legacy file, world-readable, with an abandoned session alongside a live one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = AuthStore::new(dir.path());
+        std::fs::write(
+            store.auth_path(),
+            r#"{"username": "operator", "password_hash": "$2b$12$abc"}"#,
+        )
+        .expect("seed");
+        std::fs::set_permissions(store.auth_path(), std::fs::Permissions::from_mode(0o644))
+            .expect("loosen");
+        std::fs::write(
+            store.sessions_path(),
+            format!(
+                r#"{{"{}": {{"username": "operator", "expiry": 1.0}}, "{}": {{"username": "operator", "expiry": 4102444800.0}}}}"#,
+                "1".repeat(64),
+                "2".repeat(64)
+            ),
+        )
+        .expect("seed sessions");
+
+        store.prepare().expect("prepare");
+
+        let mode = std::fs::metadata(store.auth_path())
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(store.auth_path()).expect("read"))
+                .expect("json");
+        assert!(
+            on_disk.get("username").is_none(),
+            "the legacy shape must be rewritten: {on_disk}"
+        );
+        assert_eq!(on_disk["users"]["operator"]["is_admin"], true);
+
+        assert_eq!(
+            store.prune_sessions().expect("already pruned"),
+            1,
+            "the abandoned session must be gone"
+        );
+        assert!(store.validate_token(&"2".repeat(64)).expect("live token"));
     }
 
     #[test]
@@ -2474,7 +2959,9 @@ mod tests {
         store
             .create_user("root", "hunter2hunter2", true)
             .expect("create");
-        let err = store.set_admin("nobody", true).expect_err("must refuse");
+        let err = store
+            .set_admin("nobody", true, "root")
+            .expect_err("must refuse");
         assert!(matches!(err, AuthError::NoSuchUser(_)), "{err:?}");
     }
 

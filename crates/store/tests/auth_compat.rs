@@ -129,10 +129,10 @@ fn round_trips_a_python_written_file_without_losing_unknown_keys() -> TestResult
     // downgrade/upgrade cycle would silently drop a setting. Asserted at *both*
     // levels: `AuthFile` had a top-level `extra` map but `User` did not, so any one
     // mutation silently erased every undeclared per-user field for every user.
-    let contents = r#"{"signup_enabled": true, "future_setting": {"nested": [1, 2]}, "users": {"alice": {"password_hash": "$2b$12$8GTDUnQLeOEj0Ma6it0BU.LD0dqLzcwMUjke8.NhXhNJBeY8LT5gq", "is_admin": false, "privileges": {}, "future_user_field": {"kept": true}}}}"#;
+    let contents = r#"{"signup_enabled": true, "future_setting": {"nested": [1, 2]}, "users": {"alice": {"password_hash": "$2b$12$8GTDUnQLeOEj0Ma6it0BU.LD0dqLzcwMUjke8.NhXhNJBeY8LT5gq", "is_admin": false, "privileges": {}, "future_user_field": {"kept": true}}, "root": {"password_hash": "$2b$12$8GTDUnQLeOEj0Ma6it0BU.LD0dqLzcwMUjke8.NhXhNJBeY8LT5gq", "is_admin": true}}}"#;
     let (_dir, store) = store_with(&[("auth.json", contents)])?;
 
-    store.set_admin("alice", true)?;
+    store.set_admin("alice", true, "root")?;
 
     let on_disk = read_json(store.auth_path())?;
     assert_eq!(
