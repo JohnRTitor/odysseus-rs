@@ -126,11 +126,11 @@ fn a_malformed_bcrypt_hash_fails_closed_rather_than_erroring() -> TestResult {
 #[test]
 fn round_trips_a_python_written_file_without_losing_unknown_keys() -> TestResult {
     // A key this build does not know about must survive a write, or a
-    // downgrade/upgrade cycle would silently drop a setting.
-    let contents = format!(
-        r#"{{"signup_enabled": true, "future_setting": {{"nested": [1, 2]}}, "users": {{{PYTHON_USER_RECORD} }}}}"#
-    );
-    let (_dir, store) = store_with(&[("auth.json", &contents)])?;
+    // downgrade/upgrade cycle would silently drop a setting. Asserted at *both*
+    // levels: `AuthFile` had a top-level `extra` map but `User` did not, so any one
+    // mutation silently erased every undeclared per-user field for every user.
+    let contents = r#"{"signup_enabled": true, "future_setting": {"nested": [1, 2]}, "users": {"alice": {"password_hash": "$2b$12$8GTDUnQLeOEj0Ma6it0BU.LD0dqLzcwMUjke8.NhXhNJBeY8LT5gq", "is_admin": false, "privileges": {}, "future_user_field": {"kept": true}}}}"#;
+    let (_dir, store) = store_with(&[("auth.json", contents)])?;
 
     store.set_admin("alice", true)?;
 
@@ -140,6 +140,31 @@ fn round_trips_a_python_written_file_without_losing_unknown_keys() -> TestResult
         serde_json::json!([1, 2])
     );
     assert_eq!(on_disk["signup_enabled"], true);
+    assert_eq!(
+        on_disk["users"]["alice"]["future_user_field"]["kept"], true,
+        "an unknown per-user key must survive: {on_disk}"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_empty_allowed_models_list_from_an_older_python_build_stays_unrestricted() -> TestResult {
+    // `get_privileges` merges `{**DEFAULT_PRIVILEGES, **stored}` precisely so a file
+    // predating `allowed_models_restricted` still works. Python treats an empty list
+    // as unrestricted (`bool([])` is False); a stricter reading would lock such a
+    // user out of every model.
+    let contents = r#"{"users": {"alice": {
+        "password_hash": "$2b$12$abc",
+        "is_admin": false,
+        "privileges": {"allowed_models": []}
+    }}}"#;
+    let (_dir, store) = store_with(&[("auth.json", contents)])?;
+
+    let privs = store.privileges("alice")?;
+    assert!(
+        !privs.allowed_models_restricted,
+        "an empty list must not block every model"
+    );
     Ok(())
 }
 
