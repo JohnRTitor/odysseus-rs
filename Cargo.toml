@@ -110,6 +110,7 @@ toml = "0.9"
 
 # --- crypto ---
 bcrypt = "0.19"
+getrandom = "0.3"
 subtle = "2.6"
 secrecy = "0.10"
 totp-rs = { version = "6", features = ["secret_container"] }

@@ -13,6 +13,8 @@
 
 #![deny(missing_docs)]
 
+pub mod atomic;
+pub mod auth;
 pub mod blocking;
 pub mod crypto;
 pub mod pool;

@@ -36,7 +36,7 @@
 | **PARTIAL** | **1** |
 | **UNIMPLEMENTED** | **285** |
 | **REMOVED** | 10 |
-| **REPLACED** | 4 |
+| **REPLACED** | 6 |
 | Phases complete | 0 of 24 |
 | Blocked by a failed spike | 4 (conditional) |
 | Spikes resolved | 2 of 11 (S1/S2, S7) — see `SPIKE_RESULTS.md` |
@@ -239,7 +239,7 @@ reach zero.** That inverts the whole point of this file.
 
 ---
 
-## 6. Data-migration acceptance criteria — status
+## 7. Data-migration acceptance criteria — status
 
 `DATA_MIGRATION.md` §11 lists 12 criteria for the data migration. Progress:
 
@@ -250,7 +250,7 @@ reach zero.** That inverts the whole point of this file.
 | 3 | `PRAGMA index_list` matches for every table | **MET** — 81 explicit indexes |
 | 4 | `PRAGMA foreign_key_check` returns zero rows | **MET** |
 | 5 | Sessions, messages, documents, memories, notes, tasks, calendar readable and owner-scoped | **PARTIAL** — column-shape round-trip proven; owner-scoping queries land in Phase 1 |
-| 6 | Login works against the real `auth.json` + `sessions.json` | UNIMPLEMENTED (T0060) |
+| 6 | Login works against the real `auth.json` + `sessions.json` | **PARTIAL** — the store reads, verifies and prunes both files: `crates/store/src/auth.rs` + `crates/store/tests/auth_compat.rs` (11 fixtures pinned to `core/auth.py`, incl. legacy migration, reserved-name purge, orphan-token pruning). The HTTP login endpoint does not exist yet — T0064/T0087 |
 | 7 | A previously-encrypted column decrypts with the real `.app_key` | **MET for the key** — the install's real `.app_key` loads and round-trips. The install currently holds **0 encrypted rows**, so decrypting a stored value is untested against real data |
 | 8 | `data/settings.json` keys are honoured | UNIMPLEMENTED (Phase 20) |
 | 9 | Golden-set vector agreement at chosen thresholds | UNIMPLEMENTED (spike S11) |
@@ -264,10 +264,11 @@ against a populated install before release.
 
 ---
 
-## 7. Change log
+## 8. Change log
 
 | Date | Change | By |
 |---|---|---|
 | Planning | Initial register created from the source audit at `0b66c720`. All 300 features classified; implementation not started. | plan |
+| Phase 0 | `auth.json`/`sessions.json` store landed (T0060–T0063, T0069). Data-migration criterion 6 moved UNIMPLEMENTED → PARTIAL: file formats load, verify and prune, but the HTTP login endpoint does not exist. Corrected the REPLACED count (4 → 6, the table already had six rows) and the duplicated `## 6.` heading. | plan |
 
 **Update this file and `TASKS.md` in the same commit as any implementation work.**
