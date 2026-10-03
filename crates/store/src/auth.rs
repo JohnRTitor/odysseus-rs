@@ -19,10 +19,14 @@
 //! * `validate_token` performs an **orphan check**: a token whose username no
 //!   longer exists in `auth.json` is rejected *and* pruned. Otherwise renaming or
 //!   deleting a user would leave live sessions behind.
-//! * TOTP **fails closed**: a user with `totp_enabled` but no secret is refused
-//!   entry, never waved through.
+//!
+//! TOTP is **not implemented here** (T0068). `User` parses `totp_enabled` and the
+//! secrets so the file round-trips, but nothing in this module verifies a code, so a
+//! caller reading those fields today must not treat them as enforced.
 //! * Admins get the full privilege set wholesale, and the last admin cannot be
-//!   demoted.
+//!   demoted or deleted.
+//! * Promotion stashes `privileges_before_admin`; demotion restores it, so a
+//!   temporary admin stint cannot leave `can_use_bash` behind.
 
 use std::{
     collections::BTreeMap,
@@ -103,7 +107,13 @@ pub enum AuthError {
 }
 
 /// A user's stored record.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written to redact `password_hash` and the TOTP secrets. A
+/// derived `Debug` would put a bcrypt hash and a base32 TOTP seed into any
+/// `tracing::debug!(?user)`, any `#[instrument]` that captures its argument, and
+/// any `expect("…{user:?}")` — and a leaked TOTP seed regenerates valid codes
+/// forever, which no session revocation can undo. See AGENTS.md §4 and §10.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct User {
     /// bcrypt hash, never the plaintext.
     pub password_hash: String,
@@ -139,6 +149,35 @@ pub struct User {
     pub totp_backup_codes: Option<Vec<String>>,
 }
 
+impl std::fmt::Debug for User {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("User")
+            .field("password_hash", &"<redacted>")
+            .field("created", &self.created)
+            .field("is_admin", &self.is_admin)
+            .field("privileges", &self.privileges)
+            .field("privileges_before_admin", &self.privileges_before_admin)
+            .field(
+                "totp_secret",
+                &self.totp_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("totp_enabled", &self.totp_enabled)
+            .field(
+                "totp_secret_pending",
+                &self.totp_secret_pending.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "totp_backup_codes",
+                &self
+                    .totp_backup_codes
+                    .as_ref()
+                    .map_or(0usize, Vec::len)
+                    .to_string(),
+            )
+            .finish()
+    }
+}
+
 impl User {
     /// A new user with the given bcrypt hash.
     #[must_use]
@@ -162,7 +201,10 @@ impl User {
 }
 
 /// The `auth.json` document.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written so that logging an `AuthFile` cannot spill every user's
+/// bcrypt hash at once. See [`User`].
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct AuthFile {
     /// Whether anyone may self-register.
     #[serde(default)]
@@ -175,6 +217,16 @@ struct AuthFile {
     extra: BTreeMap<String, serde_json::Value>,
 }
 
+impl std::fmt::Debug for AuthFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthFile")
+            .field("signup_enabled", &self.signup_enabled)
+            .field("users", &self.users)
+            .field("extra_keys", &self.extra.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 /// The `sessions.json` document.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SessionFile {
@@ -183,17 +235,41 @@ struct SessionFile {
 }
 
 /// One live browser session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SessionEntry {
+    /// Defaulted so a hand-edited or truncated entry is skipped rather than
+    /// failing the parse of every other token in the file.
+    #[serde(default, deserialize_with = "null_as_default")]
     username: String,
     /// Unix expiry, as Python's `time.time()`.
     ///
     /// Defaults to `0` rather than erroring, matching `_load_sessions`'s
-    /// `v.get("expiry", 0) > now`. Without the default a hand-edited or
-    /// truncated entry would fail the whole file's parse and surface as a hard
-    /// error on every request, instead of simply expiring.
-    #[serde(default)]
+    /// `v.get("expiry", 0) > now`, so a missing or null expiry simply expires.
+    /// Without this a single bad entry would fail the whole file's parse and turn
+    /// every authenticated request into a 500.
+    #[serde(default, deserialize_with = "null_as_default")]
     expiry: f64,
+}
+
+/// Treats an explicit JSON `null` as an absent field.
+///
+/// `#[serde(default)]` only covers a *missing* key, so `{"expiry": null}` would
+/// still be a hard parse error. Both failure modes must expire the entry.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+impl std::fmt::Debug for SessionEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionEntry")
+            .field("username", &self.username)
+            .field("expiry", &self.expiry)
+            .finish()
+    }
 }
 
 /// The privilege set, from `DEFAULT_PRIVILEGES`.
@@ -371,40 +447,54 @@ impl AuthStore {
     /// The caller gets a loud failure rather than a silently empty user table,
     /// which would look like "everyone was locked out".
     fn load_auth(&self) -> Result<AuthFile, AuthError> {
-        if !self.auth_path.exists() {
+        let Some(raw) = self.read_auth_raw()? else {
             return Ok(AuthFile::default());
+        };
+        let mut document = parse_auth(&raw, &self.auth_path)?;
+        Self::migrate_document(&mut document);
+        decode_auth(document, &self.auth_path)
+    }
+
+    /// Reads `auth.json` verbatim, or `None` when it does not exist.
+    fn read_auth_raw(&self) -> Result<Option<String>, AuthError> {
+        if !self.auth_path.exists() {
+            return Ok(None);
         }
-        let raw = std::fs::read_to_string(&self.auth_path).map_err(|source| AuthError::Io {
-            path: self.auth_path.display().to_string(),
-            source,
-        })?;
-
-        // Migrations run on the raw JSON, not on `AuthFile`. Two of them depend on
-        // *key absence* — `"is_admin" not in user`, `"users" not in config` — which
-        // a typed struct with `#[serde(default)]` cannot represent, since a
-        // defaulted `false` is indistinguishable from an explicit `false`.
-        let mut document: serde_json::Value =
-            serde_json::from_str(&raw).map_err(|e| AuthError::Malformed {
+        std::fs::read_to_string(&self.auth_path)
+            .map(Some)
+            .map_err(|source| AuthError::Io {
                 path: self.auth_path.display().to_string(),
-                message: e.to_string(),
-            })?;
+                source,
+            })
+    }
 
-        let migrated = Self::migrate_document(&mut document);
-
-        let file: AuthFile =
-            serde_json::from_value(document).map_err(|e| AuthError::Malformed {
-                path: self.auth_path.display().to_string(),
-                message: e.to_string(),
-            })?;
-
-        // Python persists its migrations (`self._save()` inside each one). Skipping
-        // that would re-apply them on every boot and, worse, leave a legacy
-        // reserved-name account on disk that keeps being "dropped" in memory.
-        if migrated {
+    /// Reads `auth.json` and writes the migrated form back if it changed.
+    ///
+    /// Python persists each migration inside the migration itself (`self._save()`).
+    /// That is done here, as one explicit step, rather than as a side effect of
+    /// reading: a read that writes needs `config_lock`, and `load_auth` is reached
+    /// from `validate_token` and `issue_token` while they hold `sessions_lock`.
+    /// Taking `config_lock` there would invert the lock order against
+    /// `delete_user`/`rename_user`, which hold config and then want sessions.
+    ///
+    /// Unsynchronised *reads* are safe — `rename` is atomic, so a reader sees
+    /// either the whole old file or the whole new one. Only read-modify-**write**
+    /// needs the lock, which is why only this method and the mutators take it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Io`] if the migrated document cannot be written.
+    pub fn migrate_and_persist(&self) -> Result<(), AuthError> {
+        let _guard = self.lock_config()?;
+        let Some(raw) = self.read_auth_raw()? else {
+            return Ok(());
+        };
+        let mut document = parse_auth(&raw, &self.auth_path)?;
+        if Self::migrate_document(&mut document) {
+            let file = decode_auth(document, &self.auth_path)?;
             self.save_auth(&file)?;
         }
-
-        Ok(file)
+        Ok(())
     }
 
     /// Applies every `auth.json` migration, in the order `AuthManager.__init__` does.
@@ -555,6 +645,40 @@ impl AuthStore {
     /// Returns [`AuthError::Password`] if the hash cannot be parsed.
     pub fn verify_password(password: &str, hash: &str) -> Result<bool, AuthError> {
         bcrypt::verify(password, hash).map_err(|e| AuthError::Password(e.to_string()))
+    }
+
+    /// Hashes a password for storage, **on the blocking pool**.
+    ///
+    /// Cost 12 is ~250 ms of CPU. Calling [`AuthStore::hash_password`] directly from
+    /// an async handler would park a runtime worker for a quarter of a second per
+    /// login, stalling SSE streams and token validation for the whole process
+    /// (AGENTS.md D11). This wrapper is the intended entry point from `odysseus-web`;
+    /// the sync form exists for startup work and tests.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`AuthError::PasswordTooShort`], [`AuthError::Password`], and a
+    /// [`tokio::task::JoinError`] if the task is cancelled or panics.
+    pub async fn hash_password_blocking(
+        password: String,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        crate::blocking::spawn_blocking(move || Self::hash_password(&password))
+            .await?
+            .map_err(Into::into)
+    }
+
+    /// Verifies a password against a stored hash, **on the blocking pool**.
+    ///
+    /// # Errors
+    ///
+    /// As [`AuthStore::hash_password_blocking`].
+    pub async fn verify_password_blocking(
+        password: String,
+        hash: String,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        crate::blocking::spawn_blocking(move || Self::verify_password(&password, &hash))
+            .await?
+            .map_err(Into::into)
     }
 
     /// Resolves a username to its stored record.
@@ -726,28 +850,48 @@ impl AuthStore {
     }
 
     /// Applies one stored privilege override.
+    ///
+    /// A value of the wrong JSON type is **denied**, not silently replaced by the
+    /// default. The permissive fallback would be the wrong direction: for the six
+    /// capabilities that default to `true`, a corrupt `"can_use_agent": 0` would
+    /// decode as *permitted*, and a corrupt `max_messages_per_day` would decode as
+    /// `0` — an unlimited quota. `auth_helpers.py:186` denies in the same cases
+    /// (`not privs.get(key, True)`).
+    ///
+    /// An unrecognised *key* is still ignored, so a newer build's privilege does
+    /// not stop an older one from starting.
     fn apply_privilege(target: &mut Privileges, key: &str, value: &serde_json::Value) {
-        let flag = value.as_bool().unwrap_or(target.get(key));
         match key {
-            "can_use_agent" => target.can_use_agent = flag,
-            "can_use_browser" => target.can_use_browser = flag,
-            "can_use_documents" => target.can_use_documents = flag,
-            "can_use_research" => target.can_use_research = flag,
-            "can_generate_images" => target.can_generate_images = flag,
-            "can_manage_memory" => target.can_manage_memory = flag,
-            "can_use_bash" => target.can_use_bash = flag,
+            "can_use_agent" => target.can_use_agent = denied_unless_bool(value),
+            "can_use_browser" => target.can_use_browser = denied_unless_bool(value),
+            "can_use_documents" => target.can_use_documents = denied_unless_bool(value),
+            "can_use_research" => target.can_use_research = denied_unless_bool(value),
+            "can_generate_images" => {
+                target.can_generate_images = denied_unless_bool(value);
+            }
+            "can_manage_memory" => target.can_manage_memory = denied_unless_bool(value),
+            "can_use_bash" => target.can_use_bash = denied_unless_bool(value),
+            // `1` is the smallest quota that still permits nothing, and is what a
+            // negative Python cap (`-1`) denies with.
             "max_messages_per_day" => {
-                target.max_messages_per_day = value.as_u64().unwrap_or(0);
+                // `0` is unlimited and must survive as such. A value that is not a
+                // non-negative integer — `null`, a string, or a negative cap, which
+                // Python's `int(-1)` turns into a quota every count exceeds — is
+                // denied with the smallest quota that permits nothing.
+                target.max_messages_per_day = value.as_u64().unwrap_or(1);
             }
             "allowed_models" => {
-                if let Ok(list) = serde_json::from_value::<Vec<String>>(value.clone()) {
-                    target.allowed_models = list;
+                // An undecodable list must not become "no restriction".
+                target.allowed_models =
+                    serde_json::from_value::<Vec<String>>(value.clone()).unwrap_or_default();
+                if target.allowed_models.is_empty() {
+                    target.allowed_models_restricted = true;
                 }
             }
-            "allowed_models_restricted" => target.allowed_models_restricted = flag,
-            "block_all_models" => target.block_all_models = flag,
-            // Unknown keys are ignored rather than erroring, so a newer build's
-            // privilege does not make an older one refuse to start.
+            "allowed_models_restricted" => {
+                target.allowed_models_restricted = denied_unless_bool(value);
+            }
+            "block_all_models" => target.block_all_models = denied_unless_bool(value),
             _ => {}
         }
     }
@@ -789,25 +933,29 @@ impl AuthStore {
         if token.is_empty() {
             return Ok(false);
         }
-        let mut sessions = self.load_sessions()?;
-        let Some(entry) = sessions.tokens.get(token) else {
+        // `read_sessions` already dropped every expired entry, so a token missing
+        // from the result was pruned from the file on this call.
+        let (mut sessions, pruned) = self.read_sessions()?;
+        let Some(entry) = sessions.tokens.get(token).cloned() else {
+            if pruned {
+                self.save_sessions(&sessions)?;
+            }
             return Ok(false);
         };
 
-        if entry.expiry <= now_secs_f64() {
+        // Orphan check: the account must still exist. `user_exists` reads
+        // `auth.json` without taking `config_lock`, which is safe because writes
+        // land by atomic rename — a reader sees the whole old file or the whole new
+        // one. Taking the config lock here would invert the order against
+        // `delete_user`/`rename_user`, which hold config and then want sessions.
+        let orphan = !self.user_exists(&entry.username)?;
+        if orphan {
             sessions.tokens.remove(token);
-            self.save_sessions(&sessions)?;
-            return Ok(false);
         }
-
-        // Orphan check: the account must still exist.
-        if !self.user_exists(&entry.username)? {
-            sessions.tokens.remove(token);
+        if orphan || pruned {
             self.save_sessions(&sessions)?;
-            return Ok(false);
         }
-
-        Ok(true)
+        Ok(!orphan)
     }
 
     /// Resolves a session token to its username, applying the same checks as
@@ -840,10 +988,30 @@ impl AuthStore {
 
     /// Revokes every session for a user, optionally keeping one.
     ///
+    /// Returns how many tokens were dropped.
+    ///
     /// # Errors
     ///
     /// Returns [`AuthError::Io`] if the session file cannot be written.
     pub fn revoke_user_sessions(
+        &self,
+        username: &str,
+        except: Option<&str>,
+    ) -> Result<usize, AuthError> {
+        let _guard = self.lock_sessions()?;
+        self.revoke_user_sessions_locked(username, except)
+    }
+
+    /// The body of [`AuthStore::revoke_user_sessions`], for callers that already
+    /// hold `sessions_lock`.
+    ///
+    /// `sessions_lock` is a plain `Mutex`, so this cannot be the public entry point:
+    /// re-locking inside `delete_user`/`rename_user` would self-deadlock. Keeping
+    /// the unlocked variant private and named is what stops a future caller from
+    /// reaching it without the lock — the alternative, which this replaces, was a
+    /// `pub` method that silently did an unsynchronised read-modify-write of the
+    /// live session file whenever it was not called from `delete_user`.
+    fn revoke_user_sessions_locked(
         &self,
         username: &str,
         except: Option<&str>,
@@ -865,22 +1033,45 @@ impl AuthStore {
         Ok(doomed.len())
     }
 
-    /// Deletes a user and every session belonging to them.
+    /// Deletes a user and every **browser session** belonging to them.
+    ///
+    /// # Not yet complete — T0070
+    ///
+    /// API tokens are **not** revoked here, because they are not implemented (T0065).
+    /// `core/auth.py:301-318` deletes the `ApiToken` rows *first* and returns without
+    /// touching the user if the token store is unavailable, precisely so a token
+    /// cannot outlive its owner. Until that exists, a deleted user's bearer tokens
+    /// would keep working — so a caller must not treat this as full revocation.
     ///
     /// # Errors
     ///
-    /// Returns [`AuthError::NoSuchUser`] for an unknown account, and propagates
-    /// IO failures.
+    /// Returns [`AuthError::Denied`] for the last administrator,
+    /// [`AuthError::NoSuchUser`] for an unknown account, and propagates IO failures.
     pub fn delete_user(&self, username: &str) -> Result<(), AuthError> {
         let _config = self.lock_config()?;
         let _sessions = self.lock_sessions()?;
         let key = normalise_username(username);
         let mut file = self.load_auth()?;
-        if file.users.remove(&key).is_none() {
+        if !file.users.contains_key(&key) {
             return Err(AuthError::NoSuchUser(username.to_owned()));
         }
+
+        // The last admin is not deletable, for the same reason they are not
+        // demotable. Without this the user table can reach zero, `is_configured`
+        // flips false, and the first-run setup path reopens — which hands admin to
+        // whoever reaches it next. `set_admin` enforces one half of this invariant;
+        // this is the other half.
+        if file.users.get(&key).is_some_and(|u| u.is_admin)
+            && file.users.values().filter(|u| u.is_admin).count() <= 1
+        {
+            return Err(AuthError::Denied(
+                "cannot delete the last administrator".into(),
+            ));
+        }
+
+        file.users.remove(&key);
         self.save_auth(&file)?;
-        self.revoke_user_sessions(&key, None)?;
+        self.revoke_user_sessions_locked(&key, None)?;
         Ok(())
     }
 
@@ -888,13 +1079,22 @@ impl AuthStore {
     ///
     /// # Errors
     ///
-    /// Returns [`AuthError::Denied`] when the target name is taken or reserved,
-    /// and propagates IO failures.
+    /// Returns [`AuthError::Denied`] when the target name is empty, taken, or
+    /// reserved, and propagates IO failures.
     pub fn rename_user(&self, from: &str, to: &str) -> Result<(), AuthError> {
         let _config = self.lock_config()?;
         let _sessions = self.lock_sessions()?;
         let from_key = normalise_username(from);
         let to_key = normalise_username(to);
+
+        // `create_user` refuses an empty username; rename must too. An empty key is
+        // worse than a collision: `auth_helpers.require_privilege` and
+        // `owner_filter` both treat a falsy user as "no filter applied", so an ""
+        // account would pass every privilege gate and see every user's data — and
+        // `migrate_document` drops empty keys on the next load, deleting it anyway.
+        if to_key.is_empty() {
+            return Err(AuthError::Denied("username must not be empty".into()));
+        }
         if RESERVED_USERNAMES.contains(&to_key.as_str()) {
             return Err(AuthError::Denied(format!("{to_key} is reserved")));
         }
@@ -905,7 +1105,6 @@ impl AuthStore {
         };
         if from_key != to_key && file.users.contains_key(&to_key) {
             file.users.insert(from_key, user);
-            self.save_auth(&file)?;
             return Err(AuthError::Denied(format!("{to_key} already exists")));
         }
         file.users.insert(to_key.clone(), user);
@@ -926,18 +1125,56 @@ impl AuthStore {
         Ok(())
     }
 
-    fn load_sessions(&self) -> Result<SessionFile, AuthError> {
+    /// Reads `sessions.json`, pruning anything already expired.
+    ///
+    /// Returns the pruned document and whether anything was dropped.
+    ///
+    /// Pruning here is what stops the file growing without bound: `_load_sessions`
+    /// does the same, and pruning only when a token is *presented* would leave every
+    /// abandoned login in the file, so each authenticated request would re-parse a
+    /// document that only ever grows.
+    ///
+    /// The prune is **not** written back from here. This is reached from read paths,
+    /// and an unsynchronised write is exactly what the session lock exists to
+    /// prevent; a caller holding `sessions_lock` persists it.
+    fn read_sessions(&self) -> Result<(SessionFile, bool), AuthError> {
         if !self.sessions_path.exists() {
-            return Ok(SessionFile::default());
+            return Ok((SessionFile::default(), false));
         }
         let raw = std::fs::read_to_string(&self.sessions_path).map_err(|source| AuthError::Io {
             path: self.sessions_path.display().to_string(),
             source,
         })?;
-        serde_json::from_str(&raw).map_err(|e| AuthError::Malformed {
-            path: self.sessions_path.display().to_string(),
-            message: e.to_string(),
-        })
+        let mut sessions: SessionFile =
+            serde_json::from_str(&raw).map_err(|e| AuthError::Malformed {
+                path: self.sessions_path.display().to_string(),
+                message: e.to_string(),
+            })?;
+
+        let now = now_secs_f64();
+        let before = sessions.tokens.len();
+        sessions.tokens.retain(|_, entry| entry.expiry > now);
+        let pruned = sessions.tokens.len() != before;
+        Ok((sessions, pruned))
+    }
+
+    fn load_sessions(&self) -> Result<SessionFile, AuthError> {
+        self.read_sessions().map(|(sessions, _)| sessions)
+    }
+
+    /// Drops expired sessions from `sessions.json` and returns how many remain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Io`] if the file cannot be written.
+    pub fn prune_sessions(&self) -> Result<usize, AuthError> {
+        let _guard = self.lock_sessions()?;
+        let (sessions, pruned) = self.read_sessions()?;
+        let remaining = sessions.tokens.len();
+        if pruned {
+            self.save_sessions(&sessions)?;
+        }
+        Ok(remaining)
     }
 
     fn save_sessions(&self, file: &SessionFile) -> Result<(), AuthError> {
@@ -946,6 +1183,15 @@ impl AuthStore {
             source,
         })
     }
+}
+
+/// A stored boolean privilege, denied unless it is literally `true` or `false`.
+///
+/// `auth_helpers.py:186` reads `not privs.get(key, True)`, so a present-but-wrong-typed
+/// value denies. An *absent* key still takes the default, which `privileges_for`
+/// handles by starting from `Privileges::default()` and only visiting stored keys.
+fn denied_unless_bool(value: &serde_json::Value) -> bool {
+    value.as_bool().unwrap_or(false)
 }
 
 /// `DEFAULT_PRIVILEGES` as the JSON map stored in `auth.json`.
@@ -988,6 +1234,27 @@ pub fn admin_privileges_map() -> BTreeMap<String, serde_json::Value> {
     map.insert("allowed_models_restricted".into(), json!(false));
     map.insert("block_all_models".into(), json!(false));
     map
+}
+
+/// Parses an `auth.json` document.
+///
+/// Migrations run on this raw `Value`, not on `AuthFile`. Two of them depend on
+/// *key absence* — `"is_admin" not in user`, `"users" not in config` — which a
+/// typed struct with `#[serde(default)]` cannot represent, because a defaulted
+/// `false` is indistinguishable from an explicit `false`.
+fn parse_auth(raw: &str, path: &Path) -> Result<serde_json::Value, AuthError> {
+    serde_json::from_str(raw).map_err(|e| AuthError::Malformed {
+        path: path.display().to_string(),
+        message: e.to_string(),
+    })
+}
+
+/// Decodes a migrated document into the typed form.
+fn decode_auth(document: serde_json::Value, path: &Path) -> Result<AuthFile, AuthError> {
+    serde_json::from_value(document).map_err(|e| AuthError::Malformed {
+        path: path.display().to_string(),
+        message: e.to_string(),
+    })
 }
 
 /// Lowercases and trims a username, which is how it is keyed.
@@ -1049,8 +1316,9 @@ fn random_hex(n: usize) -> Result<String, AuthError> {
 mod tests {
     use {
         super::{
-            AuthError, AuthStore, PASSWORD_MIN_LENGTH, Privileges, RESERVED_USERNAMES, TOKEN_BYTES,
-            TOKEN_TTL_SECONDS, User, normalise_username, ttl_secs_f64,
+            AuthError, AuthStore, PASSWORD_MIN_LENGTH, Privileges, RESERVED_USERNAMES,
+            SessionEntry, SessionFile, TOKEN_BYTES, TOKEN_TTL_SECONDS, User, normalise_username,
+            ttl_secs_f64,
         },
         serde_json::json,
         std::collections::BTreeMap,
@@ -1060,6 +1328,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = AuthStore::new(dir.path());
         (dir, store)
+    }
+
+    /// The live session map, for tests that need to age a token out.
+    fn read_sessions(store: &AuthStore) -> SessionFile {
+        store.load_sessions().expect("load")
     }
 
     #[test]
@@ -1157,8 +1430,11 @@ mod tests {
         assert!(user.is_admin, "legacy single user must become admin");
         assert_eq!(user.password_hash, "$2b$12$abcdefghijklmnopqrstuv");
 
-        // The migration is persisted, matching Python's `self._save()`: the
-        // top-level legacy keys are gone and the user now lives under `users`.
+        // Python persists each migration inside the migration itself
+        // (`self._save()`). Here that is the explicit `migrate_and_persist` step,
+        // because a read must not write: `load_auth` is reached while `sessions_lock`
+        // is held, and writing there would need `config_lock` in the wrong order.
+        store.migrate_and_persist().expect("persist migration");
         let on_disk = std::fs::read_to_string(store.auth_path()).expect("read");
         let doc: serde_json::Value = serde_json::from_str(&on_disk).expect("valid json");
         assert!(doc.get("username").is_none(), "top-level username removed");
@@ -1542,6 +1818,179 @@ mod tests {
             "lost updates: {:?}",
             file.users.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn rename_cannot_create_an_empty_username() {
+        // An empty key is worse than a collision: `auth_helpers.require_privilege`
+        // and `owner_filter` both treat a falsy user as "no filter applied", so an
+        // "" account would pass every privilege gate and read every user's data.
+        // `migrate_document` also drops empty keys on the next load, deleting it.
+        let (_dir, store) = store();
+        store
+            .create_user("root", "hunter2hunter2", true)
+            .expect("create");
+
+        for bad in ["", "   ", "\t\n "] {
+            let err = store.rename_user("root", bad).expect_err("must refuse");
+            assert!(matches!(err, AuthError::Denied(_)), "{bad:?} gave {err:?}");
+        }
+
+        // The account must be intact, not silently consumed by the failed rename.
+        assert!(store.user("root").expect("root survives").is_admin);
+        assert!(!store.user_exists("").expect("no empty account"));
+    }
+
+    #[test]
+    fn the_last_admin_cannot_be_deleted() {
+        // The other half of the invariant `set_admin` protects. Without it the user
+        // table can reach zero, `is_configured` flips false, and the first-run setup
+        // path reopens — handing admin to whoever reaches it next.
+        let (_dir, store) = store();
+        store
+            .create_user("root", "hunter2hunter2", true)
+            .expect("create");
+
+        let err = store.delete_user("root").expect_err("must refuse");
+        assert!(matches!(err, AuthError::Denied(_)), "{err:?}");
+        assert!(store.user_exists("root").expect("root survives"));
+
+        // With a second admin, deleting an ordinary user still works.
+        store
+            .create_user("bob", "hunter2hunter2", false)
+            .expect("create");
+        store.delete_user("bob").expect("delete");
+        assert!(!store.user_exists("bob").expect("gone"));
+    }
+
+    #[test]
+    fn a_malformed_privilege_value_denies_rather_than_defaulting() {
+        // Fail-open risk: `can_use_agent` defaults to true, so a corrupt non-boolean
+        // would decode as *permitted*. Python denies (`not privs.get(key, True)`).
+        let (_dir, store) = store();
+        let mut file = store.load_auth().expect("load");
+        file.users.insert(
+            "alice".to_owned(),
+            User {
+                privileges: BTreeMap::from([
+                    ("can_use_agent".into(), json!(0)),
+                    ("can_use_bash".into(), json!("yes")),
+                    ("max_messages_per_day".into(), json!("lots")),
+                    ("allowed_models".into(), json!({"not": "a list"})),
+                ]),
+                ..User::new("$2b$12$abc".to_owned(), false)
+            },
+        );
+        store.save_auth(&file).expect("save");
+
+        let privs = store.privileges("alice").expect("privs");
+        assert!(!privs.can_use_agent, "a corrupt flag must not permit");
+        assert!(!privs.can_use_bash, "a corrupt flag must not permit");
+        assert_eq!(
+            privs.max_messages_per_day, 1,
+            "a corrupt quota must deny, not become unlimited"
+        );
+        assert!(
+            privs.allowed_models_restricted,
+            "an undecodable model list must not mean 'no restriction'"
+        );
+    }
+
+    #[test]
+    fn a_quota_of_zero_still_means_unlimited() {
+        // `DEFAULT_PRIVILEGES["max_messages_per_day"] = 0` means unlimited, so the
+        // deny-on-corrupt rule must not swallow the one legitimate non-positive value.
+        let (_dir, store) = store();
+        let mut file = store.load_auth().expect("load");
+        file.users.insert(
+            "alice".to_owned(),
+            User {
+                privileges: BTreeMap::from([("max_messages_per_day".into(), json!(0))]),
+                ..User::new("$2b$12$abc".to_owned(), false)
+            },
+        );
+        store.save_auth(&file).expect("save");
+        assert_eq!(
+            store
+                .privileges("alice")
+                .expect("privs")
+                .max_messages_per_day,
+            0,
+            "0 is unlimited"
+        );
+    }
+
+    #[test]
+    fn debug_output_redacts_the_hash_and_totp_secrets() {
+        // A leaked base32 TOTP seed regenerates valid codes forever, and no session
+        // revocation undoes it, so `Debug` must never carry it (AGENTS.md §4, §10).
+        let user = User {
+            totp_secret: Some("JBSWY3DPEHPK3PXP".to_owned()),
+            totp_secret_pending: Some("KRSXG5CTMVRXEZLU".to_owned()),
+            totp_backup_codes: Some(vec!["a".into(), "b".into()]),
+            ..User::new("$2b$12$abcdefghijklmnopqrstuv".to_owned(), false)
+        };
+        let rendered = format!("{user:?}");
+
+        assert!(!rendered.contains("JBSWY3DPEHPK3PXP"), "{rendered}");
+        assert!(!rendered.contains("KRSXG5CTMVRXEZLU"), "{rendered}");
+        assert!(!rendered.contains("$2b$12$"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn expired_sessions_are_pruned_from_disk_without_any_token_being_presented() {
+        // Python prunes at load (`_load_sessions:143-146`). Pruning only on
+        // presentation would leave every abandoned login in the file forever.
+        let (_dir, store) = store();
+        store
+            .create_user("alice", "hunter2hunter2", false)
+            .expect("create");
+        store.issue_token("alice").expect("issue");
+
+        // Expire it by rewriting the file directly.
+        let mut doc = read_sessions(&store);
+        let stale = "e".repeat(64);
+        doc.tokens.insert(
+            stale.clone(),
+            SessionEntry {
+                username: "alice".to_owned(),
+                expiry: 1.0,
+            },
+        );
+        store.save_sessions(&doc).expect("write");
+
+        let remaining = store.prune_sessions().expect("prune");
+        assert_eq!(remaining, 1, "only the live token should remain");
+        assert!(
+            !store.validate_token(&stale).expect("validate"),
+            "the expired token must be rejected after the prune"
+        );
+    }
+
+    #[test]
+    fn a_session_entry_with_null_fields_expires_instead_of_breaking_the_file() {
+        // `#[serde(default)]` covers a missing key but not an explicit `null`, and
+        // one unparseable entry would otherwise fail the whole document — turning
+        // every authenticated request into a 500.
+        let (_dir, store) = store();
+        store
+            .create_user("alice", "hunter2hunter2", false)
+            .expect("create");
+        let live = store.issue_token("alice").expect("issue");
+
+        let contents = format!(
+            r#"{{"{live}": {{"username": "alice", "expiry": 4102444800.0}}, "nulled": {{"username": null, "expiry": null}}}}"#
+        );
+        std::fs::write(store.sessions_path(), contents).expect("write");
+
+        assert!(
+            store
+                .validate_token(&live)
+                .expect("a null entry must not break the file"),
+            "the valid token must still work"
+        );
+        assert!(!store.validate_token("nulled").expect("null entry expires"));
     }
 
     #[test]

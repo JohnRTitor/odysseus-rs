@@ -270,5 +270,6 @@ against a populated install before release.
 |---|---|---|
 | Planning | Initial register created from the source audit at `0b66c720`. All 300 features classified; implementation not started. | plan |
 | Phase 0 | `auth.json`/`sessions.json` store landed (T0060–T0063, T0069). Data-migration criterion 6 moved UNIMPLEMENTED → PARTIAL: file formats load, verify and prune, but the HTTP login endpoint does not exist. Corrected the REPLACED count (4 → 6, the table already had six rows) and the duplicated `## 6.` heading. | plan |
+| Phase 0 | Adversarial review of the auth store (`f53924e`) found and fixed: `rename_user` could create an empty username that bypasses every privilege gate; `delete_user` could remove the last admin and reopen first-run setup; `revoke_user_sessions` did an unsynchronised read-modify-write of the live session file; `load_auth` wrote `auth.json` from read paths while `sessions_lock` was held; a corrupt boolean privilege decoded as *permitted*; a `null` session field failed the whole file's parse; temp-name entropy failure silently produced an all-zero name; both JSON files were world-readable. 11 regression tests added, each verified to fail without its fix. | plan |
 
 **Update this file and `TASKS.md` in the same commit as any implementation work.**

@@ -256,7 +256,9 @@ fn a_python_setup_legacy_file_migrates_to_an_admin() -> TestResult {
         "the sole legacy account is the administrator"
     );
 
-    // The migration is written back, matching Python's `self._save()`.
+    // Python writes each migration back from inside the migration (`self._save()`); here
+    // that is the explicit step, because a read must not write.
+    store.migrate_and_persist()?;
     let after = read_json(store.auth_path())?;
     assert!(
         after.get("username").is_none(),
@@ -296,6 +298,7 @@ fn a_reserved_username_in_a_python_file_is_dropped_not_honoured() -> TestResult 
     );
     assert!(store.user_exists("alice")?);
 
+    store.migrate_and_persist()?;
     let after = read_json(store.auth_path())?;
     assert_eq!(
         after["users"].as_object().map(serde_json::Map::len),

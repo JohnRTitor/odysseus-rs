@@ -11,6 +11,10 @@
 //! The temp name is suffixed with random bytes rather than the process id
 //! precisely so two processes racing on the same path cannot collide — the
 //! Python source makes the same point at `core/atomic_io.py:24-29`.
+//!
+//! Files land at mode 0600. `sessions.json` holds directly usable 7-day session
+//! tokens and `auth.json` holds bcrypt hashes plus TOTP secrets, so a world-readable
+//! mode would hand a local account on a shared host every logged-in session.
 
 use std::{
     io::Write as _,
@@ -45,12 +49,12 @@ pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
 
-    let temp = temp_sibling(path);
+    let temp = temp_sibling(path)?;
 
     // Write, flush, and sync. `sync_all` covers both the file contents and the
     // metadata; `flush` alone only pushes into the OS buffer.
     let write_result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&temp)?;
+        let mut file = create_private(&temp)?;
         file.write_all(bytes)?;
         file.flush()?;
         file.sync_all()?;
@@ -81,7 +85,7 @@ pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// The suffix is random rather than the pid for the reason the Python source
 /// gives: a pid is constant for the life of a process, so two writers on one path
 /// still race. A `uuid4` hex is 16 random bytes.
-fn temp_sibling(path: &Path) -> PathBuf {
+fn temp_sibling(path: &Path) -> std::io::Result<PathBuf> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path.file_name().map_or_else(
         || std::ffi::OsString::from("atomic"),
@@ -89,9 +93,11 @@ fn temp_sibling(path: &Path) -> PathBuf {
     );
 
     let mut suffix = [0u8; 16];
-    // A collision is not a correctness problem, only a redundant retry, so fall
-    // back to the pid rather than failing an otherwise valid write.
-    let _ = getrandom::fill(&mut suffix);
+    // Propagated, not swallowed: on failure the buffer would stay all-zero, so
+    // every writer would pick the same temp path, interleave their writes into one
+    // file, and rename a mixed-length invalid document into place.
+    getrandom::fill(&mut suffix)
+        .map_err(|e| std::io::Error::other(format!("no entropy for a unique temp name: {e}")))?;
 
     let mut unique = String::with_capacity(32);
     for byte in suffix {
@@ -99,7 +105,23 @@ fn temp_sibling(path: &Path) -> PathBuf {
         let _ = write!(unique, "{byte:02x}");
     }
 
-    dir.join(format!("{}.tmp.{unique}", name.to_string_lossy()))
+    Ok(dir.join(format!("{}.tmp.{unique}", name.to_string_lossy())))
+}
+
+/// Creates `path` readable and writable only by its owner.
+///
+/// `OpenOptions::mode` only applies when the file is actually created, and the umask
+/// can only remove bits — so 0600 is requested explicitly rather than relying on
+/// the default 0666 & ~umask, which is world-readable on a typical host.
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
 }
 
 #[cfg(test)]
@@ -165,6 +187,38 @@ mod tests {
 
         let raw = std::fs::read_to_string(path).expect("read");
         serde_json::from_str::<serde_json::Value>(&raw).expect("final file must be valid JSON");
+    }
+
+    #[test]
+    fn files_are_not_world_readable() {
+        // `sessions.json` holds directly usable 7-day session tokens and
+        // `auth.json` holds bcrypt hashes plus TOTP secrets. The default
+        // 0666 & ~umask is world-readable on a typical host.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("secrets.json");
+        atomic_write_json(&path, &serde_json::json!({ "a": 1 })).expect("write");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+    }
+
+    #[test]
+    fn an_existing_loose_mode_is_tightened_on_rewrite() {
+        // `rename` preserves the temp file's mode, and `OpenOptions::mode` only
+        // applies on creation — so a file that already exists loosely must be
+        // chmod'ed, not just replaced.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("secrets.json");
+        std::fs::write(&path, "{}").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+
+        atomic_write_json(&path, &serde_json::json!({ "a": 1 })).expect("write");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
     }
 
     #[test]
