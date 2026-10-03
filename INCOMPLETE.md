@@ -1,5 +1,5 @@
-# INCOMPLETE.md — Authoritative Status Register
-
+# INCOMPLETE.md — Authoritative Status Registerseen: 1 (conditional) |
+| Spikes resolved
 **This file is authoritative.** It lists every feature that is `PARTIAL` or
 `UNIMPLEMENTED`. It must be updated whenever implementation begins.
 
@@ -153,6 +153,36 @@ decision is not re-litigated later.
 ---
 
 ## 4. REPLACED — old behaviour and new behaviour
+
+### 4.1 Request-timeout prefix matching — **Python bug found and fixed**
+
+Discovered by a test written while porting the timeout middleware (T0085), not by
+reading the source.
+
+**Old behaviour (`app.py:199`):** the exempt-path check is a plain
+`path.startswith(prefix)` over a list whose first entry is `/api/chat`. So
+`/api/chatgpt-subscription/device/start`.startswith(`/api/chat`) is **true**, and
+every ChatGPT subscription route — device start, poll, cancel — silently escaped
+the 45-second deadline. The same shape would bite any future `/api/chat*` route.
+
+**New behaviour:** matching is segment-aware. A prefix matches the path itself or
+anything beginning with `prefix` followed by `/`, and nothing else.
+
+| Path | Python | Rust |
+|---|---|---|
+| `/api/chat` | exempt | exempt |
+| `/api/chat/stream` | exempt | exempt |
+| `/api/chatgpt-subscription/device/start` | **exempt (wrong)** | **charged (correct)** |
+| `/api/images` | exempt (wrong) | not exempt |
+| `/api/model` | not exempt | not exempt |
+
+**Why fix rather than port:** the Python behaviour is a defect, not an intention.
+Porting it would have silently granted every future `/api/chat…` route an
+unbounded request lifetime — exactly the class of hang the middleware exists to
+prevent. Covered by
+`timeout::tests::a_prefix_does_not_match_a_sibling_with_a_shared_name`.
+
+### 4.2 Other replacements
 
 | ID | Item | OLD behaviour | NEW behaviour | Reason |
 |---|---|---|---|---|

@@ -10,3 +10,26 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+odysseus-domain = { workspace = true }
+odysseus-store = { workspace = true }
+axum = { workspace = true }
+axum-extra = { version = "0.10", features = ["cookie"] }
+getrandom = "0.3"
+tower = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

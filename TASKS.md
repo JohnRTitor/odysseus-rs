@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 13 / 231 complete · Phase 0 in progress
+**Status:** 20 / 231 complete · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — S1/S2 and S7 resolved, 9 pending.
 
@@ -101,13 +101,13 @@ is written.**
 
 ### 0.5 Web layer
 
-- [ ] T0080 Axum app with `AppState` built once — **no module-level singletons**
-- [ ] T0081 `SecurityHeadersLayer` — per-request nonce; `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`, HSTS
-- [ ] T0082 **All three CSP branches**: research reports, tool render, PDF preview (`default-src 'none'` + `SAMEORIGIN`), default (`DENY` + nonce)
-- [ ] T0083 `CorsLayer` from `ALLOWED_ORIGINS`
-- [ ] T0084 `CompressionLayer` that **does not compress `text/event-stream`**
-- [ ] T0085 `TimeoutLayer` — 45 s + the **10 exempt prefixes**
-- [ ] T0086 Slow-request log (0.75 s threshold)
+- [x] T0080 Axum app with `AppState` built once — **no module-level singletons**
+- [x] T0081 `SecurityHeadersLayer` — per-request nonce; `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`, HSTS
+- [x] T0082 **All CSP branches** (report / tool_render / pdf_preview / default): research reports, tool render, PDF preview (`default-src 'none'` + `SAMEORIGIN`), default (`DENY` + nonce)
+- [x] T0083 `CorsLayer` from `ALLOWED_ORIGINS`
+- [x] T0084 `CompressionLayer` that **does not compress `text/event-stream`**
+- [x] T0085 `TimeoutLayer` — 45 s + the **10 exempt prefixes**. Found+fixed a Python bug: `/api/chat` matched `/api/chatgpt-subscription/*`
+- [x] T0086 Slow-request log (0.75 s threshold)
 - [ ] T0087 `AuthLayer` implementing the **exact 7-step gate order** (`API_MIGRATION.md` §2.1)
 - [ ] T0088 `_is_trusted_loopback` — reject any of the 7 proxy-forwarded headers
 - [ ] T0089 Internal-tool header + `compare_digest` + optional `X-Odysseus-Owner` impersonation
