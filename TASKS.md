@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 26 / 489 complete · Phase 0 in progress
+**Status:** 29 / 489 complete · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — S1/S2 and S7 resolved, 9 pending.
 
@@ -92,9 +92,9 @@ is written.**
 - [x] T0062 Legacy single-user shape migration; lowercase normalisation; reserved-username purge
 - [x] T0063 Session tokens: `sessions.json`, 7-day TTL, **orphan check** (username must still exist)
 - [ ] T0064 **TEST: login works against the real `auth.json` + `sessions.json`** (acceptance gate)
-- [ ] T0065 API tokens: `ody_` + 43 chars, bcrypt hash, `prefix` = 8 chars, id = 8 hex
-- [ ] T0066 Token cache: `RwLock<HashMap<prefix, Vec<Candidate>>>` + dirty flag, constant-time compare
-- [ ] T0067 14 scopes + 4 profiles; write scope auto-inserts its read scope
+- [x] T0065 API tokens: `ody_` + 43 chars, bcrypt hash, `prefix` = 8 chars, id = 8 hex
+- [x] T0066 Token cache: `RwLock<HashMap<prefix, Vec<Candidate>>>` + dirty flag, constant-time compare
+- [x] T0067 14 scopes + 4 profiles; write scope auto-inserts its read scope
 - [ ] T0068 TOTP 2FA — **fails closed** when enabled but secret missing; 8 single-use backup codes
 - [x] T0069 Privileges: 7 booleans + `max_messages_per_day` + `allowed_models`; refuse to demote the last admin
 - [ ] T0070 User CRUD; delete revokes API tokens **first** (fail-closed), then sessions; rename rewrites live sessions

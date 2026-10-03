@@ -7,3 +7,26 @@ allow-print-in-tests = true
 # The workspace lints deny these outright. Keep MSRV 1.88 to match
 # `workspace.package.rust-version`.
 msrv = "1.88"
+
+# Proper nouns and upstream identifiers that appear verbatim in doc comments.
+# Rewording prose to satisfy `doc_markdown` would be worse than declaring the
+# vocabulary, and these are names, not code.
+doc-valid-idents = [
+    "SQLAlchemy",
+    "SQLite",
+    "SQL",
+    "OAuth",
+    "CalDAV",
+    "IMAP",
+    "SMTP",
+    "MIME",
+    "WebSocket",
+    "OpenAI",
+    "ChromaDB",
+    "FTS5",
+    "bcrypt",
+    "Fernet",
+    "TOTP",
+    "bcrypt.rs",
+    "..",
+]

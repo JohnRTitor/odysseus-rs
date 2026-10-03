@@ -113,7 +113,15 @@ bcrypt = "0.19"
 getrandom = "0.3"
 subtle = "2.6"
 secrecy = "0.10"
-totp-rs = { version = "6", features = ["secret_container"] }
+# `secret_container` was never a real feature of totp-rs 6 and this declaration
+# sat inert because no member crate consumed it, so the bad feature name was
+# invisible until something tried to resolve it. Verified features are:
+# gen_secret, otpauth, qr, serde, steam, zeroize (+ alloc, migration, std).
+# `gen_secret` mints the seed, `otpauth` builds the otpauth:// URI, `zeroize`
+# scrubs the seed from memory on drop. The `qr` feature is deliberately NOT
+# enabled here -- `routes/auth_routes.py:258-263` renders the QR PNG, which is
+# presentation and belongs in the web layer (AGENTS.md §8).
+totp-rs = { version = "6", features = ["gen_secret", "otpauth", "zeroize"] }
 
 # --- observability ---
 tracing = "0.1"

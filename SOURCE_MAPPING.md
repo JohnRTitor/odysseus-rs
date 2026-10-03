@@ -61,7 +61,7 @@ injected.
 | `core/auth.py` (680 L) | `odysseus-store/src/auth.rs`, `odysseus-web/src/auth.rs` | Persistence + Web | Split: user/token **storage** vs. request **verification**. |
 | ↳ `AuthManager` singleton | **REMOVED** — `AppState.auth: Arc<AuthStore>` | — | No module-level singletons. |
 | ↳ `DEFAULT_PRIVILEGES` / `ADMIN_PRIVILEGES` `:24-48` | `odysseus-domain/src/privileges.rs` | Domain core | Pure data. |
-| ↳ TOTP `:488-562` | `odysseus-store/src/totp.rs` | Persistence | Fails closed when enabled-but-no-secret. Preserve. |
+| ↳ TOTP `:483-562` | `odysseus-store/src/totp.rs` | Persistence | Fails closed when enabled-but-no-secret. Preserve. |
 | `core/session_manager.py` (782 L) | `odysseus-services/src/sessions.rs` + `odysseus-store/src/sessions.rs` | Application + Persistence | The manager held both an in-RAM cache and persistence. Split. |
 | ↳ `self.sessions: Dict[str, Session]` cache | `odysseus-services/src/session_cache.rs` | Application | An LRU metadata cache in front of SQLite, not a source of truth. |
 | ↳ `_persist_message()` `:244-309` | `odysseus-store/src/messages.rs` | Persistence | Preserve: upload-ref reservation, base64 stripping, `last_message_at` bump only here. |
