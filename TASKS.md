@@ -23,11 +23,11 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 35 / 489 complete · Phase 0 in progress
+**Status:** 36 / 489 complete · Phase 0 in progress
 
-**Spike outcomes:** see `SPIKE_RESULTS.md` — S1/S2 and S7 resolved, 9 pending.
+**Spike outcomes:** see `SPIKE_RESULTS.md` — **4 of 11 resolved** (S1, S2, S5, S7); 7 pending.
 
-**Spike outcomes:** see `SPIKE_RESULTS.md`. S1/S2 and S7 resolved; 9 pending.
+**Spike outcomes:** see `SPIKE_RESULTS.md`. **4 of 11 resolved** (S1, S2, S5, S7); 7 pending.
 
 ---
 
@@ -62,7 +62,7 @@ is written.**
 - [x] T0021 **S2** `ort` version — confirm `2.0.0-rc.13` builds; pin it. Confirm the session-build API shape
 - [ ] T0022 **S3** SAM ONNX — produce `image_encoder.onnx` (ViT-B) + `mask_decoder.onnx`; measure the encoder pass
 - [ ] T0023 **S4** `any-tts` — does it provide a Kokoro backend? If yes, `kokoroxide` becomes moot (F338)
-- [ ] T0024 **S5** `rembg-rs` — load U2Net, produce an alpha matte. Fail ⇒ F169 REMOVE
+- [x] T0024 **S5** `rembg-rs` **FAIL: does not compile** (4 errors; `ort` caret req `"2.0.0-rc.10"` resolves to rc.13, which made `Session::inputs`/`outputs` private). Capability confirmed with `ort` pinned to `=2.0.0-rc.10` — 634 ms CPU for 480×360 — but `binary: false` yields **0 partial-alpha pixels**, i.e. a hard cutout, not a matte. F169 REMOVED; run U2Net via `ort` directly if ever wanted (Phase 17)
 - [ ] T0025 **S6** `whisper-rs` — faster-whisper parity on CPU and CUDA. Fail ⇒ F339 REMOVE
 - [x] T0026 **S7** `rusqlite` — FTS5 enabled? `sqlite-vec` loads as an extension? **Blocks F125 and F124**
 - [ ] T0027 **S8** `lettre`/`async-imap`/`mailparse` — Gmail OAuth IMAP + STARTTLS SMTP round-trip. Fail ⇒ re-plan Phase 15

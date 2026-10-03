@@ -472,10 +472,29 @@ below was tuned against ChromaDB and will not hold:
 
 **This is a gated task with golden-set validation, never hand-tuning** (decision D4a).
 
+> **Refined 2026-10-03 (spike S7 follow-up).** The claim above is *conditional on the
+> metric*, which is the whole point. Python sets `hnsw:space: cosine` explicitly per
+> lane (`embedding_lanes.py:80`) and L2-normalises at insert
+> (`embedding_lanes.py:132`), so `1.0 - distance` is a genuine `[0,1]` cosine
+> similarity — and every value in that table is calibrated against it. sqlite-vec
+> *supports* `vec0(..., distance_metric=cosine)`.
+>
+> So: **declare cosine explicitly, and this table still holds** — golden-set validation
+> becomes genuine verification rather than re-discovery. **Default to L2 (sqlite-vec's
+> default), and every row in it is wrong**, because `1.0 - L2` is unbounded and
+> decreases as vectors diverge. An earlier note in `SPIKE_RESULTS.md` §7 asserted
+> Chroma also defaulted to L2 and used that to downgrade this section; that was false
+> and has been corrected. Do not reintroduce the downgrade.
+
+
 ### 5.3 Golden-set protocol (spike S11)
 
 1. Before switching, capture a **golden set** from the live ChromaDB: 200 queries ×
-   top-10 results with scores, across all 4 collections.
+   top-10 results with scores, across every `{base, lane}` collection that exists
+   (`collection_name(base, lane) = f"{base}_{lane}"`, `embedding_lanes.py:69-70` —
+   three at capture time: `rag`, `memories`, `tool_index`). Record per row the **distance
+   and `1.0 - distance`** under an explicitly-declared `cosine` metric, plus which
+   collections were empty, so the set is a calibration baseline rather than a smoke test.
 2. Run the same queries against sqlite-vec with candidate threshold sets.
 3. Choose the metric + thresholds that maximise top-10 agreement.
 4. Record the chosen values as **constants with a comment citing this document**.
@@ -494,8 +513,10 @@ The user chose "no separate server". Options:
 docs, memories). Exported vectors are useless across a metric change.
 
 **UX during reindex:** retrieval features (RAG, semantic memory, tool selection) show a
-"reindexing" state. The keyword fallback in `tool_index.py:3938-3946` is **already the
-designed degradation path** — on any error or timeout, `_relevant_tools` stays `None` and
+"reindexing" state. The keyword fallback in `agent_loop.py:927`
+(`_TOOL_SELECTION_TIMEOUT_SECONDS = 1.5`, used at `:3895`-`:3932`, with
+`_relevant_tools = None` at `:3934` and `:3936`) is **already the designed
+degradation path** — on any error or timeout, `_relevant_tools` stays `None` and
 the keyword fallback runs. That means tool selection degrades gracefully, and this is
 worth stating explicitly rather than treating reindex as a hard outage.
 

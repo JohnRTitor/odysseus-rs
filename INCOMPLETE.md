@@ -57,7 +57,7 @@ fails, the item becomes REMOVED with the spike result as the documented reason.
 | Feature | Status | Missing | Blocked By | Planned Phase |
 |---|---|---|---|---|
 | F168 Image mask (SAM) | UNIMPLEMENTED | ONNX SAM inference in Rust | **Spike S3** — upstream `export_onnx_model.py` exports only prompt encoder + mask decoder, **not** the ViT image encoder. Needs a separate `image_encoder.onnx` conversion. `ort` EP availability unproven (S1) | 0 (S1,S3) → 17 |
-| F169 Image remove-bg | UNIMPLEMENTED | Rust U2Net alpha-matte inference | **Spike S5** — `rembg-rs` 0.1.4 is minimally maintained (14 commits, 1 issue, 0 PRs). HOLD → REMOVE if it fails | 0 (S5) → 17 |
+| F169 Image remove-bg | **REMOVED** | — | **Spike S5 FAIL.** `rembg-rs 0.1.4` (published 2025-12-28, no push since) does not compile: its `ort = "2.0.0-rc.10"` caret requirement resolves to rc.13, which made `Session::inputs`/`outputs` private and broke 4 call sites in `manager.rs`. Dependency rot, not a host problem — a bare `ort = "=2.0.0-rc.13"` control crate reproduces it. Capability confirmed separately: pinned to `=2.0.0-rc.10` it runs U2Net at 634 ms CPU for 480×360. But it can only ever emit alpha 0 or 255 — `binary: false` is a no-op, since the scale factor is applied twice — so it is a threshold, not a matte, and the raw sigmoid mask is never exposed. 240 transitive packages for one inference call. Run U2Net via `ort` directly (~150 lines) if it is ever wanted. | — |
 | F338 Kokoro local TTS | UNIMPLEMENTED | Native Kokoro inference | **Spike S4** — `kokoroxide` 0.1.5 is explicitly **WIP** (7 stars, 0 issues). If `any-tts` provides a Kokoro backend, this is resolved; otherwise `kokoroxide` becomes REMOVE | 0 (S4) → 22 |
 | F176 Local diffusion generation | UNIMPLEMENTED | Full SD pipeline in Rust: CLIP tokenizer + `text_encoder` + `unet` + `vae_decoder` + scheduler port. **No ONNX equivalent exists for the scheduler** (~200–400 lines of stateful math) | **Spike S9** — scope decision. `/api/image/inpaint` and `/api/image/harmonize` already proxy to a registered `ModelEndpoint`, so a local SD pipeline may duplicate existing capability. `ort` is pinned to `2.0.0-rc.13` (an RC); TensorRT engine cache is required for the claimed 1.5–2.5 s | 0 (S9) → 17 |
 | F124 Local embeddings | UNIMPLEMENTED | Rust embedding runtime replacing Python `fastembed` | **S7 RESOLVED** — FTS5 and `sqlite-vec` both work with `rusqlite` 0.40 `bundled`. Remaining: the embedding runtime itself | 7 |
@@ -146,7 +146,7 @@ decision is not re-litigated later.
 
 | ID | Item | Evidence | Becomes |
 |---|---|---|---|
-| F169 | Image remove-bg | `rembg-rs` 0.1.4 (Dec 2025); repository has **14 commits, 1 issue, 1 PR**. Too little evidence to call dependable. | REMOVE if S5 fails |
+| F169 | Image remove-bg | Resolved by spike S5 — **FAIL as published**, removed. The earlier "minimally maintained, 14 commits" note understated it: the crate does not compile at all against current `ort`. | RESOLVED — REMOVED |
 | F338 | Kokoro local TTS | `kokoroxide` 0.1.5 (Oct 2025); **explicitly marked WIP**; 29 commits, 7 stars, 1 open PR, 0 issues. | REMOVE if S4 fails and `any-tts` has no Kokoro backend |
 | F176 | Local diffusion generation | SD is not one ONNX graph. Requires tokenizer + 4 exported graphs + a scheduler port. `ort` is at `2.0.0-rc.13` (an RC). | REMOVE if S9 concludes a local pipeline duplicates the existing proxy path |
 
