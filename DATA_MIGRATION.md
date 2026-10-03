@@ -47,6 +47,13 @@ Inventory of every persistent store, its disposition, and its migration risk.
 
 27 tables. Verified against the live `sqlite_master`, not the SQLAlchemy models.
 
+Every one of the 27 SQLAlchemy models in `core/database.py` was then diffed against that
+baseline — column by column, plus PKs, FKs, unique constraints and indexes — and the
+resulting inventory was checked against all 49 `database.py` migration helpers. Coverage
+is in **§2.3**; every discrepancy found is in **§2.2**. Nothing in either list has been
+applied to `0001_baseline.sql`: decision D6 (§3.1) makes the live database the winner,
+and a human decides whether a follow-up migration is warranted.
+
 ### 2.1 DDL
 
 ```sql
@@ -156,8 +163,8 @@ user_tools(id, name NOT NULL, description, icon, html_content NOT NULL,
   author, created_at/updated_at, PK(id),
   FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE SET NULL)
 
-user_tool_data(id INTEGER PK AUTOINCREMENT, tool_id NOT NULL, "key" NOT NULL,
-  value TEXT, created_at, updated_at,
+user_tool_data(id INTEGER PK (rowid alias, NOT AUTOINCREMENT), tool_id NOT NULL,
+  "key" NOT NULL, value TEXT, created_at, updated_at,
   FOREIGN KEY(tool_id) REFERENCES user_tools(id) ON DELETE CASCADE)
   UNIQUE IDX ix_user_tool_data_tool_key(tool_id,"key")
 
@@ -221,15 +228,90 @@ integrations(id, owner, name NOT NULL, type NOT NULL, config JSON,
 
 ### 2.2 Schema drift found (must be recorded, not silently fixed)
 
+Diffed 2026-10-03 (T0044). Every row cites **both** sides: the baseline SQL line in
+`crates/store/migrations/0001_baseline.sql` and the model or helper line in
+`core/database.py`. Two rows predate this diff and are marked where T0044 corrected them;
+the correction is part of the record, not a fix.
+
 | Item | Evidence | Action |
 |---|---|---|
 | `gallery_people` | In the owner-sweep list (`database.py:1447`); **no such table or model exists anywhere** | Do not create. REMOVED. |
-| `gallery_people` sweep statement | Would fail on a DB that never had it | Guard or drop from the sweep. |
-| `ix_sessions_last_message_at` | Created by `_migrate_add_last_message_at_column`, **absent from the model** | Create in baseline. |
+| `gallery_people` sweep statement | **Corrected by T0044 — cannot fail.** The loop is guarded by `if "owner" in columns` (`database.py:1452-1453`), and `PRAGMA table_info` on a missing table returns zero rows, so the `UPDATE` is skipped rather than raising | No-op. The "guard or drop" action is already satisfied; no Python change needed. |
+| `ix_sessions_last_message_at` | Created by `_migrate_add_last_message_at_column`, **absent from the model** | Create in baseline. **Done** — `0001_baseline.sql:733`. |
 | `sessions.character_id` equivalent | `ScheduledTask.character_id` documents itself as vestigial | Preserve the column; do not add an FK. |
-| `webhooks`, `task_runs`, `mcp_servers` | In the owner sweep but have **no `owner` column** | No-op; drop from sweep. |
+| `webhooks`, `task_runs` | In the owner sweep (`database.py:1446,1448`) but have **no `owner` column** (`0001_baseline.sql:508-521`, `:460-473`; models `database.py:648`, `:810`) | No-op; drop from sweep. |
+| `mcp_servers` | **Corrected by T0044 — it was never in the sweep.** It has no `owner` column (`0001_baseline.sql:286-301`, model `database.py:570-585`), but it does not appear in the list at `database.py:1442-1448`, so the earlier version of this row was wrong to claim it was swept | No-op. `mcp_servers` needs no sweep decision; `calendar_events` and `user_tool_data` do — see the two rows below. |
 | `ModelEndpoint.provider_auth_id` | Plain indexed string, no FK, no relationship | Preserve as-is; do not "fix". |
 | Two migrations break on Postgres | Raw `sqlite3` + `.replace("sqlite:///","")` (`database.py:868,1207,2295`) | Do not port. Single baseline is dialect-portable. |
+| `calendar_events`, `user_tool_data` in the owner sweep | Listed at `database.py:1445,1447`; neither table has an `owner` column — not in `0001_baseline.sql:43-68` / `:476-485`, nor in the models (`database.py:1856`, `:688`) | No-op; same disposition as `webhooks` / `task_runs`. Two more inert entries in a 19-entry list. |
+| **5 owner-bearing tables are missing from the owner sweep** | The list at `database.py:1442-1448` covers 14 of the 19 tables that have an `owner` column. Absent: `caldav_deleted_events`, `editor_drafts`, `email_accounts`, `model_endpoints`, `provider_auth_sessions` — all of which have one (`0001_baseline.sql:30`, `:180`, `:202`, `:332`, `:369`) | **Recommendation, not implemented.** Their rows keep `owner IS NULL`, which every model documents as "legacy/shared" (`database.py:189`) — i.e. visible to all users. Three of the five hold Fernet-encrypted secrets (§6). §3.4 says to port the sweep, so a human must decide whether to port the gap verbatim or close it. |
+| `user_tool_data.id` is **not** `AUTOINCREMENT` | `0001_baseline.sql:477,483` (`id INTEGER NOT NULL, PRIMARY KEY (id)`, and the live DB has no `sqlite_sequence` table) vs `database.py:692` `Column(Integer, primary_key=True, autoincrement=True)` — SQLAlchemy's SQLite dialect drops the flag, so no SQLAlchemy-created schema has it either | Baseline wins. §2.1 corrected. **Do not add `AUTOINCREMENT`** in a follow-up: it would create a `sqlite_sequence` table the live DB does not have and change row-reuse semantics. |
+| `ix_scheduled_tasks_webhook` | Created by name only by the helper (`database.py:1731`), while the model's `unique=True` (`database.py:759`) materialises as the inline `UNIQUE (webhook_token)` at `0001_baseline.sql:418` — i.e. `sqlite_autoindex_scheduled_tasks_2` in the baseline | No schema change; the uniqueness is identical. But **never refer to this constraint by name** — a legacy Python DB carries the index under a different name. Use `PRAGMA index_list`. |
+| `scheduled_tasks` FKs are lost by the Python table rebuild | `0001_baseline.sql:416-417` declares two FKs; the hardcoded `CREATE TABLE scheduled_tasks` at `database.py:1613-1639`, entered when `prompt`/`schedule`/`scheduled_time` are still `NOT NULL` (`database.py:1604-1608`), declares **no** `FOREIGN KEY` at all | Baseline wins. **Recommendation, not implemented:** the data-migration preflight should diff `PRAGMA foreign_key_list('scheduled_tasks')` against the baseline, because `PRAGMA foreign_key_check` (§11.4) cannot detect a *missing* FK and would pass on such a database. |
+| 19 columns carry a SQL `DEFAULT` on the helper path only | `0001_baseline.sql:52` (`is_utc BOOLEAN NOT NULL`) and `:436` (`total_input_tokens INTEGER`) vs `database.py:2430` (`DEFAULT 0 NOT NULL`) and `database.py:1297` (`DEFAULT 0`); also `:164` vs `database.py:925`, `:19` vs `database.py:1384`. The baseline contains **zero** `DEFAULT` clauses because SQLAlchemy's `default=` is a Python-side default that never emits DDL | Baseline wins. Rust must supply all 19 in its write path and must never rely on a DB-level default: `documents.archived`, `notes.sort_order`, `notes.repeat`, `gallery_images.caption`, `api_tokens.scopes`, `sessions.total_input_tokens`, `sessions.total_output_tokens`, `model_endpoints.{model_type,endpoint_kind,model_refresh_mode}`, `scheduled_tasks.{task_type,trigger_type,trigger_counter,notifications_enabled}`, `crew_members.is_default_assistant`, `email_accounts.smtp_security`, `calendar_events.{is_utc,importance,recurrence_exdates}`. |
+| 35 columns are `TEXT` on the helper path, `VARCHAR` in the baseline | `0001_baseline.sql:309` (`memories.owner VARCHAR`), `:439` (`sessions.crew_member_id VARCHAR`), `:135` (`crew_members.timezone VARCHAR`) vs `database.py:1321` (`ADD COLUMN owner TEXT`), `:1777`, `:1798`. Same class for `notes.{image_url,repeat,ai_content_hash,agent_session_id}`, `email_accounts.{oauth_provider,oauth_access_token,oauth_refresh_token,oauth_token_expiry,display_name,smtp_security}`, `calendar_events.{origin,importance,event_type,remote_href,remote_etag,caldav_sync_pending}`, `calendars.{account_id,caldav_base_url}`, `model_endpoints.{model_type,endpoint_kind,model_refresh_mode}`, `task_runs.model`, `scheduled_tasks.crew_member_id` | Baseline wins. Both spellings carry TEXT affinity in SQLite, so values are interchangeable; do not "correct" the baseline and do not assert on `typeof()`. The 9 helper `TEXT` columns that *do* match the baseline (`model_endpoints.{hidden_models,cached_models,pinned_models}`, `notes.ai_classification`, `gallery_images.caption`, `mcp_servers.{oauth_config,disabled_tools,oauth_tokens}`, `calendar_events.recurrence_exdates`) are correct as written. |
+| Column **order** differs on the helper path | `0001_baseline.sql:433` puts `last_message_at` 10th of 19, between `last_accessed` and `is_important`; `database.py:884` `ALTER TABLE sessions ADD COLUMN last_message_at DATETIME` appends after `updated_at`. All 72 helper-added columns behave this way | Baseline wins. **Rust must name columns explicitly in every `INSERT`/`SELECT` and must never use positional `VALUES` or `SELECT *`** — the same column set can arrive in two orders. Note for the legacy-DB migration runner. |
+| FTS5 objects are conditional in Python, unconditional in the baseline | `database.py:2204-2207` probes for FTS5 and `return`s early if it is missing, so a Python install without FTS5 has neither the table nor the triggers; `0001_baseline.sql:524` and `:775-793` create them unconditionally | No schema change. But it is a **fail-closed** choice: a `rusqlite` built without FTS5 fails `migrate()` outright instead of degrading to LIKE search. Confirm that is the intent (§3.3 requires the probe; it does not require making migration 0001 fallible). |
+| `0001_baseline.sql:8` says `-- Tables: 33` | The file creates 27 `CREATE TABLE` + 1 `CREATE VIRTUAL TABLE`. 33 is the source database's `sqlite_master` row count for `type='table'`, which includes the 5 FTS5 shadow tables | Comment only, and `0001_baseline.sql` must not be edited (D6, §3.2). **Recommendation, not implemented:** `tools/dump-baseline` should print "created tables" and "sqlite_master rows scanned" as separate numbers. |
+
+### 2.3 Coverage of the T0044 diff
+
+**Coverage: 27 of 27 models, 27 of 27 baseline tables, 81 of 81 indexes, 13 of 13 foreign
+keys, 4 of 4 unique constraints, 3 of 3 triggers, and all 49 `_migrate_*` helpers plus
+`_scrub_legacy_chat_message_fts_media` and the `after_create` DDL hook at
+`database.py:466-470`.** Both directions were walked: every model was looked up in the
+baseline, and every baseline object was traced back to a model, a helper, or an
+explanation below.
+
+| Dimension | Count | Result |
+|---|---|---|
+| Models inheriting `Base` | 27 | 27 matched to a `CREATE TABLE`; **0 unmatched** |
+| Columns | 361 in the baseline, 361 declared by the models | **Exact parity**, per table: same names, same order, same SQL type, same `NOT NULL` flags, same PKs |
+| Real-table columns in the baseline with no model | **0** | Every one traces to a `Column(...)`. Only the FTS5 table's 4 columns are model-less (see below) |
+| Model columns missing from the baseline | **0** | — |
+| Model-declared indexes | 79 | 79 present, same names, same columns, same order, same uniqueness |
+| Helper-created indexes | 2 | `ix_sessions_last_message_at` (`:733`), `ux_email_accounts_one_default_per_owner` (`:772`) — both accounted for |
+| Foreign keys | 13 across 11 tables | Identical `ondelete`/`onupdate` to the models; `calendar_events.calendar_id` has **no** `ondelete` in either, which is deliberate (§2.1) |
+| Unique constraints | 4 | `gallery_images.filename`, `scheduled_tasks.webhook_token`, `user_tool_data(tool_id,key)`, the partial `ux_email_accounts_one_default_per_owner` |
+| Triggers | 3 | `chat_messages_fts_ai/_ad/_au`, semantically identical to `database.py:2223-2241` including the `;base64,` / `data:image/` / `data:audio/` scrub |
+| Baseline objects with **no** model | 6 | `chat_messages_fts` + `chat_messages_fts_{config,content,data,docsize,idx}` |
+| `owner` columns | 18 of the 28 created tables | The other 9 are listed in §2.2; of the 19 tables the Python sweep names, 14 have `owner` and 5 are inert |
+
+**Models matched with zero drift: 27 of 27 on the ORM-declared surface.** Not one column,
+type, nullability, PK, FK, unique constraint or model-declared index differs between the
+classes and the baseline. Every new finding in §2.2 therefore comes from one of three
+places: the migration-helper path (which can build a different *shape* for the same
+column), a comment, or a Python file that is not a model.
+
+**Tables whose shape a helper can still change: 16 of 27** — the 72 columns added by
+`ALTER TABLE ... ADD COLUMN` across `scheduled_tasks` (11), `model_endpoints` (11),
+`calendar_events` (9), `sessions` (7), `documents` (7), `notes` (6), `email_accounts` (6),
+`mcp_servers` (3), `gallery_images` (2), `crew_members` (2), `calendars` (2),
+`api_tokens` (2), and 1 each in `user_tools`, `task_runs`, `memories`, `comparisons`. All
+72 are present in the baseline; only the type spelling, the SQL `DEFAULT`, and the column
+position differ, and those are the three rows above.
+
+**Baseline objects with no model, stated explicitly:** `chat_messages_fts` is an FTS5
+virtual table created by `_migrate_chat_messages_fts` (`database.py:2209-2241`), which
+SQLAlchemy cannot express, so it has no ORM class and never will. Its five shadow tables
+(`_config`, `_content`, `_data`, `_docsize`, `_idx`) are created by SQLite itself on first
+use and must **not** appear in the baseline — `schema.rs` asserts both halves of that.
+The only other `__tablename__` occurrences in the Python tree are two test-local
+re-declarations of the existing `scheduled_tasks` / `task_runs` tables
+(`tests/test_task_scheduler_cancel.py:13,23`, `tests/test_scheduler_restart_doublefire.py:37,49`),
+which add nothing new.
+
+**The 29-vs-27 `__tablename__` gap:** resolved. `database.py` contains 29 occurrences of
+the string, but only **27** are declarations of the form `__tablename__ = "..."`, one per
+model class. The other two are *attribute reads* — `EmailAccount.__tablename__` at
+`database.py:1939` and `:2007`, used as a table-name argument to `inspect().has_table()`.
+There is no 28th table hiding in that gap: the ORM has 27 tables, the baseline has 27
+`CREATE TABLE` statements, and they correspond one-to-one.
+
+The shape findings are pinned as a regression guard in `crates/store/tests/baseline_vs_models.rs`
+(the FK inventory, the `scheduled_tasks` FKs, the absence of SQL `DEFAULT`s, the `owner`-less
+set, the non-`AUTOINCREMENT` id, and the FTS5 object). The object *counts* are pinned
+separately in `crates/store/src/schema.rs`.
 
 ---
 
@@ -287,6 +369,10 @@ This exists because data created while auth was disabled or localhost-bypassed w
 otherwise stay world-visible. **Port it**, but run it once at migration time rather than
 hourly — the hourly sweep only exists to catch data created during a bypassed window,
 which is not a Rust-app concern. Record as a deliberate change.
+
+**The 19 entries are not 19 swept tables.** Only 14 of them have an `owner` column, and 5
+owner-bearing tables are missing from the list — see the `owner`-sweep row in §2.2 before
+porting this verbatim.
 
 `_migrate_backfill_document_owner_from_session` (`database.py:1520`) **must run before**
 the blanket sweep. Preserve ordering.

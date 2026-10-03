@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 33 / 489 complete · Phase 0 in progress
+**Status:** 34 / 489 complete · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — S1/S2 and S7 resolved, 9 pending.
 
@@ -76,7 +76,7 @@ is written.**
 - [x] T0041 `PRAGMA foreign_keys=ON` on every connection (matches `database.py:142-147`)
 - [x] T0042 `PRAGMA busy_timeout` set — required once real concurrency exists
 - [x] T0043 Emit `0001_baseline.sql` from **live `sqlite_master`**, not from the models. Regenerable via `tools/dump-baseline`
-- [ ] T0044 Diff baseline against each SQLAlchemy model; record every discrepancy as a fixture (`DATA_MIGRATION.md` §2.2)
+- [x] T0044 Diff baseline against each SQLAlchemy model; record every discrepancy as a fixture (`DATA_MIGRATION.md` §2.2)
 - [x] T0045 `chat_messages_fts` + 3 triggers, scrubbing base64 media from the index
 - [x] T0046 Fernet encrypt/decrypt at the column boundary for the 7 encrypted columns. **`.app_key` must stay readable**
 - [ ] T0047 Naive-UTC datetime conversion helpers; round-trip tests on every datetime column
