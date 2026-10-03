@@ -19,14 +19,13 @@
 //! * `validate_token` performs an **orphan check**: a token whose username no
 //!   longer exists in `auth.json` is rejected *and* pruned. Otherwise renaming or
 //!   deleting a user would leave live sessions behind.
-//!
-//! TOTP is **not implemented here** (T0068). `User` parses `totp_enabled` and the
-//! secrets so the file round-trips, but nothing in this module verifies a code, so a
-//! caller reading those fields today must not treat them as enforced.
 //! * Admins get the full privilege set wholesale, and the last admin cannot be
 //!   demoted or deleted.
 //! * Promotion stashes `privileges_before_admin`; demotion restores it, so a
 //!   temporary admin stint cannot leave `can_use_bash` behind.
+//! * **TOTP fails closed**: a user with `totp_enabled` but no usable secret is
+//!   refused entry, never waved through. See [`AuthStore::totp_verify`], whose check
+//!   order is load-bearing.
 
 use std::{
     collections::BTreeMap,
@@ -108,6 +107,10 @@ pub enum AuthError {
     /// The requester is not permitted to perform this action.
     #[error("not authorized: {0}")]
     NotAuthorized(String),
+
+    /// The TOTP layer refused something.
+    #[error(transparent)]
+    Totp(#[from] crate::totp::TotpError),
 }
 
 /// A user's stored record.
@@ -835,6 +838,239 @@ impl AuthStore {
             .get(&normalise_username(username))
             .cloned()
             .ok_or_else(|| AuthError::NoSuchUser(username.to_owned()))
+    }
+
+    // -- TOTP (core/auth.py:483-562) ---------------------------------------
+    //
+    // The logic lives in `crate::totp`; these are the `auth.json` mutations.
+    // Every one takes `config_lock` for the whole read-modify-write, matching
+    // Python's `_config_lock` usage in the same methods.
+
+    /// Whether a user has enrolled a second factor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError`] if the file cannot be read. An unknown user reads as
+    /// `false` rather than erroring, because callers use this to decide whether to
+    /// *ask* for a code.
+    pub fn totp_enabled(&self, username: &str) -> Result<bool, AuthError> {
+        let key = normalise_username(username);
+        Ok(self
+            .load_auth()?
+            .users
+            .get(&key)
+            .is_some_and(|u| u.totp_enabled))
+    }
+
+    /// Starts enrolment: mints a secret, stores it as *pending*, and returns it
+    /// alongside the `otpauth://` URI to render as a QR code.
+    ///
+    /// The user is **not** enabled yet — `totp_confirm_enable` does that, so a
+    /// secret the user never scanned cannot lock them out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::NoSuchUser`] for an unknown account and
+    /// [`AuthError::Totp`] if entropy or the URI fails.
+    pub fn totp_generate_secret(&self, username: &str) -> Result<(String, String), AuthError> {
+        let key = normalise_username(username);
+        let secret = crate::totp::generate_secret()?;
+        let base32 = crate::totp::secret_to_base32(&secret);
+        let uri = crate::totp::provisioning_uri(&key, &secret)?;
+
+        let _guard = self.lock_config()?;
+        let mut file = self.load_auth()?;
+        let Some(user) = file.users.get_mut(&key) else {
+            return Err(AuthError::NoSuchUser(username.to_owned()));
+        };
+        user.totp_secret_pending = Some(base32.clone());
+        self.save_auth(&file)?;
+
+        Ok((base32, uri))
+    }
+
+    /// The `otpauth://` URI for a known secret, for re-rendering a QR code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Totp`] if the stored secret does not decode, which is
+    /// also why a corrupt secret cannot be displayed as a working one.
+    pub fn totp_provisioning_uri(&self, username: &str) -> Result<String, AuthError> {
+        let key = normalise_username(username);
+        let file = self.load_auth()?;
+        let user = file
+            .users
+            .get(&key)
+            .ok_or_else(|| AuthError::NoSuchUser(username.to_owned()))?;
+        let stored = user
+            .totp_secret
+            .as_deref()
+            .or(user.totp_secret_pending.as_deref())
+            .ok_or_else(|| {
+                AuthError::Totp(crate::totp::TotpError::MalformedSecret(
+                    "no secret has been generated".into(),
+                ))
+            })?;
+        Ok(crate::totp::provisioning_uri(
+            &key,
+            &crate::totp::parse_secret(stored)?,
+        )?)
+    }
+
+    /// Completes enrolment: verifies `code` against the *pending* secret, enables
+    /// 2FA, and mints [`crate::totp::BACKUP_CODE_COUNT`] backup codes.
+    ///
+    /// Returns the backup codes, which are shown once and stored hashed-by-obscurity
+    /// only — `auth.json` holds them in the clear, as it does in Python.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Denied`] when no secret is pending or `code` is wrong,
+    /// and [`AuthError::NoSuchUser`] for an unknown account.
+    pub fn totp_confirm_enable(
+        &self,
+        username: &str,
+        code: &str,
+        now: u64,
+    ) -> Result<Vec<String>, AuthError> {
+        let key = normalise_username(username);
+
+        let secret = {
+            let file = self.load_auth()?;
+            let user = file
+                .users
+                .get(&key)
+                .ok_or_else(|| AuthError::NoSuchUser(username.to_owned()))?;
+            user.totp_secret_pending
+                .clone()
+                .ok_or_else(|| AuthError::Denied("no pending totp secret".into()))?
+        };
+
+        let parsed = crate::totp::parse_secret(&secret)?;
+        if !crate::totp::verify_code(&parsed, code, now) {
+            return Err(AuthError::Denied("totp code is incorrect".into()));
+        }
+
+        let backup = crate::totp::generate_backup_codes()?;
+
+        let _guard = self.lock_config()?;
+        let mut file = self.load_auth()?;
+        let Some(user) = file.users.get_mut(&key) else {
+            return Err(AuthError::NoSuchUser(username.to_owned()));
+        };
+        user.totp_secret = Some(secret);
+        user.totp_enabled = true;
+        // The pending copy is dropped: keeping it would leave two live secrets, and
+        // `totp-disable` clearing only one of them is how a stale secret survives.
+        user.totp_secret_pending = None;
+        user.totp_backup_codes = Some(backup.clone());
+        self.save_auth(&file)?;
+
+        Ok(backup)
+    }
+
+    /// The login-time check: is this user allowed in with `code`?
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`AuthError`] from reading the file.
+    ///
+    /// # Order, which is load-bearing (`auth.py:526-548`)
+    ///
+    /// 1. not enabled -> `true` (nothing to fail);
+    /// 2. enabled with no usable secret -> `false` (**fail closed**);
+    /// 3. a backup code -> consume it, persist, `true`;
+    /// 4. otherwise the TOTP code.
+    pub fn totp_verify(&self, username: &str, code: &str, now: u64) -> Result<bool, AuthError> {
+        let key = normalise_username(username);
+        let file = self.load_auth()?;
+        let Some(user) = file.users.get(&key) else {
+            // An unknown user cannot have a valid second factor.
+            return Ok(false);
+        };
+
+        // Step 1, and it must return here: a user who never enrolled has no secret
+        // to find, so falling through to the secret lookup would refuse every
+        // ordinary login.
+        if !user.totp_enabled {
+            return Ok(true);
+        }
+
+        // Step 2: enabled with no secret at all is a corrupt auth.json. Fail closed.
+        // `auth.py:532-537` records that this once returned true.
+        let Some(stored) = user.totp_secret.clone().filter(|s| !s.trim().is_empty()) else {
+            tracing::error!(user = %key, "totp_enabled with no secret; refusing");
+            return Ok(false);
+        };
+
+        // Step 3: backup codes, *before* the secret is decoded. Python checks them
+        // first (`auth.py:539-546`), which is what lets an enrolled user locked out
+        // by a corrupt secret still spend a code.
+        let backup = user.totp_backup_codes.clone().unwrap_or_default();
+        if let Some(remaining) = crate::totp::consume_backup_code(&backup, code) {
+            let _guard = self.lock_config()?;
+            let mut file = self.load_auth()?;
+            if let Some(user) = file.users.get_mut(&key) {
+                user.totp_backup_codes = Some(remaining);
+                self.save_auth(&file)?;
+            }
+            tracing::info!(user = %key, "backup code consumed");
+            return Ok(true);
+        }
+
+        // Step 4. An unparseable secret is a refusal, not an error: the caller must
+        // never be able to read a failure here as "allow".
+        let Ok(parsed) = crate::totp::parse_secret(&stored) else {
+            tracing::error!(user = %key, "totp_enabled with an unusable secret; refusing");
+            return Ok(false);
+        };
+
+        Ok(crate::totp::verify_code(&parsed, code, now))
+    }
+
+    /// Disables 2FA after verifying the password.
+    ///
+    /// The secrets and the flag are cleared in one write, so no reader can observe
+    /// `totp_enabled == false` next to a live secret (`auth.py:556-559`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Denied`] when the password is wrong,
+    /// [`AuthError::NoSuchUser`] for an unknown account, and propagates IO failures.
+    pub fn totp_disable(&self, username: &str, password: &str) -> Result<(), AuthError> {
+        let key = normalise_username(username);
+
+        // Password first, before any mutation.
+        let user = self.user(&key)?;
+        if !Self::verify_password(password, &user.password_hash)? {
+            return Err(AuthError::Denied("password is incorrect".into()));
+        }
+
+        let _guard = self.lock_config()?;
+        let mut file = self.load_auth()?;
+        let Some(user) = file.users.get_mut(&key) else {
+            return Err(AuthError::NoSuchUser(username.to_owned()));
+        };
+        user.totp_secret = None;
+        user.totp_secret_pending = None;
+        user.totp_backup_codes = None;
+        user.totp_enabled = false;
+        self.save_auth(&file)
+    }
+
+    /// The remaining backup codes for a user, for a "show my codes" screen.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::NoSuchUser`] for an unknown account.
+    pub fn totp_remaining_backup_codes(&self, username: &str) -> Result<Vec<String>, AuthError> {
+        let key = normalise_username(username);
+        Ok(self
+            .load_auth()?
+            .users
+            .get(&key)
+            .and_then(|u| u.totp_backup_codes.clone())
+            .unwrap_or_default())
     }
 
     /// Whether a user exists.

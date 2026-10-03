@@ -20,6 +20,7 @@ pub mod blocking;
 pub mod crypto;
 pub mod pool;
 pub mod schema;
+pub mod totp;
 
 use std::path::{Path, PathBuf};
 
