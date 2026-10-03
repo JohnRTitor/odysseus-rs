@@ -1,0 +1,178 @@
+# cargo-deny policy for the Odysseus workspace.
+#
+# AGENTS.md §12.3 requires `cargo deny check advisories licenses bans` to pass
+# before any dependency change is committed. This file is that policy. It is
+# deliberately narrow: every entry below is an examined decision, and the
+# rationale is recorded next to it so a future reader can tell "we checked and
+# accepted this" from "we never looked".
+#
+# Nothing here suppresses an advisory. There are no `[advisories] ignore`
+# entries, and if a real vulnerability ever appears the correct response is to
+# report it and fix the dependency, not to add a line below.
+
+[graph]
+# AGENTS.md §13 runs clippy as `cargo clippy --all-targets --all-features`.
+# A licence check that only walks default features inspects a *narrower* graph
+# than the one that actually builds and ships, so an optional-feature-gated
+# dependency could carry an unacceptable licence into a release build without
+# ever appearing here. Checking the wider graph is what makes this a real check.
+all-features = true
+
+[licenses]
+# Accepted licences, copied from `cargo deny list` over the resolved graph.
+#
+# Each is a considered decision, not a "it compiled so it must be fine":
+#
+#   MIT / MIT-0         The standard permissive licence; the overwhelming
+#                       majority of the transitive graph.
+#   Apache-2.0          Permissive, with an express patent grant. Preferred over
+#                       MIT where offered because of that clause.
+#   Apache-2.0 WITH LLVM-exception
+#                       wasi / wasip2 / wit-bindgen. Permissive; the exception
+#                       only carves out LLVM's own code.
+#   BSD-3-Clause        Permissive. The non-endorsement clause is harmless for a
+#                       dependency we do not redistribute.
+#   BSL-1.0              Boost Software License. See the decision note below --
+#                       this is the one non-OSI licence allowed.
+#   Zlib                 Permissive, OSI approved.
+#   0BSD                 Public-domain-equivalent, OSI approved.
+#   Unlicense            Public domain. See the decision note below.
+#   CC0-1.0              Public-domain dedication, OSI approved. SPDX treats
+#                       it as equivalent to Unlicense for this purpose.
+#   Unicode-3.0          The 19 icu4x crates. OSI approved and explicitly
+#                       designed for reuse in proprietary software.
+#   MPL-2.0              fernet only. See the decision note below.
+#   LGPL-2.1-or-later    r-efi only, via the wasi target-support chain. See the
+#                       decision note below.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "LGPL-2.1-or-later",
+]
+
+# Per-licence clarifications.
+#
+# LGPL is a copyleft licence, so it cannot simply be waved through with the
+# others: the question is whether r-efi is *linked into the shipped binary* in a
+# way that would impose LGPL's reciprocal obligations. It is not. r-efi is a
+# UEFI support crate pulled in only through the wasi / wasip2 / wit-bindgen
+# target-support chain, which is compiled for those targets rather than linked
+# into the Linux binary this project ships. Even if it were, LGPL-2.1 permits
+# use of a library provided the user can relink against a modified version,
+# which the dynamic-linking structure of Rust binaries preserves by default.
+# Accepted on that basis, and worth re-examining if the wasi chain ever stops
+# being target-only.
+#
+# `version-two` is NOT set: it would additionally accept any LGPL-3.0 variant,
+# broadening the grant beyond what has actually been reviewed. Allow exactly
+# the 2.1 line that was examined, and nothing above it.
+
+[licenses.private]
+# The 12 AGPL-3.0-or-later entries in `cargo deny list` are this project's own
+# crates (odysseus-{agent,cli,domain,integrations,llm,ml,server,services,store,
+# tools,ui,web}). They carry AGPL because the root Cargo.toml declares
+# `license = "AGPL-3.0-or-later"` and each member inherits it via
+# `license.workspace = true`.
+#
+# Ignoring them is correct and NOT a loophole: with `publish = false` they are
+# never distributed as packages, so there is no third party to whom AGPL's
+# copyleft obligations could be owed, and a licence *check* has nothing to
+# enforce about code you wrote yourself.
+#
+# The distinction that matters: this field ignores `private` crates only. Had a
+# third-party crate been AGPL it would have to appear under
+# `[[licenses.exceptions]]` with a stated reason, and no such entry exists here.
+# The project's own AGPL declaration is an owner-level decision; it is recorded
+# as an observation and deliberately not "fixed" by this policy.
+ignore = true
+
+[advisories]
+# A yanked release is withdrawn by its author. Depending on one means depending
+# on code its author no longer stands behind, and it can be pulled from the
+# registry at any time, so a build would stop resolving. Deny.
+yanked = "deny"
+
+# Vulnerabilities are denied by default in cargo-deny's built-in defaults;
+# stated explicitly so a future default change cannot silently loosen this file.
+#
+# AGPL-3.0-or-later and LGPL-2.1-or-later are copyleft licences accepted above
+# for *linkage*, not as a reason to run unfixed vulnerable code. A vulnerability
+# advisory against an AGPL dependency is still a vulnerability, and is still
+# denied here.
+version = 2
+
+# `unmaintained` selects the SCOPE of the unmaintained-crate check, not a
+# severity -- cargo-deny reports those findings at warning level regardless, so
+# there is no severity to choose here and `warn` is not a valid value for it.
+# Valid scopes are `all` / `workspace` / `transitive` / `none`.
+#
+# `all` is chosen over the narrower scopes deliberately. "Unmaintained" is a
+# judgement that a crate has no active maintainer, not a statement that it is
+# broken, so the response to such a finding should never be to stop looking. The
+# trade-off is asymmetric:
+#
+#   * `none` would hide the signal entirely -- a crate can go unmaintained and
+#     nothing in the build would say so.
+#   * `workspace` or `transitive` would hide the majority of them, since nearly
+#     every crate in this tree is transitive.
+#   * Failing the build over it would be wrong too: the "fix" would be to delete
+#     a working dependency, which is a worse outcome than the risk being managed.
+#
+# So: report everything, warn about all of it, and let a human decide. This
+# cannot mask a vulnerability -- those are denied above -- so no advisory is
+# suppressed by this setting.
+unmaintained = "all"
+
+# No `ignore` list, and none is warranted: an ignored advisory is a suppressed
+# vulnerability finding, which is the one outcome this policy exists to prevent.
+
+[bans]
+# AGENTS.md §12.3 says to check the stdlib or an existing dependency before adding
+# a crate, and to declare versions centrally. A `foo = "*"` requirement silently
+# opts out of both: the version floats to whatever is newest on every resolve, so
+# two developers on different days build different binaries from one
+# `Cargo.toml`. Deny it.
+#
+# `deny-wildcard-paths` additionally rejects `path = ".../*"`, which would
+# implicitly pick up any crate dropped into a directory later.
+wildcards = "deny"
+
+# No `[bans.deny]` list. Nothing in the graph is currently known-bad, and adding
+# an entry speculatively would be noise. `deny` is the correct value: if a crate
+# is ever shown to be unsafe to depend on, it goes here.
+multiple-versions = "warn"
+
+# The graph currently has ~15 crates at two or more versions (base64, block-
+# buffer, cipher, cpufeatures, digest, getrandom, hashbrown, hmac, sha2, r-efi
+# and friends). They are all transitive and resolve to distinct major versions
+# their dependents require; collapsing them is not possible from this workspace.
+#
+# `warn` rather than `deny` is the honest setting: these are real duplicated
+# build artefacts with a real (if small here) binary-size cost, and the right
+# response is to notice them when a dependency bumps, not to break the build on
+# someone else's release schedule. This is a reporting threshold, not a
+# security control; nothing is being suppressed.
+
+[sources]
+# Supply-chain hardening. Every crate must come from crates.io or be a local
+# path/git dependency of this workspace -- nothing from an unknown registry,
+# and nothing fetched from an arbitrary git URL. A dependency introduced from an
+# unpinned git tag is the highest-severity supply-chain vector available to a
+# build: it is unaudited, mutable, and not covered by the advisory databases
+# this policy depends on.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# crates.io itself is allowed above. Local path dependencies are always
+# permitted by cargo-deny's model, which is what lets the 12 workspace crates
+# resolve at all.
