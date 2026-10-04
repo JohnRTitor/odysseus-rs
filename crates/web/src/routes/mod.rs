@@ -5,4 +5,5 @@
 //! `odysseus-services`, and anything that decides *what a status code means*
 //! belongs in [`crate::error`].
 
+pub mod auth;
 pub mod system;

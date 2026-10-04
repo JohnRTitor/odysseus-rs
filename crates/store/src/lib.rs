@@ -19,6 +19,7 @@ pub mod auth;
 pub mod blocking;
 pub mod crypto;
 pub mod pool;
+pub mod ratelimit;
 pub mod schema;
 pub mod totp;
 

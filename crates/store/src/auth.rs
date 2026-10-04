@@ -96,6 +96,14 @@ pub enum AuthError {
     #[error("no such user: {0}")]
     NoSuchUser(String),
 
+    /// First-run setup was attempted on an install that already has an account.
+    ///
+    /// Distinct from [`AuthError::Denied`] because the caller must map it to a
+    /// different response: the first-run endpoint answers 409 once setup is
+    /// done, rather than treating it as a generic refusal.
+    #[error("this instance is already set up")]
+    AlreadyConfigured,
+
     /// The password did not meet the minimum length.
     #[error("password must be at least {PASSWORD_MIN_LENGTH} characters")]
     PasswordTooShort,
@@ -360,7 +368,12 @@ impl std::fmt::Debug for SessionEntry {
 ///
 /// Boolean switches are `true` by default except `can_use_bash`, which is off
 /// because shell access is the highest-risk capability in the app.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize` because `GET /api/auth/status` returns this map to the frontend so
+/// it can dim controls the user may not use. The field names are the wire format
+/// and are deliberately identical to the `DEFAULT_PRIVILEGES` keys in
+/// `auth_helpers.py`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "these mirror the eleven independent DEFAULT_PRIVILEGES keys that `auth_helpers.py` reads by name; folding them into a bitflags field would hide the exact JSON keys, which are part of the wire format of auth.json"
@@ -816,6 +829,64 @@ impl AuthStore {
         bcrypt::verify(password, hash).map_err(|e| AuthError::Password(e.to_string()))
     }
 
+    /// Verifies a login attempt, doing the same work whether or not the account
+    /// exists.
+    ///
+    /// # Why this exists
+    ///
+    /// [`AuthStore::verify_password`] is a bare bcrypt verify. A login handler
+    /// that looks the user up first and verifies second therefore answers an
+    /// unknown username in ~1 ms (no hash to check) and a known one in ~250 ms
+    /// (bcrypt cost 12) — on an unauthenticated endpoint, which is exactly where
+    /// a timing oracle is worth having. An attacker enumerating usernames needs
+    /// only a stopwatch.
+    ///
+    /// This performs **exactly one** bcrypt comparison on both paths: against the
+    /// stored hash when the user exists, and against a precomputed dummy hash
+    /// otherwise. The miss path returns `false`, the same answer as a wrong
+    /// password against a real account.
+    ///
+    /// # Why the dummy hash is precomputed
+    ///
+    /// Hashing a dummy password per request would add a *second* ~250 ms of work
+    /// to the miss path, making it slower than the hit path — a leak in the
+    /// opposite direction, and a self-inflicted `DoS`. So the hash is built once
+    /// from 32 random bytes and reused, which is also why the key is random: a
+    /// predictable dummy plaintext could in principle be discovered and, if it
+    /// ever matched, authenticate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Io`] or [`AuthError::Malformed`] if `auth.json` cannot
+    /// be read, and [`AuthError::Password`] if bcrypt itself fails. A missing
+    /// account is **not** an error: it is `Ok(false)`, because a login attempt
+    /// against an unknown user is a failed login, not a fault.
+    ///
+    /// **Blocking.** Cost 12 is ~250 ms of CPU. Call from
+    /// `spawn_blocking` via a thin wrapper, exactly as
+    /// [`AuthStore::verify_password_blocking`]; never from an async handler body.
+    pub fn verify_password_or_dummy(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<bool, AuthError> {
+        let key = normalise_username(username);
+        let file = self.load_auth()?;
+        // Whichever hash is used, exactly one bcrypt::verify runs below. Both arms
+        // produce an owned `String`, so the value outlives the borrow of `file`.
+        let (hash, user_exists) = match file.users.get(&key) {
+            Some(user) => (user.password_hash.clone(), true),
+            None => (dummy_hash()?.to_owned(), false),
+        };
+        // A user with an empty stored hash is not an error either; it compares
+        // against the empty string and fails, which is the correct outcome.
+        let matched =
+            bcrypt::verify(password, &hash).map_err(|e| AuthError::Password(e.to_string()))?;
+        // The `&&` matters: a dummy comparison that somehow matched must not
+        // authenticate anyone. `user_exists` is the authority, not the bcrypt result.
+        Ok(matched && user_exists)
+    }
+
     /// Hashes a password for storage, **on the blocking pool**.
     ///
     /// Cost 12 is ~250 ms of CPU. Calling [`AuthStore::hash_password`] directly from
@@ -1197,6 +1268,59 @@ impl AuthStore {
             .load_auth()?
             .users
             .contains_key(&normalise_username(username)))
+    }
+
+    /// Creates the **first** administrator, and only while none exists.
+    ///
+    /// This exists because `is_configured` followed by `create_user` is a race:
+    /// the check and the insert happen under separate `config_lock` acquisitions,
+    /// so two concurrent `POST /api/auth/setup` calls with *different* usernames
+    /// both observe "unconfigured", both insert, and both return 200 — two admins,
+    /// one of them chosen by whoever won. `create_user` only rejects a duplicate
+    /// *username*, so it cannot catch this.
+    ///
+    /// Python closes it with `_setup_lock`, held across the check and the create
+    /// (`core/auth.py:255-260`, declared at `:107` for exactly this reason). Here
+    /// the same atomicity comes from doing both inside one `config_lock` hold.
+    ///
+    /// The bcrypt hash is computed **before** the lock, so a cost-12 hash does not
+    /// serialise every other writer on the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::AlreadyConfigured`] if any account already exists, and
+    /// otherwise propagates the same reserved-name, empty-name, password and IO
+    /// failures as [`AuthStore::create_user`].
+    pub fn setup_first_run(&self, username: &str, password: &str) -> Result<(), AuthError> {
+        let key = normalise_username(username);
+        if RESERVED_USERNAMES.contains(&key.as_str()) {
+            return Err(AuthError::Denied(format!("{key} is reserved")));
+        }
+        if key.is_empty() {
+            return Err(AuthError::Denied("username must not be empty".into()));
+        }
+        let hash = Self::hash_password(password)?;
+
+        // One lock hold covers the emptiness check AND the insert. That is the
+        // entire point of this function.
+        let _guard = self.lock_config()?;
+        let mut file = self.load_auth()?;
+        if !file.users.is_empty() {
+            return Err(AuthError::AlreadyConfigured);
+        }
+        file.users.insert(key, User::new(hash, true));
+        self.save_auth(&file)
+    }
+
+    /// Whether anyone may self-register.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError`] if `auth.json` cannot be read. The login form needs
+    /// this before anyone has a session, so it must not fail closed to `false`
+    /// on an unreadable file — that would silently hide registration.
+    pub fn signup_enabled(&self) -> Result<bool, AuthError> {
+        Ok(self.load_auth()?.signup_enabled)
     }
 
     /// Creates a user, rejecting reserved names and duplicates.
@@ -2056,6 +2180,42 @@ fn ttl_secs_f64() -> f64 {
     ttl
 }
 
+/// A bcrypt hash of a 32-byte random value that no one can supply, computed once.
+///
+/// The point is that `bcrypt::verify` still does its full ~250 ms of work against
+/// it, so the "no such user" path costs the same as the "wrong password" path.
+/// See [`AuthStore::verify_password_or_dummy`].
+///
+/// Initialised at first use rather than being a hard-coded literal: a committed
+/// hash would be a constant in the source tree, and its plaintext would have to
+/// be reasoned about forever. One `OnceLock` also means the ~250 ms of hashing
+/// is paid once per process instead of once per login attempt.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Password`] if the OS entropy source fails, or if bcrypt
+/// fails to hash. Both propagate rather than falling back to something weak:
+/// failing open here would reintroduce exactly the timing gap this hides, and
+/// failing closed would turn a lucky entropy outage into a locked-out instance.
+///
+/// `LazyLock` rather than `OnceLock` because `OnceLock::get_or_try_init` is still
+/// unstable; holding a `Result` in the cell gives the same fallible-init semantics
+/// on stable. The error is stored as its `Display` form and mapped back, so the
+/// cell stays `Sync` (which requires the payload to be, and `AuthError` carries an
+/// `io::Error` that is not `Clone`).
+fn dummy_hash() -> Result<&'static str, AuthError> {
+    static DUMMY: std::sync::LazyLock<Result<String, String>> = std::sync::LazyLock::new(|| {
+        let key =
+            random_hex(32).map_err(|e| format!("building the dummy credential failed: {e}"))?;
+        bcrypt::hash(&key, bcrypt::DEFAULT_COST)
+            .map_err(|e| format!("bcrypt hashing the dummy credential failed: {e}"))
+    });
+    DUMMY
+        .as_ref()
+        .map(String::as_str)
+        .map_err(|message| AuthError::Password(message.clone()))
+}
+
 /// `n` random bytes as lowercase hex, matching `secrets.token_hex(n)`.
 ///
 /// # Errors
@@ -2092,6 +2252,90 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = AuthStore::new(dir.path());
         (dir, store)
+    }
+
+    #[test]
+    fn first_run_setup_creates_an_admin_when_the_install_is_empty() {
+        let (_dir, auth) = store();
+        assert!(!auth.is_configured().expect("configured"));
+        auth.setup_first_run("alice", "correct horse battery")
+            .expect("setup");
+        assert!(auth.is_configured().expect("configured"));
+        assert!(auth.is_admin("alice").expect("is admin"));
+    }
+
+    #[test]
+    fn first_run_setup_refuses_once_any_account_exists() {
+        let (_dir, auth) = store();
+        auth.create_user("alice", "correct horse battery", false)
+            .expect("create");
+        let err = auth
+            .setup_first_run("mallory", "correct horse battery")
+            .expect_err("must refuse");
+        assert!(
+            matches!(err, AuthError::AlreadyConfigured),
+            "a second first-run setup must be refused, got {err:?}"
+        );
+        // A refusal that still created the account would be the bug, not the fix.
+        assert!(!auth.user_exists("mallory").expect("exists"));
+    }
+
+    #[test]
+    fn concurrent_first_run_setups_produce_exactly_one_admin() {
+        // The regression this function exists for. Different usernames, so
+        // `create_user`'s duplicate check cannot catch it: without a single lock
+        // hold across the check and the insert, both threads observe an empty
+        // file and both insert. Verified to fail against that shape — all four
+        // won.
+        let (_dir, auth) = store();
+        let names = ["alice", "mallory", "trent", "victor"];
+
+        let winners: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = names
+                .iter()
+                .map(|name| {
+                    let auth = auth.clone();
+                    let name = (*name).to_owned();
+                    scope.spawn(move || {
+                        auth.setup_first_run(&name, "correct horse battery")
+                            .is_ok()
+                            .then_some(name)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().ok().flatten())
+                .collect()
+        });
+
+        assert_eq!(winners.len(), 1, "exactly one setup may win: {winners:?}");
+        assert_eq!(
+            auth.known_owners().expect("owners").len(),
+            1,
+            "exactly one account may exist after concurrent setup"
+        );
+        let admins = auth
+            .known_owners()
+            .expect("owners")
+            .into_iter()
+            .filter(|u| auth.is_admin(u).unwrap_or(false))
+            .count();
+        assert_eq!(admins, 1, "the winner must be an admin");
+    }
+
+    #[test]
+    fn signup_enabled_reflects_the_stored_flag() {
+        let (_dir, auth) = store();
+        assert!(!auth.signup_enabled().expect("flag"));
+
+        let raw = std::fs::read_to_string(auth.auth_path()).unwrap_or_else(|_| String::from("{}"));
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+        doc["signup_enabled"] = serde_json::json!(true);
+        std::fs::write(auth.auth_path(), doc.to_string()).expect("write");
+
+        assert!(auth.signup_enabled().expect("flag"));
     }
 
     /// An `AuthStore` plus the `ApiTokenStore` over the same directory, since

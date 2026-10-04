@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 44 / 489 complete · Phase 0 in progress
+**Status:** 45 / 489 complete · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — **4 of 11 resolved** (S1, S2, S5, S7); 7 pending.
 
@@ -91,7 +91,7 @@ is written.**
 - [x] T0061 `auth.json` read/write with atomic replace + `fsync`
 - [x] T0062 Legacy single-user shape migration; lowercase normalisation; reserved-username purge
 - [x] T0063 Session tokens: `sessions.json`, 7-day TTL, **orphan check** (username must still exist)
-- [ ] T0064 **TEST: login works against the real `auth.json` + `sessions.json`** (acceptance gate)
+- [x] T0064 **TEST: login works against the real `auth.json` + `sessions.json`** (acceptance gate) — **PASS.** `crates/web/src/routes/auth.rs`: setup, login, logout, status, policy. A real password against the real `auth.json` yields a session in the real `sessions.json` that then authenticates a gated request. 19 tests, five mutations verified to go red
 - [x] T0065 API tokens: `ody_` + 43 chars, bcrypt hash, `prefix` = 8 chars, id = 8 hex
 - [x] T0066 Token cache: `RwLock<HashMap<prefix, Vec<Candidate>>>` + dirty flag, constant-time compare
 - [x] T0067 14 scopes + 4 profiles; write scope auto-inserts its read scope

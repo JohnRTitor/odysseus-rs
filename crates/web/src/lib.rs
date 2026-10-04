@@ -36,4 +36,5 @@ pub use {
     app::{AppState, router, router_without_auth, secured},
     error::{AppError, AppResult},
     identity::{AuthContext, BypassConfig},
+    routes::auth::{self, routes as auth_routes},
 };

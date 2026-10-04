@@ -175,6 +175,165 @@ impl AppState {
             }
         }
     }
+
+    /// Creates the first administrator. Refused once any account exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::AppError::Auth`] for a reserved or empty username, a short
+    /// password, or [`odysseus_store::auth::AuthError::AlreadyConfigured`].
+    pub async fn setup_first_admin(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<(), crate::AppError> {
+        let auth = Arc::clone(&self.auth);
+        let (name, secret) = (username.to_owned(), password.to_owned());
+        run_blocking("first-run setup", move || {
+            auth.setup_first_run(&name, &secret)
+        })
+        .await
+    }
+
+    /// Verifies a login, always doing exactly one bcrypt comparison.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::AppError::Auth`] if `auth.json` cannot be read. A wrong
+    /// password and an unknown user are both `Ok(false)`, and cost the same.
+    pub async fn verify_login(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<bool, crate::AppError> {
+        let auth = Arc::clone(&self.auth);
+        let (name, secret) = (username.to_owned(), password.to_owned());
+        run_blocking("password verification", move || {
+            auth.verify_password_or_dummy(&name, &secret)
+        })
+        .await
+    }
+
+    /// Whether `username` has a second factor enrolled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::AppError::Auth`] if the account or file cannot be read.
+    pub async fn totp_enabled(&self, username: &str) -> Result<bool, crate::AppError> {
+        let auth = Arc::clone(&self.auth);
+        let name = username.to_owned();
+        run_blocking("totp flag read", move || auth.totp_enabled(&name)).await
+    }
+
+    /// Checks a TOTP or backup code, spending a backup code if one matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::AppError::Auth`] if `auth.json` cannot be read. A wrong
+    /// code is `Ok(false)` — never an error, so a caller cannot read a failure
+    /// as a permit.
+    pub async fn verify_second_factor(
+        &self,
+        username: &str,
+        code: &str,
+    ) -> Result<bool, crate::AppError> {
+        let auth = Arc::clone(&self.auth);
+        let (name, secret) = (username.to_owned(), code.to_owned());
+        run_blocking("second-factor check", move || {
+            auth.totp_verify(&name, &secret, unix_now())
+        })
+        .await
+    }
+
+    /// Issues a session token for an already-authenticated user.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::AppError::Auth`] if the account is unknown or
+    /// `sessions.json` cannot be written.
+    pub async fn issue_session(&self, username: &str) -> Result<String, crate::AppError> {
+        let auth = Arc::clone(&self.auth);
+        let name = username.to_owned();
+        run_blocking("session issue", move || auth.issue_token(&name)).await
+    }
+
+    /// Revokes one session token. A token that is already gone is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::AppError::Auth`] if `sessions.json` cannot be written.
+    pub async fn revoke_session(&self, token: &str) -> Result<(), crate::AppError> {
+        let auth = Arc::clone(&self.auth);
+        let raw = token.to_owned();
+        run_blocking("session revoke", move || auth.revoke_token(&raw)).await
+    }
+
+    /// Whether self-registration is currently allowed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::AppError::Auth`] if `auth.json` cannot be read.
+    pub async fn signup_enabled(&self) -> Result<bool, crate::AppError> {
+        let auth = Arc::clone(&self.auth);
+        run_blocking("signup flag read", move || auth.signup_enabled()).await
+    }
+
+    /// Whether `username` is an administrator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::AppError::Auth`] if the account or file cannot be read.
+    pub async fn is_admin(&self, username: &str) -> Result<bool, crate::AppError> {
+        let auth = Arc::clone(&self.auth);
+        let name = username.to_owned();
+        run_blocking("admin flag read", move || auth.is_admin(&name)).await
+    }
+
+    /// The effective privilege map for `username`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::AppError::Auth`] if the account or file cannot be read.
+    pub async fn privileges(
+        &self,
+        username: &str,
+    ) -> Result<odysseus_store::auth::Privileges, crate::AppError> {
+        let auth = Arc::clone(&self.auth);
+        let name = username.to_owned();
+        run_blocking("privilege read", move || auth.privileges(&name)).await
+    }
+}
+
+/// Runs a blocking auth-store call on the blocking pool.
+///
+/// One place, so every `AppState` auth method gets the D11 treatment and the
+/// `JoinError` → 500 mapping without repeating it. The `what` label appears in
+/// the log so a failure names the operation rather than a type.
+async fn run_blocking<T, F>(what: &'static str, f: F) -> Result<T, crate::AppError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, odysseus_store::auth::AuthError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result.map_err(crate::AppError::Auth),
+        Err(e) => {
+            tracing::error!(%what, error = %e, "auth task failed");
+            Err(crate::AppError::Store(StoreError::Interrupted))
+        }
+    }
+}
+
+/// Seconds since the Unix epoch, for TOTP's 30-second time step.
+///
+/// The store's `totp_verify` takes `now` as a parameter, which is where time is
+/// pinned for testing. At the route layer we pass the real clock: a route test
+/// only needs to reach the "password accepted, code required" branch, which does
+/// not depend on which step we are in. A test that needed a *valid* code would
+/// have to go through the store with an injected `now` instead.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Reads a boolean environment flag, matching Python's `.lower() == "true"`.
@@ -230,6 +389,7 @@ pub fn router(state: &AppState) -> Router {
 /// silently unauthenticated endpoint.
 fn base(state: &AppState) -> Router {
     Router::new()
+        .merge(crate::routes::auth::routes())
         .route("/api/health", get(crate::routes::system::health))
         .route("/api/version", get(crate::routes::system::version))
         .route("/api/ready", get(crate::routes::system::ready))
