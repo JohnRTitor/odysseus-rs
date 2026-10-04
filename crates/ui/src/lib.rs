@@ -7,6 +7,10 @@
 
 #![deny(missing_docs)]
 
+pub mod app;
 pub mod theme;
 
-pub use theme::{SyntaxVars, THEMES, Theme, syntax_vars, theme};
+pub use {
+    app::{App, Nonce, PREPAINT_SCRIPT},
+    theme::{SyntaxVars, THEMES, Theme, syntax_vars, theme},
+};

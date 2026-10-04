@@ -115,6 +115,34 @@ implementation has not started. Grouped by phase for planning convenience; see
 
 *(`*` = status REPLACED or REMOVED; see §3/§4.)*
 
+### 2.4 Phase 0 UI shell — partial
+
+Phase 0's UI work is tracked as tasks rather than features, so it has no
+`F###` id. Two items are genuinely incomplete and are recorded here so the
+Definition-of-Done gate cannot read a ticked box as a finished UI.
+
+| Item | Status | Missing | Why it is not simply ticked | Next |
+|---|---|---|---|---|
+| T0100 Tailwind | UNIMPLEMENTED | Tailwind itself | The `odysseus-ui` crate exists with `ssr`/`hydrate` features and Leptos deps that are actually resolved (they were previously declared in `[workspace.dependencies]` and never used — the same defect as T0005). **No CSS is served and no styling exists**, so the shell renders unstyled. Ticking the box would mean "Tailwind wired" for a crate that contains no Tailwind. | Wire `tailwindcss` v4 (crate or `build.rs`, decision open) and serve the output |
+| T0101 axum handler | UNIMPLEMENTED | Server-side rendering of the shell | `App`/`Home`/`Settings`/`NotFound`, `<Routes/>` and `leptos_meta` all exist and compile (`crates/ui/src/app.rs`, 17 tests). **The server does not render them**, so the components have no route to `leptos_axum`. `/` still returns the 503 placeholder, which is the honest response (`N2`). | See the integration notes below |
+
+`leptos_axum` 0.8 facts established while wiring this, so the next attempt does
+not re-derive them:
+
+- `LeptosRoutes::leptos_routes(&options, paths, app_fn)` needs a **`S: LeptosOptionsLike`**
+  and an `AxumRouteListing` vec from `generate_route_list(App)`; it is a trait
+  method on `axum::Router`, not a free function.
+- `render_app_to_stream_with_context(additional_context, app_fn)` returns
+  `impl Fn(Request<Body>) -> Pin<Box<dyn Future<Output = Response<Body>>>>>`, i.e.
+  a **handler**, not a `Response`. There is no `leptos_axum::LeptosResponse` type in
+  0.8 — an early attempt that returned one does not compile.
+- `leptos_meta::provide_meta_context()` is public at `leptos_meta` root (line ~294),
+  not re-exported through a submodule; `Html` takes no children and has no `id`
+  method, so `<html>`/`<head>`/`<body>` must come from `leptos_meta`'s own SSR
+  document emission rather than from hand-written elements.
+- Hydration cannot be verified without a browser, so T0107 (no-FOUC test) stays open
+  regardless of how far SSR gets.
+
 ---
 
 ## 3. REMOVED — with documented reasons

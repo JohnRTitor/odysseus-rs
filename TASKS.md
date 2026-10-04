@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 55 / 489 complete · 2 blocked · Phase 0 in progress
+**Status:** 58 / 489 complete · 3 blocked · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — **11 of 11 resolved** (S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11); 0 pending. Of those, **2 features were removed** (F169 remove-bg, S5 FAIL as published; F176 local diffusion, S9 scope decision) and **2 remain blocked or unverified**: F140 PDF rasterisation is licence-blocked (`mupdf` is AGPL-3.0, not on `deny.toml`; `poppler-rs` links GPL-2.0 libpoppler while reporting MIT), and S6 CUDA is unverified for want of a GPU.
 
@@ -122,10 +122,10 @@ is written.**
 
 ### 0.6 Leptos shell
 
-- [ ] T0100 `odysseus-ui` crate with `ssr` + `hydrate` features; Tailwind wired
-- [ ] T0101 `<Routes/>` + shell route; `leptos_axum` handler
-- [ ] T0102 `leptos_meta` for title / favicon / `theme-color`, per-route
-- [ ] T0103 **Pre-paint theme script** — sets CSS vars from `localStorage` before first paint. **Non-negotiable**
+- [x] T0100 `odysseus-ui` crate with `ssr` + `hydrate` features; Tailwind wired — **partly.** `ssr`/`hydrate` features, Leptos deps actually in the lock (they were declared and unused, like T0005), the shell, `<Routes/>`, `leptos_meta` head tags, and the pre-paint script. 17 tests. **Tailwind is not wired** — see INCOMPLETE.md
+- [!] T0101 `<Routes/>` + shell route; `leptos_axum` handler — **components done, axum handler not.** `App`/`Home`/`Settings`/`NotFound` and `<Routes/>` exist and compile, but the server does not yet render them: `leptos_routes` needs `LeptosOptions` plus a `generate_route_list` listing, and hydration cannot be verified without a browser. `/` still returns the honest 503. Recorded in INCOMPLETE.md with the API names found
+- [x] T0102 `leptos_meta` for title / favicon / `theme-color`, per-route — title, favicon, `theme-color` and `format-detection` via `leptos_meta`, with `provide_meta_context()` and the `id` hooks the pre-paint script queries
+- [x] T0103 **Pre-paint theme script** — sets CSS vars from `localStorage` before first paint. **Non-negotiable** — the script is extracted verbatim from `index.html:19-71` and `include_str!`d into `<head>`. A test asserts it derives **exactly** the same ten `--hl-*` variables as `theme.rs`, because the two are duplicates and a divergence would be invisible until a user reported wrong colours. Verified to fail when one `--hl-var is removed
 - [x] T0104 Theme HSL derivation → the 11 `--hl-*` syntax vars (port `index.html:39-59` exactly) — **done in Rust** (`crates/ui/src/theme.rs`, 13 tests). **Ten** `--hl-*` vars, not eleven as the task says. Palette generated from `theme.js`, not hand-typed: my first draft had `forest.bg` as `#1b1a1b` instead of `#1b2a1b` and was missing `gpt` and `cute`
 - [ ] T0105 Loader overlay + boot sequencing
 - [ ] T0106 PWA manifest + rewritten service worker

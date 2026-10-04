@@ -10,3 +10,20 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# `hydrate` is the wasm build; without it the crate is the server renderer.
+# Leptos selects the whole rendering mode from these, so they cannot be inferred.
+hydrate = ["leptos/hydrate", "dep:console_error_panic_hook", "dep:wasm-bindgen"]
+
+[dependencies]
+odysseus-domain = { workspace = true }
+
+leptos = { workspace = true, features = ["ssr"] }
+leptos_meta = { workspace = true, features = ["ssr"] }
+leptos_router = { workspace = true, features = ["ssr"] }
+
+serde = { workspace = true, features = ["derive"] }
+
+console_error_panic_hook = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
