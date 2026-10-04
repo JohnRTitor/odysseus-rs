@@ -16,11 +16,10 @@
 //!   *not* do this — `verify_password` returns early on an unknown user
 //!   (`core/auth.py:568-572`) — so the oracle is ours to close, using
 //!   [`odysseus_store::auth::AuthStore::verify_password_or_dummy`].
-
 use {
     axum::{
         Json, Router,
-        extract::State,
+        extract::{Extension, State},
         http::{HeaderMap, StatusCode},
         response::{IntoResponse, Response},
         routing::{get, post},
@@ -29,6 +28,24 @@ use {
 };
 
 use crate::{AppState, error::AppError};
+
+/// Login throttle, from `auth_routes.py:119` (`RateLimiter(15, 60)`).
+///
+/// Not a tuning knob — the absence of any throttle makes this endpoint an
+/// unthrottled online brute-force oracle against a cost-12 bcrypt hash, and the
+/// second factor does not help: `SKEW = 1` leaves three valid codes live at any
+/// instant, so ~333k guesses per 30-second step, with no bcrypt to slow them.
+pub const LOGIN_MAX_REQUESTS: usize = 15;
+/// Login throttle window in seconds.
+pub const LOGIN_WINDOW_SECONDS: u64 = 60;
+
+/// First-run setup throttle, from `auth_routes.py:121` (`RateLimiter(3, 300)`).
+///
+/// Tighter than login because setup mints the administrator, and a fresh install
+/// is by definition reachable by whoever found it first.
+pub const SETUP_MAX_REQUESTS: usize = 3;
+/// Setup throttle window in seconds.
+pub const SETUP_WINDOW_SECONDS: u64 = 300;
 
 /// Mount every `/api/auth` route.
 ///
@@ -45,6 +62,30 @@ pub fn routes() -> Router<AppState> {
         .route("/api/auth/status", get(status))
         .route("/api/auth/policy", get(policy))
 }
+
+/// The 429 Python raises when a limiter refuses.
+fn too_many_requests() -> AppError {
+    AppError::Status {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        message: String::from("Too many requests — try again later"),
+    }
+}
+
+/// The throttle key: the peer's IP, or a fixed bucket when there is no peer.
+///
+/// Python uses `request.client.host`, so this must come from the connection and
+/// **never** from a header — an attacker-controlled key would let one caller
+/// exhaust, or evade, everyone else's budget. With no `ConnectInfo` there is no
+/// client to attribute, so every such caller shares one bucket: they cannot be
+/// distinguished, and the conservative reading is that they are the same client.
+fn throttle_key(peer: Option<&Peer>) -> String {
+    peer.map_or_else(String::new, |p| p.0.ip().to_string())
+}
+
+/// `Option<Extension<..>>` rather than `Extension<..>` because a router built
+/// without `into_make_service_with_connect_info` has no peer, and an absent
+/// extension must mean "untrusted, shared bucket" rather than a 500.
+type Peer = axum::extract::ConnectInfo<std::net::SocketAddr>;
 
 /// `POST /api/auth/setup` — create the first admin.
 #[derive(Debug, Deserialize)]
@@ -143,8 +184,14 @@ pub struct PolicyBody {
 /// once an account exists.
 pub async fn setup(
     State(state): State<AppState>,
+    peer: Option<Extension<Peer>>,
     Json(body): Json<SetupRequest>,
 ) -> Result<Json<OkMessage>, AppError> {
+    // Throttled first, before any work: a refused caller must not be able to
+    // spend a bcrypt hash or touch `auth.json`.
+    if !state.setup_limiter.check(&throttle_key(peer.as_deref())) {
+        return Err(too_many_requests());
+    }
     if body.password.chars().count() < odysseus_store::auth::PASSWORD_MIN_LENGTH {
         return Err(AppError::BadRequest(format!(
             "Password must be at least {} characters",
@@ -202,9 +249,15 @@ pub struct LoginRequest {
 /// when the password is right but a code is still needed — that is a 200 body.
 pub async fn login(
     State(state): State<AppState>,
+    peer: Option<Extension<Peer>>,
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Result<Response, AppError> {
+    // Before the password check, so a throttled caller learns nothing about
+    // whether the account exists.
+    if !state.login_limiter.check(&throttle_key(peer.as_deref())) {
+        return Err(too_many_requests());
+    }
     let username = normalise_username(&body.username);
 
     // Exactly one bcrypt comparison either way: an unknown user costs the same as

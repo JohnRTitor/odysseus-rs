@@ -50,6 +50,14 @@ fn state_with(request_timeout: Duration) -> AppState {
         store: std::sync::Arc::new(store),
         internal_tool_token: std::sync::Arc::from("t"),
         localhost_bypass: false,
+        login_limiter: std::sync::Arc::new(odysseus_store::ratelimit::RateLimiter::new(
+            odysseus_web::routes::auth::LOGIN_MAX_REQUESTS,
+            std::time::Duration::from_secs(odysseus_web::routes::auth::LOGIN_WINDOW_SECONDS),
+        )),
+        setup_limiter: std::sync::Arc::new(odysseus_store::ratelimit::RateLimiter::new(
+            odysseus_web::routes::auth::SETUP_MAX_REQUESTS,
+            std::time::Duration::from_secs(odysseus_web::routes::auth::SETUP_WINDOW_SECONDS),
+        )),
         request_timeout,
         slow_request_threshold: Duration::from_secs_f64(0.75),
     }

@@ -95,6 +95,14 @@ impl Harness {
             store: Arc::new(store),
             internal_tool_token: Arc::from("in-process-token"),
             localhost_bypass: false,
+            login_limiter: Arc::new(odysseus_store::ratelimit::RateLimiter::new(
+                odysseus_web::routes::auth::LOGIN_MAX_REQUESTS,
+                std::time::Duration::from_secs(odysseus_web::routes::auth::LOGIN_WINDOW_SECONDS),
+            )),
+            setup_limiter: Arc::new(odysseus_store::ratelimit::RateLimiter::new(
+                odysseus_web::routes::auth::SETUP_MAX_REQUESTS,
+                std::time::Duration::from_secs(odysseus_web::routes::auth::SETUP_WINDOW_SECONDS),
+            )),
             request_timeout: std::time::Duration::from_secs(45),
             slow_request_threshold: std::time::Duration::from_secs_f64(0.75),
         };
@@ -135,6 +143,11 @@ fn from_peer(mut request: Request<Body>, peer: SocketAddr) -> Request<Body> {
 
 fn remote() -> SocketAddr {
     SocketAddr::from(([203, 0, 113, 9], 40_000))
+}
+
+/// A second, unrelated client, for per-peer budget isolation.
+fn attacker() -> SocketAddr {
+    SocketAddr::from(([198, 51, 100, 7], 40_000))
 }
 
 async fn send(router: Router, request: Request<Body>) -> axum::response::Response {
@@ -806,4 +819,146 @@ async fn policy_is_gated_just_as_it_is_in_python() {
         body["reserved_usernames"].is_array(),
         "the form must grey out reserved names: {body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Throttling
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn login_is_throttled_after_the_documented_number_of_attempts() {
+    // Python's `_login_limiter = RateLimiter(15, 60)` (`auth_routes.py:119`).
+    // The 16th attempt from one peer in a window is refused with 429.
+    let h = Harness::with_alice();
+    let router = h.router();
+    let attempt = || {
+        post(
+            "/api/auth/login",
+            &json!({ "username": "alice", "password": "wrong on purpose" }),
+        )
+    };
+
+    for i in 1..=odysseus_web::routes::auth::LOGIN_MAX_REQUESTS {
+        let response = send(router.clone(), from_peer(attempt(), remote())).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "attempt {i} is within budget and must be a normal refusal"
+        );
+    }
+
+    let throttled = send(router, from_peer(attempt(), remote())).await;
+    assert_eq!(
+        throttled.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "attempt {} must be refused before any password work",
+        odysseus_web::routes::auth::LOGIN_MAX_REQUESTS + 1
+    );
+}
+
+#[tokio::test]
+async fn a_throttled_login_says_nothing_about_whether_the_account_exists() {
+    // The throttle must come first. If it came after the password check, the 429
+    // would only ever be reachable for a *correct* username, which turns the
+    // limiter into an enumeration oracle.
+    let h = Harness::with_alice();
+    let router = h.router();
+    let guess = |user: &'static str| {
+        post(
+            "/api/auth/login",
+            &json!({ "username": user, "password": "wrong on purpose" }),
+        )
+    };
+
+    for _ in 0..=odysseus_web::routes::auth::LOGIN_MAX_REQUESTS {
+        let _ = send(router.clone(), from_peer(guess("alice"), remote())).await;
+    }
+
+    let known = send(router.clone(), from_peer(guess("alice"), remote())).await;
+    let unknown = send(router, from_peer(guess("nobody-at-all"), remote())).await;
+    assert_eq!(known.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        unknown.status(),
+        known.status(),
+        "a throttled caller must get the same answer whatever username they send"
+    );
+}
+
+#[tokio::test]
+async fn one_client_cannot_exhaust_another_clients_budget() {
+    // Python keys on `request.client.host`, so the budget is per peer.
+    let h = Harness::with_alice();
+    let router = h.router();
+    let attempt = || {
+        post(
+            "/api/auth/login",
+            &json!({ "username": "alice", "password": "wrong on purpose" }),
+        )
+    };
+
+    for _ in 0..=odysseus_web::routes::auth::LOGIN_MAX_REQUESTS {
+        let _ = send(router.clone(), from_peer(attempt(), attacker())).await;
+    }
+    let blocked = send(router.clone(), from_peer(attempt(), attacker())).await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let bystander = send(router, from_peer(attempt(), remote())).await;
+    assert_eq!(
+        bystander.status(),
+        StatusCode::UNAUTHORIZED,
+        "an unrelated client must keep its own budget"
+    );
+}
+
+#[tokio::test]
+async fn setup_is_throttled_more_tightly_than_login() {
+    // `RateLimiter(3, 300)` (`auth_routes.py:121`): setup mints the administrator
+    // on a fresh install, so it gets a quarter of the budget. The behaviour below
+    // is the real assertion — this check just names the intent.
+    let h = Harness::empty();
+    let router = h.router();
+    let attempt = || {
+        post(
+            "/api/auth/setup",
+            &json!({ "username": "", "password": "" }),
+        )
+    };
+
+    for _ in 0..odysseus_web::routes::auth::SETUP_MAX_REQUESTS {
+        let _ = send(router.clone(), from_peer(attempt(), remote())).await;
+    }
+    let throttled = send(router, from_peer(attempt(), remote())).await;
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn the_throttle_key_cannot_be_spoofed_by_a_header() {
+    // If the key came from a header, one caller could rotate a fake
+    // `X-Forwarded-For` per request and get an unlimited budget. Two different
+    // forged values from one peer must therefore share one budget.
+    let h = Harness::with_alice();
+    let router = h.router();
+    let forged = |value: &'static str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-forwarded-for", value)
+            .body(Body::from(
+                json!({ "username": "alice", "password": "wrong on purpose" }).to_string(),
+            ))
+            .expect("request")
+    };
+
+    for i in 0..=(odysseus_web::routes::auth::LOGIN_MAX_REQUESTS + 4) {
+        let response = send(router.clone(), from_peer(forged("203.0.113.200"), remote())).await;
+        let last = i == odysseus_web::routes::auth::LOGIN_MAX_REQUESTS + 4;
+        if last {
+            assert_eq!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "rotating a forged header must not buy more attempts"
+            );
+        }
+    }
 }

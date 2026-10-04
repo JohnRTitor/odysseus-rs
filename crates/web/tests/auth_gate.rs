@@ -135,6 +135,14 @@ impl Harness {
             store: Arc::new(store),
             internal_tool_token: Arc::from("in-process-token"),
             localhost_bypass,
+            login_limiter: std::sync::Arc::new(odysseus_store::ratelimit::RateLimiter::new(
+                odysseus_web::routes::auth::LOGIN_MAX_REQUESTS,
+                std::time::Duration::from_secs(odysseus_web::routes::auth::LOGIN_WINDOW_SECONDS),
+            )),
+            setup_limiter: std::sync::Arc::new(odysseus_store::ratelimit::RateLimiter::new(
+                odysseus_web::routes::auth::SETUP_MAX_REQUESTS,
+                std::time::Duration::from_secs(odysseus_web::routes::auth::SETUP_WINDOW_SECONDS),
+            )),
             request_timeout: std::time::Duration::from_secs(45),
             slow_request_threshold: std::time::Duration::from_secs_f64(0.75),
         };

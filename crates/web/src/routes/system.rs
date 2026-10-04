@@ -186,6 +186,14 @@ mod tests {
             )),
             auth: Arc::new(auth),
             store: Arc::new(store),
+            login_limiter: Arc::new(odysseus_store::ratelimit::RateLimiter::new(
+                crate::routes::auth::LOGIN_MAX_REQUESTS,
+                std::time::Duration::from_secs(crate::routes::auth::LOGIN_WINDOW_SECONDS),
+            )),
+            setup_limiter: Arc::new(odysseus_store::ratelimit::RateLimiter::new(
+                crate::routes::auth::SETUP_MAX_REQUESTS,
+                std::time::Duration::from_secs(crate::routes::auth::SETUP_WINDOW_SECONDS),
+            )),
             internal_tool_token: Arc::from("t"),
             localhost_bypass: false,
             request_timeout: std::time::Duration::from_secs(45),

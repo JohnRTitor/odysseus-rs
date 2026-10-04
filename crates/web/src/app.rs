@@ -13,6 +13,7 @@ use {
         Store, StoreError,
         api_tokens::{ApiTokenStore, VerifiedToken},
         auth::{AuthOwners, AuthStore},
+        ratelimit,
     },
 };
 
@@ -36,6 +37,18 @@ pub struct AppState {
     pub internal_tool_token: Arc<str>,
     /// `LOCALHOST_BYPASS`, the dev-only "skip auth on loopback" switch.
     pub localhost_bypass: bool,
+    /// Login throttle: 15 per 60 s per client (`auth_routes.py:119`).
+    ///
+    /// Without it, `POST /api/auth/login` is an unthrottled online brute-force
+    /// oracle against a cost-12 bcrypt hash. TOTP makes it worse rather than
+    /// better: `SKEW = 1` leaves 3 valid codes live at any instant, so ~333k
+    /// guesses per 30-second step, and bcrypt does not slow that path.
+    pub login_limiter: Arc<ratelimit::RateLimiter>,
+    /// First-run setup throttle: 3 per 300 s per client (`auth_routes.py:121`).
+    ///
+    /// Lower than login because setup mints the administrator and is reachable on
+    /// a fresh install, where the operator is by definition still on the network.
+    pub setup_limiter: Arc<ratelimit::RateLimiter>,
     /// The hard request deadline, from `REQUEST_HARD_TIMEOUT`.
     pub request_timeout: Duration,
     /// Threshold above which a request is logged as slow, from
@@ -80,6 +93,17 @@ impl AppState {
             auth: Arc::new(auth),
             internal_tool_token: Arc::from(internal_tool_token()),
             localhost_bypass: flag("LOCALHOST_BYPASS"),
+            // Constructed once and shared, exactly as Python builds them per route
+            // at import time. The limits themselves are auth-route policy, so they
+            // live with the routes rather than in the generic limiter.
+            login_limiter: Arc::new(ratelimit::RateLimiter::new(
+                crate::routes::auth::LOGIN_MAX_REQUESTS,
+                Duration::from_secs(crate::routes::auth::LOGIN_WINDOW_SECONDS),
+            )),
+            setup_limiter: Arc::new(ratelimit::RateLimiter::new(
+                crate::routes::auth::SETUP_MAX_REQUESTS,
+                Duration::from_secs(crate::routes::auth::SETUP_WINDOW_SECONDS),
+            )),
             request_timeout: timeout::timeout_from_env(),
             slow_request_threshold: slow_log::threshold_from_env(),
         })
@@ -476,6 +500,14 @@ mod tests {
             store: Arc::new(store),
             internal_tool_token: Arc::from("test-internal-token"),
             localhost_bypass: false,
+            login_limiter: Arc::new(odysseus_store::ratelimit::RateLimiter::new(
+                crate::routes::auth::LOGIN_MAX_REQUESTS,
+                std::time::Duration::from_secs(crate::routes::auth::LOGIN_WINDOW_SECONDS),
+            )),
+            setup_limiter: Arc::new(odysseus_store::ratelimit::RateLimiter::new(
+                crate::routes::auth::SETUP_MAX_REQUESTS,
+                std::time::Duration::from_secs(crate::routes::auth::SETUP_WINDOW_SECONDS),
+            )),
             request_timeout: std::time::Duration::from_secs(45),
             slow_request_threshold: std::time::Duration::from_secs_f64(0.75),
         }

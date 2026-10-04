@@ -222,15 +222,33 @@ impl AuthContext {
 
     /// Require `privilege` for the resolved user.
     ///
-    /// A **missing** privilege key defaults to permitted, matching
-    /// `auth_helpers.py`: unknown privileges fail open because the UI gates
-    /// display-side. An explicit `false` denies. Admins hold every privilege via
+    /// Two cases that Python conflates in one `try` block, kept apart here
+    /// because they mean opposite things:
+    ///
+    /// * **A missing privilege key permits.** `auth_helpers.py:184` reads
+    ///   `privs.get(key, True)` — "this user was never granted this flag". The UI
+    ///   gates display-side, so a flag nobody has heard of is not a denial. This
+    ///   part is faithful parity and stays.
+    /// * **A failed lookup denies.** This is a **deliberate deviation** from
+    ///   `auth_helpers.py:178-181`, which catches `Exception` and returns the
+    ///   user. Python's failure means "we could not determine what this user was
+    ///   granted", not "they were granted it", and `AGENTS.md` §5 requires that
+    ///   ambiguous input be denied.
+    ///
+    /// The reachable path is not hypothetical: `AuthStore::privileges` calls
+    /// `self.user(username)?`, which returns `Err(NoSuchUser)` for an account
+    /// deleted between the session resolving and this lookup. Python hands that
+    /// request the privilege it was just revoked, and `require_admin` two
+    /// functions below denies the identical failure — so the asymmetry was a
+    /// genuine escalation path, not a style mismatch.
+    ///
+    /// An explicit `false` denies. Admins hold every privilege via
     /// [`AuthStore::privileges`], so this is a no-op for them.
     ///
     /// # Errors
     ///
-    /// [`AppError::Forbidden`] when the flag is explicitly false, or on an
-    /// unauthenticated caller.
+    /// [`AppError::Forbidden`] when the flag is explicitly false, when the lookup
+    /// fails, or on an unauthenticated caller.
     pub fn require_privilege(
         &self,
         auth: &AuthStore,
@@ -242,16 +260,18 @@ impl AuthContext {
         if user.is_empty() {
             return Ok(user);
         }
-        let Ok(privileges) = auth.privileges(user) else {
-            // auth_helpers.py swallows this and returns the user.
-            tracing::warn!(user, "privilege lookup failed; treating as permitted");
-            return Ok(user);
-        };
-        if !privileges.get(key) {
-            return Err(AppError::Forbidden(format!(
+        let denied = || {
+            AppError::Forbidden(format!(
                 "Your account is not allowed to {}.",
                 key.replace('_', " ")
-            )));
+            ))
+        };
+        let privileges = auth.privileges(user).map_err(|e| {
+            tracing::warn!(user, error = %e, "privilege lookup failed; denying");
+            denied()
+        })?;
+        if !privileges.get(key) {
+            return Err(denied());
         }
         Ok(user)
     }
@@ -498,5 +518,118 @@ mod tests {
         assert!(!owner_matches(Some("bob"), "alice"));
         // Shared rows are visible to every owner.
         assert!(owner_matches(None, "alice"));
+    }
+}
+
+#[cfg(test)]
+mod privilege_tests {
+    //! `require_privilege` had zero callers and zero tests, and its two fail-open
+    //! branches were both unasserted — so "fails open" was a claim in a doc
+    //! comment rather than a tested property.
+    //!
+    //! The distinction under test is Python's own conflation: a *missing key*
+    //! means "never granted", which is a real default; a *failed lookup* means
+    //! "cannot tell", which is not.
+
+    use {
+        super::{AppError, AuthContext, BypassConfig},
+        odysseus_store::auth::AuthStore,
+    };
+
+    const STRICT: BypassConfig = BypassConfig {
+        auth_disabled: false,
+        localhost_bypass: false,
+        is_configured: true,
+    };
+
+    fn auth_with(name: &str) -> (tempfile::TempDir, AuthStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth = AuthStore::new(dir.path());
+        auth.prepare().expect("prepare");
+        auth.create_user(name, "correct horse battery", false)
+            .expect("create");
+        (dir, auth)
+    }
+
+    #[test]
+    fn a_missing_privilege_key_permits_which_is_python_parity() {
+        let (_dir, auth) = auth_with("alice");
+        let ctx = AuthContext::cookie_session("alice");
+        assert!(
+            ctx.require_privilege(&auth, "a_privilege_nobody_has_heard_of", STRICT, false)
+                .is_ok(),
+            "a key that was never granted is not a denial: the UI gates display-side, \
+             which is the whole basis for this default (auth_helpers.py:184)"
+        );
+    }
+
+    #[test]
+    fn an_explicitly_false_privilege_denies() {
+        let (_dir, auth) = auth_with("alice");
+        // `can_use_bash` defaults to false, so it is a real stored denial rather
+        // than an absent key — which is the distinction the previous test guards.
+        let ctx = AuthContext::cookie_session("alice");
+        let err = ctx
+            .require_privilege(&auth, "can_use_bash", STRICT, false)
+            .expect_err("can_use_bash defaults off, so it must deny");
+        assert!(matches!(err, AppError::Forbidden(_)), "{err:?}");
+    }
+
+    #[test]
+    fn an_account_deleted_mid_request_loses_its_privileges() {
+        // The regression, and a reachable path rather than a hypothetical one.
+        // Python catches the exception and returns the user, so a request whose
+        // account vanished between the session resolving and the privilege lookup
+        // keeps the privilege it was just revoked.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth = AuthStore::new(dir.path());
+        auth.prepare().expect("prepare");
+        auth.create_user("alice", "correct horse battery", false)
+            .expect("create");
+        auth.create_user("root", "correct horse battery", true)
+            .expect("create root");
+
+        // The session resolved while alice still existed.
+        let session = auth.issue_token("alice").expect("issue");
+        assert_eq!(
+            auth.username_for_token(&session)
+                .expect("resolve")
+                .as_deref(),
+            Some("alice")
+        );
+
+        // Now she is deleted. `root` is the requester, so the self-delete and
+        // last-admin rules do not fire. `delete_user` revokes the owner's API
+        // tokens first, so the token store needs its table.
+        let store = odysseus_store::Store::open(dir.path().join("app.db"));
+        store.migrate().expect("migrate");
+        let tokens = odysseus_store::api_tokens::ApiTokenStore::new(store);
+        auth.delete_user("alice", "root", &tokens).expect("delete");
+
+        let ctx = AuthContext::cookie_session("alice");
+        let err = ctx
+            .require_privilege(&auth, "can_use_agent", STRICT, false)
+            .expect_err("a deleted account must not keep its privileges");
+        assert!(
+            matches!(err, AppError::Forbidden(_)),
+            "expected a denial, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_admin_gate_and_the_privilege_gate_now_agree_on_a_lookup_failure() {
+        // The asymmetry that made this an escalation path rather than a style
+        // mismatch: one denied, one granted, on the same failure.
+        let (_dir, auth) = auth_with("alice");
+        let ghost = AuthContext::cookie_session("nobody");
+
+        let privilege = ghost
+            .require_privilege(&auth, "can_use_agent", STRICT, false)
+            .expect_err("privilege gate must deny");
+        let admin = ghost
+            .require_admin(&auth, STRICT, false)
+            .expect_err("admin gate must deny");
+        assert!(matches!(privilege, AppError::Forbidden(_)));
+        assert!(matches!(admin, AppError::Forbidden(_)));
     }
 }

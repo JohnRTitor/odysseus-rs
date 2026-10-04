@@ -391,9 +391,17 @@ fn the_python_policies_are_constructible() {
     assert!(login.max_keys() > 0, "a limiter must bound its key count");
     assert!(login.check("127.0.0.1"), "a fresh key must be allowed");
 
-    // `SystemMonotonic` is the default source and must be usable directly.
-    let probe = SystemMonotonic;
-    assert!(probe.now_secs() < u64::MAX, "monotonic must be readable");
+    // `SystemMonotonic` is the default source and must be usable directly. It
+    // now holds a fixed origin rather than being a unit struct, because
+    // `Instant::now().elapsed()` measures the call, not elapsed time.
+    let probe = SystemMonotonic::new();
+    let first = probe.now_secs();
+    assert!(first < u64::MAX, "monotonic must be readable");
+    // Time must not go backwards, which a wall clock could do under NTP.
+    assert!(
+        probe.now_secs() >= first,
+        "the monotonic clock must never run backwards"
+    );
 }
 
 // ---------------------------------------------------------------------------

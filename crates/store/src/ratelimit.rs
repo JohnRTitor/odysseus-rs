@@ -61,12 +61,40 @@ pub trait Monotonic: Send + Sync + std::fmt::Debug {
 }
 
 /// Reads the system monotonic clock, equivalent to Python's `time.monotonic()`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SystemMonotonic;
+///
+/// The elapsed time is measured from a fixed origin captured at construction, not
+/// from a fresh `Instant::now()` on every call — `Instant::now().elapsed()`
+/// measures the time taken by the *call itself*, which is ~0, so it would pin
+/// `now_secs()` at 0 forever. With `now_secs() == 0` the window cutoff is also 0
+/// and `hit > cutoff` prunes every hit on every call, so the limiter admits
+/// everything and silently does nothing. It must hold a real origin.
+#[derive(Debug, Clone, Copy)]
+pub struct SystemMonotonic {
+    /// Process-lifetime origin. `Instant` is monotonic, so this cannot go
+    /// backwards the way a wall clock can over NTP adjustment.
+    origin: std::time::Instant,
+}
+
+impl SystemMonotonic {
+    /// Captures the origin. Every `SystemMonotonic` built in the same process
+    /// shares the same epoch, so their readings are comparable.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Default for SystemMonotonic {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Monotonic for SystemMonotonic {
     fn now_secs(&self) -> u64 {
-        std::time::Instant::now().elapsed().as_secs()
+        self.origin.elapsed().as_secs()
     }
 }
 
@@ -127,7 +155,7 @@ impl RateLimiter {
     /// monotonic clock and bounding the key count at [`DEFAULT_MAX_KEYS`].
     #[must_use]
     pub fn new(max_requests: usize, window: Duration) -> Self {
-        Self::with_clock(max_requests, window, Arc::new(SystemMonotonic))
+        Self::with_clock(max_requests, window, Arc::new(SystemMonotonic::new()))
     }
 
     /// As [`RateLimiter::new`], with an explicit cap on tracked keys.
@@ -136,7 +164,12 @@ impl RateLimiter {
     /// unable to track the key it is asked about.
     #[must_use]
     pub fn with_key_cap(max_requests: usize, window: Duration, max_keys: usize) -> Self {
-        Self::build(max_requests, window, max_keys, Arc::new(SystemMonotonic))
+        Self::build(
+            max_requests,
+            window,
+            max_keys,
+            Arc::new(SystemMonotonic::new()),
+        )
     }
 
     /// A limiter reading an injected time source, for deterministic tests.
@@ -251,11 +284,20 @@ impl RateLimiter {
     /// The decision, given the lock is already held.
     fn admit(state: &mut State, key: &str, now: u64, limits: &Self) -> bool {
         Self::maybe_cleanup(state, now, limits.window_secs);
-        let cutoff = now.saturating_sub(limits.window_secs);
+        let cutoff = now.checked_sub(limits.window_secs);
 
         let window = state.log.entry(key.to_owned()).or_default();
         // Python: timestamps = [t for t in timestamps if t > cutoff]
-        window.hits.retain(|&hit| hit > cutoff);
+        //
+        // `checked_sub` rather than `saturating_sub`, and that distinction is load
+        // bearing. When `now < window` there is no cutoff yet — the window reaches
+        // back before the clock's origin — so every hit so far is inside it.
+        // `saturating_sub` would yield `0` and silently discard hits recorded at
+        // exactly `t == 0`, which is precisely the first second of any process
+        // whose clock starts at zero. The effect: the limiter admits everything
+        // for the first window and then starts working, which reads as "the
+        // throttle is unreliable" rather than as a bug.
+        window.hits.retain(|&hit| cutoff.is_none_or(|c| hit > c));
 
         if window.hits.len() >= limits.max_requests {
             // Denied. The pruned window is deliberately kept rather than removed,
@@ -306,9 +348,142 @@ impl RateLimiter {
         }
         let interval = window_secs.saturating_mul(2).max(120);
         state.next_cleanup = now.saturating_add(interval);
-        let cutoff = now.saturating_sub(window_secs);
-        state
-            .log
-            .retain(|_, window| window.hits.last().is_some_and(|&last| last > cutoff));
+        let cutoff = now.checked_sub(window_secs);
+        state.log.retain(|_, window| {
+            window
+                .hits
+                .last()
+                .is_some_and(|&last| cutoff.is_none_or(|c| last > c))
+        });
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    //! These exist because two defects got through, and both made the limiter a
+    //! no-op. They are cheap, so they stay.
+    //!
+    //! Defect one: `SystemMonotonic::now_secs` returned `Instant::now().elapsed()`,
+    //! which measures the time taken by the *call* — about zero — so `now` was 0
+    //! forever. Defect two, independent: the window pruned with
+    //! `saturating_sub`, which yields cutoff 0 when `now < window`, so a hit
+    //! recorded at exactly `t == 0` was discarded on the very next call.
+    //!
+    //! Either alone was enough to admit everything forever. The tests use the
+    //! real clock where a test can be meaningful and an injected one where
+    //! advancing time is the point; nothing sleeps (`AGENTS.md` §11).
+
+    use {
+        super::{DEFAULT_MAX_KEYS, Monotonic, RateLimiter},
+        std::{sync::Arc, time::Duration},
+    };
+
+    /// A clock the test drives by hand.
+    #[derive(Debug)]
+    struct TestClock(Arc<std::sync::atomic::AtomicU64>);
+
+    impl TestClock {
+        fn new(start: u64) -> (Self, Arc<std::sync::atomic::AtomicU64>) {
+            let cell = Arc::new(std::sync::atomic::AtomicU64::new(start));
+            (Self(Arc::clone(&cell)), cell)
+        }
+    }
+
+    impl Monotonic for TestClock {
+        fn now_secs(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn the_real_clock_admits_exactly_the_budget_and_then_denies() {
+        // The regression that mattered: with the broken clock this returned
+        // `true` forever. Uses `SystemMonotonic`, because a test-clock version
+        // would pass even with the real clock broken — which is how the defect
+        // survived the original test suite.
+        let limiter = RateLimiter::new(15, Duration::from_secs(60));
+        let admitted = (0..40).filter(|_| limiter.check("k")).count();
+        assert_eq!(
+            admitted, 15,
+            "the limiter must admit exactly its budget, then refuse"
+        );
+    }
+
+    #[test]
+    fn the_window_slides_so_a_throttled_key_recovers() {
+        // With the clock broken, `now` never advanced and the key stayed denied
+        // for the life of the process — a permanent lockout for one client, which
+        // is a self-inflicted DoS rather than a throttle.
+        let (clock, handle) = TestClock::new(1_000);
+        let limiter = RateLimiter::with_clock(3, Duration::from_secs(60), Arc::new(clock));
+
+        assert!(limiter.check("k"));
+        assert!(limiter.check("k"));
+        assert!(limiter.check("k"));
+        assert!(!limiter.check("k"), "the fourth must be refused");
+
+        handle.store(1_000 + 61, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            limiter.check("k"),
+            "once the window slides the key must recover"
+        );
+    }
+
+    #[test]
+    fn a_window_that_has_not_elapsed_yet_does_not_discard_its_own_hits() {
+        // Regression for the `saturating_sub` pruning: with the clock starting at
+        // 0 and a 60 s window there is no cutoff yet, and every hit so far is
+        // inside the window.
+        let (clock, _) = TestClock::new(0);
+        let limiter = RateLimiter::with_clock(3, Duration::from_secs(60), Arc::new(clock));
+        assert!(limiter.check("k"));
+        assert!(limiter.check("k"));
+        assert!(limiter.check("k"));
+        assert!(
+            !limiter.check("k"),
+            "hits recorded at t == 0 must count, or the limiter never engages"
+        );
+    }
+
+    #[test]
+    fn the_key_count_is_bounded() {
+        let limiter = RateLimiter::with_key_cap(5, Duration::from_secs(60), 4);
+        for i in 0..50 {
+            assert!(limiter.check(&format!("client-{i}")));
+        }
+        assert!(
+            limiter.tracked_keys() <= 4,
+            "the map must stay bounded, got {}",
+            limiter.tracked_keys()
+        );
+        assert_eq!(DEFAULT_MAX_KEYS, 16_384, "the documented default");
+    }
+
+    #[test]
+    fn a_denied_attempt_does_not_extend_the_window() {
+        // Otherwise a client could keep itself locked out indefinitely by
+        // retrying, which is a denial-of-service the client inflicts on itself.
+        // The denied attempt must also not *shorten* the window: the budget is
+        // measured from the allowed attempts, not from the most recent try.
+        let (clock, handle) = TestClock::new(500);
+        let limiter = RateLimiter::with_clock(2, Duration::from_secs(60), Arc::new(clock));
+        assert!(limiter.check("k"));
+        assert!(limiter.check("k"));
+
+        handle.store(500 + 30, std::sync::atomic::Ordering::SeqCst);
+        assert!(!limiter.check("k"), "still inside the window");
+        handle.store(500 + 31, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !limiter.check("k"),
+            "the denied attempt must not have moved the window either"
+        );
+
+        // 500 + 60 is the cutoff; the hits at exactly 500 fall outside it, since
+        // Python keeps `t > cutoff`.
+        handle.store(561, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            limiter.check("k"),
+            "once the original attempts age out the key must recover"
+        );
     }
 }
