@@ -214,48 +214,61 @@ redistributed **model weights**. Not a blocker here, but any future spike that v
 weights needs one.
 
 
-## S9 — Local Stable Diffusion scope — 📌 **DECISION: REMOVE F176**
+## S10 — PDF: `lopdf` / `mupdf` / `poppler-rs` — ⚠️ **SPLIT: F148 OK, F140 licence-blocked**
 
-**Decision, not a finding: do not port Stable Diffusion to Rust.**
+The three crates divide the two features differently, and **only one of the two PDF
+features has a licence-clean implementation.**
 
-`REWRITE_PLAN.md:66-68` already settles this, and S9 only confirms it:
+| | AcroForm fill (F148) | Rasterisation (F140) |
+|---|---|---|
+| `lopdf` 0.45.0 (MIT, pure Rust, **0 C deps**) | ⚠️ **no AcroForm API** — but the object model makes it doable by hand | ❌ none |
+| `mupdf` 0.8.0 (**AGPL-3.0**) | ✅ | ✅ |
+| `poppler-rs` 0.26.0 (declares MIT) | — | ✅ but links **GPL-2.0** libpoppler |
 
-> `scripts/diffusion_server.py` and `swift/odysseus-mlx-image-bridge/` are already
-> *optional out-of-process backends* in the current app, not part of the app process.
-> **Anything replacing them inherits that placement.**
+### F148 AcroForm fill — lopdf suffices, verified
 
-So F176 is not required for the single-process goal — it is an *optional backend* by the
-plan's own definition, alongside Ollama/vLLM and MCP subprocesses.
+`lopdf` has **no** `AcroForm` helper: `grep -ri acroform` across the whole crate returns
+nothing, and the only related API is `Document::get_page_annotations` (returns annotation
+dictionaries). So the fill is dictionary work, not a call. Verified end to end: a
+hand-built widget annotation (`/FT /Tx`, `/T`, `/V`) plus a hand-built `/AcroForm`,
+filled by setting `/V`, **saved, reloaded, and the value read back**:
 
-### The evidence
+```
+page annotations: 1
+field /T  = "full_name"
+field /V  = Some("Ada Lovelace")
+/AcroForm present after reload: true
+pdf bytes: 732
+```
 
-- `/api/image/inpaint` — `routes/gallery/gallery_routes.py:1257`. Proxies to a
-  registered `ModelEndpoint` (`_first_visible_image_endpoint(db, user)`), with SSRF
-  validation (`check_outbound_url`) and OpenAI re-shaping.
-- `/api/image/harmonize` — `gallery_routes.py:1515`. Same: a registered
-  `ModelEndpoint`'s `base_url` + `api_key`, sending real img2img with `strength`
-  (comment at `:1509-1514` explains why a 100 %-mask inpaint call is the wrong shape).
-- `/images/generations` (txt2img) — `gallery_routes.py:269`, `:634`. Also a proxy.
-- `scripts/diffusion_server.py` — 1,506 lines, PyTorch + FastAPI, `from_pretrained`
-  diffusers pipelines. An HTTP service speaking OpenAI-shaped endpoints, i.e. exactly
-  what a `ModelEndpoint` row describes.
+96 transitive dependencies and no C library at all. Acceptable, with the caveat that
+**the AcroForm code is ours to maintain** — including `/NeedAppearances`, appearance
+streams, and field appearance regeneration, which the 732-byte proof does not exercise.
 
-### Why removing it is the right call, not the lazy one
+### F140 rasterisation — no licence-clean option. This is the finding.
 
-The cost is the largest single port in the rewrite — CLIP tokenizer + four exported
-graphs + **a scheduler port with no ONNX equivalent** (200–400 lines of stateful math),
-against `ort 2.0.0-rc.13`, which is a release candidate, plus a TensorRT engine cache
-for the claimed 1.5–2.5 s. The benefit is **zero capability that is not already
-reachable over HTTP**, because the Python app already reaches it the same way.
+- **`mupdf` is AGPL-3.0.** The workspace is already `AGPL-3.0-or-later`
+  (`Cargo.toml:22`), so linking it is *licence-compatible* — the obstacle is purely
+  `deny.toml`, whose allow-list has 13 entries and does not include AGPL. **That is a
+  policy decision for a human, not a legal blocker.**
+- **`poppler-rs` is the interesting one.** crates.io reports **MIT**, and
+  `cargo deny` would wave it through. But `Cargo.toml:18` says `build = false` and it
+  depends on `poppler-sys-rs`: it is **gir bindings to a system `libpoppler`**
+  (`Gir.toml`: `library = "Poppler"`, `version = "0.18"`, linking `Gio`, `GLib`,
+  `GObject`, `Cairo`). **libpoppler is GPL-2.0-or-later.** So the licence check passes
+  while the shipped binary links GPL — **a hole in the current `deny.toml` policy**,
+  independent of this feature. Separately, `libpoppler-glib` is **absent from the dev
+  shell** (`pkg-config --exists poppler-glib` fails; `glib` and `cairo` are present), so
+  it cannot even be linked here.
 
-**Action:** F176 → REMOVED, with the reason recorded (not deleted). `diffusion_server.py`
-remains an *optional external backend* that Rust registers as a `ModelEndpoint` — the
-same mechanism inpaint and harmonize already use. Nothing about image editing or
-generation is lost; only the Rust reimplementation of a PyTorch service is dropped.
+**Recommendations**
 
-**Re-open if** image generation becomes a hard requirement for a LAN-only install with
-no external GPU. It is not one today.
-
+1. **F148** → proceed with `lopdf`, budget for a hand-written AcroForm layer.
+2. **F140** → do **not** take `poppler-rs`. If rasterisation is required, take `mupdf`
+   and add AGPL-3.0 to `deny.toml` with a written justification, or keep rendering
+   server-side behind the existing image proxy. Record that `deny.toml` currently cannot
+   detect GPL linked through a `-sys` crate — worth fixing regardless of F140.
+3. Both crates' licences must be re-checked at adoption time; both are moving targets.
 
 ---
 
