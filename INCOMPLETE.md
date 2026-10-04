@@ -123,25 +123,41 @@ Definition-of-Done gate cannot read a ticked box as a finished UI.
 
 | Item | Status | Missing | Why it is not simply ticked | Next |
 |---|---|---|---|---|
-| T0100 Tailwind | UNIMPLEMENTED | Tailwind itself | The `odysseus-ui` crate exists with `ssr`/`hydrate` features and Leptos deps that are actually resolved (they were previously declared in `[workspace.dependencies]` and never used — the same defect as T0005). **No CSS is served and no styling exists**, so the shell renders unstyled. Ticking the box would mean "Tailwind wired" for a crate that contains no Tailwind. | Wire `tailwindcss` v4 (crate or `build.rs`, decision open) and serve the output |
-| T0101 axum handler | UNIMPLEMENTED | Server-side rendering of the shell | `App`/`Home`/`Settings`/`NotFound`, `<Routes/>` and `leptos_meta` all exist and compile (`crates/ui/src/app.rs`, 17 tests). **The server does not render them**, so the components have no route to `leptos_axum`. `/` still returns the 503 placeholder, which is the honest response (`N2`). | See the integration notes below |
+| T0100 Tailwind | UNIMPLEMENTED | Tailwind itself | The `odysseus-ui` crate exists, `ssr` and `hydrate` build, and the shell server-renders. **No CSS is served and no styling exists**, so the page renders unstyled. Ticking this box would mean "Tailwind wired" for a crate that contains no Tailwind. | Wire `tailwindcss` v4 (crate or `build.rs`, decision open) and serve the output |
+| T0107 no-FOUC test | UNIMPLEMENTED | A browser | SSR is proven: the pre-paint script is inlined in `<head>` before any styled content, carries the CSP nonce that authorises it, and sets every `--hl-*` variable `theme.rs` derives. What no test here can show is that the browser **executes** it before the first painted frame. | Headless-browser assertion on computed `getComputedStyle` at first paint |
 
-`leptos_axum` 0.8 facts established while wiring this, so the next attempt does
-not re-derive them:
+### 2.5 Leptos/axum facts worth not rediscovering
 
-- `LeptosRoutes::leptos_routes(&options, paths, app_fn)` needs a **`S: LeptosOptionsLike`**
-  and an `AxumRouteListing` vec from `generate_route_list(App)`; it is a trait
-  method on `axum::Router`, not a free function.
-- `render_app_to_stream_with_context(additional_context, app_fn)` returns
-  `impl Fn(Request<Body>) -> Pin<Box<dyn Future<Output = Response<Body>>>>>`, i.e.
-  a **handler**, not a `Response`. There is no `leptos_axum::LeptosResponse` type in
-  0.8 — an early attempt that returned one does not compile.
-- `leptos_meta::provide_meta_context()` is public at `leptos_meta` root (line ~294),
-  not re-exported through a submodule; `Html` takes no children and has no `id`
-  method, so `<html>`/`<head>`/`<body>` must come from `leptos_meta`'s own SSR
-  document emission rather than from hand-written elements.
-- Hydration cannot be verified without a browser, so T0107 (no-FOUC test) stays open
-  regardless of how far SSR gets.
+Recorded because each cost a wrong first attempt, and each fails in a way that
+looks like a different bug:
+
+- **Leptos does not initialise an SSR executor on non-wasm.** `leptos::task::spawn`
+  reaches `any_spawner::Executor::spawn`, which panics with *"tried to spawn a
+  Future with Executor::spawn() before a global executor was initialized"* unless
+  `any_spawner::Executor::init_tokio()` was called. Leptos auto-inits only on wasm
+  (`init_wasm_bindgen`). `main` now calls it; without it every `/` request aborts
+  mid-render and no component-level unit test notices.
+- **`leptos_meta` injects by string-searching the rendered HTML for `</head>`.**
+  `MetaContext::inject_meta_context` panics with *"you are using leptos_meta
+  without a </head> tag"*. So the app must render real `<html>`/`<head>`/`<body>`.
+  `leptos_meta::Html` is a **client-side** component that sets attributes on an
+  existing `document.documentElement`; under SSR it emits nothing.
+- **Do not provide `leptos_axum::ResponseOptions` yourself.**
+  `render_app_to_stream_with_context`'s `handle_response` already provides the
+  instance the response is built from, *before* invoking the `additional_context`
+  closure. Providing another shadows it, so a component's `set_status` amends a
+  copy that is discarded — the 404 page rendered with a 200 until this was removed.
+- **`LeptosOptions` is a `TypedBuilder` and `#[non_exhaustive]`**, with
+  `#[builder(default)]` on every field but `output_name`. A struct literal cannot
+  be written, which is why `leptos_routes` needs no options plumbing here at all:
+  `render_app_to_stream_with_context` is called directly with the real `Request`.
+- **`leptos_routes` takes `Vec<AxumRouteListing>`** from `generate_route_list(App)`
+  and its `app_fn`/`additional_context` are `'static` closures taking no arguments.
+- **`#[component]` does not carry a `#[must_use]` placed before it through**, so
+  `clippy::must_use_candidate` needs `#[expect(..., reason = "...")]`.
+- **Axum `Extension` needs `ConnectInfo`** for the auth gate to apply the loopback
+  bypass; without it `/` 302s to `/login` and the test silently measures the login
+  page.
 
 ---
 

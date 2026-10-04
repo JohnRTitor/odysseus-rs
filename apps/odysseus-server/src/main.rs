@@ -13,6 +13,18 @@ use {odysseus_web::AppState, tracing_subscriber::EnvFilter};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
+    // Leptos's out-of-order HTML streaming spawns onto a global executor, and on
+    // non-wasm targets Leptos does **not** initialise one — `leptos::task::spawn`
+    // reaches `any_spawner::Executor::spawn`, which panics if nothing set it up.
+    // Without this, every SSR request to `/` aborts mid-render. Leptos only
+    // auto-initialises on wasm, where it uses `init_wasm_bindgen`.
+    //
+    // Idempotent, and ignored here because a second call is harmless; the error
+    // that matters (no runtime) cannot happen this early in `main`.
+    if let Err(reason) = any_spawner::Executor::init_tokio() {
+        tracing::error!(%reason, "could not initialise the Leptos SSR executor");
+    }
+
     // Order matters: `bootstrap` migrates before the listener binds, so the
     // first request can never race the schema. The Python app did this as an
     // import side effect (`core/database.py:2737`) — exactly the pattern being

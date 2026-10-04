@@ -20,6 +20,7 @@ odysseus-domain = { workspace = true }
 odysseus-store = { workspace = true }
 odysseus-web = { workspace = true }
 axum = { workspace = true }
+any_spawner = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

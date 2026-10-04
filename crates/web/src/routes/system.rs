@@ -10,11 +10,15 @@
 //! is recorded as a deliberate fix in `INCOMPLETE.md`.
 
 use {
-    axum::{Json, extract::State},
+    axum::{
+        Json,
+        extract::{Extension, State},
+        response::IntoResponse,
+    },
     serde::Serialize,
 };
 
-use crate::AppState;
+use crate::{AppState, middleware::security::CspNonce};
 
 /// Application version, kept in step with the Python `APP_VERSION`.
 pub const APP_VERSION: &str = "0.1.0";
@@ -78,25 +82,58 @@ pub async fn runtime() -> Json<RuntimeBody> {
 
 /// The UI has not been built yet.
 ///
-/// # Errors
+/// Server-renders the Leptos shell (T0101).
 ///
-/// Always returns [`crate::AppError::Status`] with 503 and an explanatory
-/// message. It is written as a `Result` rather than a plain 503 response so the
-/// body goes through the same error path as every other failure, and so adding a
-/// real route later is a one-line change.
+/// Replaces the 503 placeholder this used to return. The 503 was honest — it named
+/// what was missing and pointed at the live API — so the replacement has to be
+/// honest too, which is why the shell itself says chat and sessions are not built
+/// (`odysseus-ui`, `AGENTS.md` N2) rather than rendering an empty chat window.
 ///
-/// Returns 503 with an explicit reason rather than a placeholder page. A stub
-/// page would violate `AGENTS.md` §0 N2; a bare 404 would leave a user with no
-/// way to tell "not implemented" from "wrong port".
-pub async fn ui_not_yet_built() -> Result<axum::response::Response, crate::AppError> {
-    Err(crate::AppError::Status {
-        status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        message: String::from(
-            "The Odysseus UI has not been built in the Rust port yet. \
-             See TASKS.md phase 0.6 (T0100-T0107). The API is live: try /api/health, \
-             /api/version, /api/ready.",
-        ),
-    })
+/// Also installed as the router **fallback**, so an unknown page renders the
+/// Leptos `NotFound` route inside the real document instead of axum's empty body —
+/// the shell owns the 404 body precisely because it owns the document. A path
+/// under `/api/` is excluded: those clients are programs, and handing an HTML
+/// document to one turns a missing endpoint into a parse error instead of a
+/// diagnosable status.
+///
+/// The `leptos_routes` trait extension is deliberately not used. It needs a
+/// `LeptosOptions` and a `generate_route_list` listing, and its `app_fn` /
+/// `additional_context` closures are `'static` and take no arguments — so a
+/// per-request CSP nonce cannot be threaded into them without a task-local.
+/// `render_app_to_stream_with_context` returns a handler that takes the
+/// `Request` directly, and its `handle_response` reads the path from
+/// `req.uri()` to build the router's location, so calling it with the real request
+/// gives both correct route resolution and a per-request nonce with no extra
+/// plumbing.
+///
+/// The nonce comes from the same [`CspNonce`] the security middleware put in the
+/// request extensions and interpolated into the `script-src` header. A script
+/// whose nonce does not match that header is refused by the browser, so reading it
+/// from anywhere else would produce a page that is styled but dead.
+pub async fn ui_shell(
+    Extension(nonce): Extension<CspNonce>,
+    request: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    if request.uri().path().starts_with("/api/") {
+        return crate::AppError::Status {
+            status: axum::http::StatusCode::NOT_FOUND,
+            message: String::from("no such endpoint"),
+        }
+        .into_response();
+    }
+
+    leptos_axum::render_app_to_stream_with_context(
+        move || {
+            leptos::prelude::provide_context(odysseus_ui::Nonce(nonce.0.clone()));
+            // `ResponseOptions` is deliberately NOT provided here. `handle_response`
+            // already provides the instance the response is actually built from,
+            // *before* calling this closure — so providing another here shadows it
+            // and a component's `set_status` would amend a copy that is thrown away.
+            // That is why the 404 came back as 200 on the first attempt.
+        },
+        odysseus_ui::App,
+    )(request)
+    .await
 }
 
 /// `/api/version` body.

@@ -14,6 +14,10 @@ workspace = true
 [dependencies]
 odysseus-domain = { workspace = true }
 odysseus-store = { workspace = true }
+any_spawner = { workspace = true }
+odysseus-ui = { workspace = true, features = ["ssr"] }
+leptos = { workspace = true, features = ["ssr"] }
+leptos_axum = { workspace = true }
 axum = { workspace = true }
 axum-extra = { version = "0.10", features = ["cookie"] }
 getrandom = "0.3"

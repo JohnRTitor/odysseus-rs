@@ -418,7 +418,8 @@ fn base(state: &AppState) -> Router {
         .route("/api/version", get(crate::routes::system::version))
         .route("/api/ready", get(crate::routes::system::ready))
         .route("/api/runtime", get(crate::routes::system::runtime))
-        .route("/", get(crate::routes::system::ui_not_yet_built))
+        .route("/", get(crate::routes::system::ui_shell))
+        .fallback(crate::routes::system::ui_shell)
         .with_state(state.clone())
 }
 

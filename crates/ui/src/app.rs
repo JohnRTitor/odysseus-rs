@@ -51,10 +51,13 @@ pub const NOT_BUILT_SETTINGS: &str = "Account, provider and appearance settings.
 )]
 #[component]
 pub fn App() -> impl IntoView {
-    // `leptos_meta` collects the head elements through a context and emits the
-    // `<html>/<head>/<body>` document itself during SSR, so there is no `<Html>` or
-    // `<head>` element here to write. `provide_meta_context` is what registers that
-    // collector; without it every `<Meta>` below renders into nothing.
+    // `leptos_meta` collects `<Title>`/`<Meta>`/`<Link>` into a context and then
+    // **injects them by searching the rendered HTML for `</head>`** — see
+    // `MetaContext::inject_meta_context`, which panics with "you are using
+    // leptos_meta without a </head> tag" when it cannot find one. So the document
+    // tags below are load-bearing, not decoration: `leptos_meta::Html` is a
+    // *client-side* component that sets attributes on an existing
+    // `document.documentElement`, and under SSR it emits nothing.
     provide_meta_context();
 
     // The nonce is attached by the security-headers middleware, which inserts it
@@ -67,23 +70,33 @@ pub fn App() -> impl IntoView {
     let nonce_attr = nonce.map(|n| n.0);
 
     view! {
-        <Title text="Odysseus"/>
-        <Meta charset="utf-8"/>
-        <Meta name="viewport" content="width=device-width, initial-scale=1"/>
-        <Meta name="format-detection" content="telephone=no, date=no, address=no, email=no"/>
-        <Meta name="theme-color" content="#282c34"/>
-        <Link rel="icon" href="/static/favicon.svg"/>
-        // Emitted first among the body-adjacent elements so the browser runs it
-        // during head parsing. That ordering *is* the mechanism: a script that
-        // arrives after the stylesheet has painted cannot prevent the flash of the
-        // wrong theme.
-        <script inner_html=PREPAINT_SCRIPT nonce=nonce_attr></script>
-        <Router>
-            <Routes fallback=NotFound>
-                <Route path=path!("") view=Home/>
-                <Route path=path!("/settings") view=Settings/>
-            </Routes>
-        </Router>
+        <!DOCTYPE html>
+        <html lang="en">
+            <head>
+                <Title text="Odysseus"/>
+                <Meta charset="utf-8"/>
+                <Meta name="viewport" content="width=device-width, initial-scale=1"/>
+                <Meta
+                    name="format-detection"
+                    content="telephone=no, date=no, address=no, email=no"
+                />
+                <Meta name="theme-color" content="#282c34"/>
+                <Link rel="icon" href="/static/favicon.svg"/>
+                // Emitted inside <head> and before any styled content so the
+                // browser runs it during head parsing. That ordering *is* the
+                // mechanism: a script arriving after the stylesheet has painted
+                // cannot prevent the flash of the wrong theme.
+                <script inner_html=PREPAINT_SCRIPT nonce=nonce_attr></script>
+            </head>
+            <body>
+                <Router>
+                    <Routes fallback=NotFound>
+                        <Route path=path!("") view=Home/>
+                        <Route path=path!("/settings") view=Settings/>
+                    </Routes>
+                </Router>
+            </body>
+        </html>
     }
 }
 
@@ -146,6 +159,16 @@ pub fn Settings() -> impl IntoView {
 )]
 #[component]
 pub fn NotFound() -> impl IntoView {
+    // Rendering a 404 page with a 200 status is a real defect, not a nit: caches
+    // and crawlers key on the status, and a monitoring check for 4xx would see a
+    // healthy site. The server layer provides `ResponseOptions` because it owns the
+    // response; under `hydrate` there is no server response to amend, so the
+    // whole block is cfg'd out rather than left to fail on a missing dependency.
+    #[cfg(feature = "ssr")]
+    if let Some(options) = use_context::<leptos_axum::ResponseOptions>() {
+        options.set_status(http::StatusCode::NOT_FOUND);
+    }
+
     view! {
         <main id="app-shell" data-testid="not-found">
             <h1>"Not found"</h1>

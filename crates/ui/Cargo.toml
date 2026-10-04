@@ -12,16 +12,27 @@ publish.workspace = true
 workspace = true
 
 [features]
-# `hydrate` is the wasm build; without it the crate is the server renderer.
-# Leptos selects the whole rendering mode from these, so they cannot be inferred.
+# Leptos builds this crate twice from one source: `ssr` renders to HTML on the
+# server, `hydrate` attaches behaviour to that HTML in the browser. The rendering
+# mode is selected by features and cannot be inferred, so the leptos feature is
+# NOT hardcoded on the dependency — doing that would force `ssr` into the wasm
+# build and the two are mutually exclusive.
+default = ["ssr"]
+
+# `ResponseOptions` is how a component amends the server response (the NotFound
+# route sets 404 on it). It is axum-specific, so it is not dragged into the
+# `hydrate` build, where there is no server response to amend.
+ssr = ["leptos/ssr", "leptos_meta/ssr", "leptos_router/ssr", "dep:leptos_axum", "dep:http"]
 hydrate = ["leptos/hydrate", "dep:console_error_panic_hook", "dep:wasm-bindgen"]
 
 [dependencies]
 odysseus-domain = { workspace = true }
 
-leptos = { workspace = true, features = ["ssr"] }
-leptos_meta = { workspace = true, features = ["ssr"] }
-leptos_router = { workspace = true, features = ["ssr"] }
+leptos = { workspace = true }
+leptos_meta = { workspace = true }
+leptos_router = { workspace = true }
+leptos_axum = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 
 serde = { workspace = true, features = ["derive"] }
 

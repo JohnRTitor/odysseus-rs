@@ -72,6 +72,7 @@ futures = "0.3"
 async-trait = "0.1"
 
 # --- web ---
+any_spawner = "0.3"
 axum = { version = "0.8", features = ["macros", "http2"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "compression-gzip", "trace", "fs"] }
