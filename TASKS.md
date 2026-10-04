@@ -25,9 +25,11 @@ e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
 **Status:** 46 / 489 complete · Phase 0 in progress
 
-**Spike outcomes:** see `SPIKE_RESULTS.md` — **4 of 11 resolved** (S1, S2, S5, S7); 7 pending.
+**Spike outcomes:** see `SPIKE_RESULTS.md` — **11 of 11 resolved** (S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11); 0 pending. Of those, **2 features were removed** (F169 remove-bg, S5 FAIL as published; F176 local diffusion, S9 scope decision) and **2 remain blocked or unverified**: F140 PDF rasterisation is licence-blocked (`mupdf` is AGPL-3.0, not on `deny.toml`; `poppler-rs` links GPL-2.0 libpoppler while reporting MIT), and S6 CUDA is unverified for want of a GPU.
 
-**Spike outcomes:** see `SPIKE_RESULTS.md`. **4 of 11 resolved** (S1, S2, S5, S7); 7 pending.
+
+**Spike outcomes:** see `SPIKE_RESULTS.md` — **11 of 11 resolved** (S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11); 0 pending. Of those, **2 features were removed** (F169 remove-bg, S5 FAIL as published; F176 local diffusion, S9 scope decision) and **2 remain blocked or unverified**: F140 PDF rasterisation is licence-blocked (`mupdf` is AGPL-3.0, not on `deny.toml`; `poppler-rs` links GPL-2.0 libpoppler while reporting MIT), and S6 CUDA is unverified for want of a GPU.
+
 
 ---
 
