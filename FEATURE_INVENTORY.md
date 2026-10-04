@@ -255,7 +255,7 @@ lines of code fence, completion verifier max 2 rounds.
 | F173 | Signatures | `routes/signature_routes.py`, `gallery.js` | Reusable image stamps; PNG/SVG stored **encrypted** | `signatures` | Med | Med | `odysseus-services` | 22 | UNIMPLEMENTED |
 | F174 | Image style transfer | `gallery_routes.py:604` | Privilege-gated | n/a | Med | Med | `odysseus-services` | 17 | UNIMPLEMENTED |
 | F175 | Image generation (`generate_image`) | `src/ai_interaction.py:944-1190`, `src/image_model_ids.py` | Deliberately **absent from native schemas** (XML/fence-only); auto-detects the image model; saves to gallery | `gallery_images` | Med | Med | `odysseus-tools` | 17 | UNIMPLEMENTED |
-| F176 | Local diffusion generation | `scripts/diffusion_server.py` (1,506 L) | Already an **optional out-of-process backend** | external | High | High | spike S9 | 17 | **HOLD** — scope decision pending |
+| F176 | Local diffusion generation | `scripts/diffusion_server.py` (1,506 L) | Already an **optional out-of-process backend** | external | High | High | **none — do not port** | 16 | **REMOVED by spike S9.** `REWRITE_PLAN.md:66-68` classifies this as an optional backend, not app process; `/api/image/inpaint`, `/api/image/harmonize` and `/images/generations` all proxy to a registered `ModelEndpoint` already. `diffusion_server.py` stays available as an external `ModelEndpoint` |
 
 ---
 

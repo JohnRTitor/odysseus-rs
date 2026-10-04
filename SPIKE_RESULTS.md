@@ -214,52 +214,48 @@ redistributed **model weights**. Not a blocker here, but any future spike that v
 weights needs one.
 
 
-## S8 — `lettre` / `async-imap` / `mailparse` — ✅ **PASS (XOAUTH2 verified on the wire)**
+## S9 — Local Stable Diffusion scope — 📌 **DECISION: REMOVE F176**
 
-**Phase 15 does not need re-planning.** Gmail OAuth2 works on both halves, and the
-XOAUTH2 SASL string — the single most error-prone part — was checked byte-for-byte
-against Google's published format by running a real SMTP dialogue.
+**Decision, not a finding: do not port Stable Diffusion to Rust.**
 
-```
-lettre test_connection -> Ok(true)
-wire:  AUTH XOAUTH2 dXNlcj1hbGljZUBleGFtcGxlLmNvbQFhdXRoPUJlYXJlciB5YTI5LmEwQWZINlNNQngtYWNjZXNzLXRva2VuAQE=
-bytes: user=alice@example.com\u{1}auth=Bearer ya29.a0AfH6SMBx-access-token\u{1}\u{1}
-```
+`REWRITE_PLAN.md:66-68` already settles this, and S9 only confirms it:
 
-Google publishes that exact layout (`user=` + `\x01` + `auth=Bearer ` + token + `\x01\x01`).
+> `scripts/diffusion_server.py` and `swift/odysseus-mlx-image-bridge/` are already
+> *optional out-of-process backends* in the current app, not part of the app process.
+> **Anything replacing them inherits that placement.**
 
-| Crate | Version | Licence | Evidence |
-|---|---|---|---|
-| `lettre` | 0.11.23 | MIT | `transport/smtp/authentication.rs:117-123` builds the XOAUTH2 string; verified on the wire above |
-| `async-imap` | 0.12.0 | MIT OR Apache-2.0 | `client.rs:244-297` `authenticate("XOAUTH2", &auth)` with a custom `Authenticator` (`type Response: AsRef<[u8]>`) |
-| `mailparse` | 0.17.0 | 0BSD | multipart/alternative parsed: 2 parts, subject recovered |
+So F176 is not required for the single-process goal — it is an *optional backend* by the
+plan's own definition, alongside Ollama/vLLM and MCP subprocesses.
 
-Transitive deps: **132** for all three.
+### The evidence
 
-### Three gotchas worth writing down
+- `/api/image/inpaint` — `routes/gallery/gallery_routes.py:1257`. Proxies to a
+  registered `ModelEndpoint` (`_first_visible_image_endpoint(db, user)`), with SSRF
+  validation (`check_outbound_url`) and OpenAI re-shaping.
+- `/api/image/harmonize` — `gallery_routes.py:1515`. Same: a registered
+  `ModelEndpoint`'s `base_url` + `api_key`, sending real img2img with `strength`
+  (comment at `:1509-1514` explains why a 100 %-mask inpaint call is the wrong shape).
+- `/images/generations` (txt2img) — `gallery_routes.py:269`, `:634`. Also a proxy.
+- `scripts/diffusion_server.py` — 1,506 lines, PyTorch + FastAPI, `from_pretrained`
+  diffusers pipelines. An HTTP service speaking OpenAI-shaped endpoints, i.e. exactly
+  what a `ModelEndpoint` row describes.
 
-1. **XOAUTH2 is not in lettre's defaults.** `DEFAULT_MECHANISMS = [Plain, Login]`
-   (`authentication.rs:10`). You must pass
-   `.authentication(vec![Mechanism::Xoauth2])` explicitly, with the bearer token as
-   `Credentials::new(user, token)`. Fail-safe in practice — Gmail rejects PLAIN — but
-   the failure will read as "auth failed", not "you forgot the mechanism".
-2. **`.tls()` is feature-gated.** It only exists under a TLS backend feature
-   (`tokio1-native-tls` / `tokio1-rustls` / …). With `default-features = false` the
-   builder has no TLS method at all, which fails at compile time rather than silently
-   sending mail in the clear. Use `Tls::Required` on port 587 (STARTTLS, MITM-safe) or
-   `Tls::Wrapper` on 465 (implicit).
-3. **Gmail IMAP is implicit TLS on 993, not STARTTLS.** `async-imap` supports it via
-   `async_imap::connect((domain, 993), domain, tls)` with an
-   `async_native_tls::TlsConnector`. Gmail advertises `LOGINDISABLED`, so XOAUTH2 is the
-   only path — which is what you want.
+### Why removing it is the right call, not the lazy one
 
-The async-imap `Authenticator` shape is also the right place for **token refresh
-mid-handshake**, which a fixed lettre `Credentials` cannot do. Note that as a real
-design constraint for Phase 15: the SMTP bearer token must be re-read per send.
+The cost is the largest single port in the rewrite — CLIP tokenizer + four exported
+graphs + **a scheduler port with no ONNX equivalent** (200–400 lines of stateful math),
+against `ort 2.0.0-rc.13`, which is a release candidate, plus a TensorRT engine cache
+for the claimed 1.5–2.5 s. The benefit is **zero capability that is not already
+reachable over HTTP**, because the Python app already reaches it the same way.
 
-**Verdict: PASS.** End-to-end against Gmail is **UNVERIFIED** — no credentials — but the
-mechanism, the encoding and the TLS modes are all confirmed, which is the part that
-would have failed.
+**Action:** F176 → REMOVED, with the reason recorded (not deleted). `diffusion_server.py`
+remains an *optional external backend* that Rust registers as a `ModelEndpoint` — the
+same mechanism inpaint and harmonize already use. Nothing about image editing or
+generation is lost; only the Rust reimplementation of a PyTorch service is dropped.
+
+**Re-open if** image generation becomes a hard requirement for a LAN-only install with
+no external GPU. It is not one today.
+
 
 ---
 
