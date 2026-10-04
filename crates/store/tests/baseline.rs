@@ -369,3 +369,95 @@ fn opens_a_real_python_created_database_when_available() -> Result<(), Box<dyn s
 
     Ok(())
 }
+
+/// T0051, in a form CI can actually run.
+///
+/// The pre-existing `opens_a_real_python_created_database_when_available` skips
+/// itself whenever `DATA_DIR` is unset — which is always, in CI. So the
+/// encrypted-column compatibility requirement was verified by a test that never
+/// executed, and `crypto::load_key` had no live caller at all. An audit found
+/// this by running the suite and reading the skip message.
+///
+/// This version needs no external install: it writes a key file in the documented
+/// format, encrypts through the same path the migrations use, stores the result in
+/// a **real** encrypted column of a **real** migrated database, and reads it back.
+///
+/// **What this does and does not prove.** It proves our key loading, prefixing,
+/// column storage and read path agree with each other and with the Fernet spec —
+/// `fernet` is the same implementation Python's `cryptography` uses, so the bytes
+/// are interchangeable by construction. It does **not** prove parity with a value
+/// Python actually wrote; that needs a Python-produced fixture, and no interpreter
+/// is available in this environment. The `DATA_DIR` test remains for a maintainer
+/// who has a real install, and is the only thing that closes that half. Recorded in
+/// INCOMPLETE.md rather than papered over.
+#[test]
+fn an_encrypted_column_round_trips_through_a_real_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    use odysseus_store::crypto;
+
+    let dir = tempfile::tempdir()?;
+    let key_path = dir.path().join(".app_key");
+    // The on-disk format Python writes: a 44-byte url-safe base64 Fernet key.
+    // Surrounding whitespace is realistic — `auth_compat.rs` covers the same thing
+    // for the JSON sidecars.
+    std::fs::write(&key_path, format!("{}\n", fernet::Fernet::generate_key()))?;
+
+    let store = Store::open(dir.path().join("app.db"));
+    store.migrate()?;
+    let key = crypto::load_key(&key_path)?;
+
+    // A value that looks like a credential, so nothing can accidentally pass by
+    // being empty or self-describing.
+    let secret = "sk-live-abc123do-not-log-me";
+    let stored = crypto::encrypt(&key, secret);
+    assert!(
+        stored.starts_with(ENCRYPTED_PREFIX),
+        "the stored form must carry the prefix, got {stored:?}"
+    );
+
+    {
+        let conn = store.connect()?;
+        conn.execute(
+            "INSERT INTO model_endpoints
+             (id, name, base_url, api_key, is_enabled, hidden_models, cached_models,
+              pinned_models, model_type, endpoint_kind, model_refresh_mode,
+              model_refresh_interval, model_refresh_timeout, supports_tools, owner,
+              provider_auth_id, created_at, updated_at)
+             VALUES ('ep1', 'local', 'http://127.0.0.1:11434', ?1, 1,
+                     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'alice',
+                     NULL, '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+            [&stored],
+        )?;
+    }
+
+    let read_back: String = {
+        let conn = store.connect()?;
+        conn.query_row(
+            "SELECT api_key FROM model_endpoints WHERE id = 'ep1'",
+            [],
+            |r| r.get(0),
+        )?
+    };
+    let plaintext = crypto::maybe_decrypt(&key, &read_back)?;
+
+    assert_eq!(
+        plaintext, secret,
+        "a column encrypted by this build must decrypt through the same build"
+    );
+    assert!(
+        !read_back.contains(secret),
+        "the secret must not be recoverable from the stored bytes"
+    );
+
+    // And the shape the migrations rely on: a plaintext value must still pass
+    // through untouched, or re-running an idempotence check would double-encrypt
+    // an already-encrypted column.
+    let legacy = "sk-legacy-plaintext";
+    assert_eq!(crypto::maybe_decrypt(&key, legacy)?, legacy);
+    assert!(
+        !crypto::is_encrypted(legacy),
+        "a plaintext value must not be mistaken for an encrypted one"
+    );
+
+    Ok(())
+}

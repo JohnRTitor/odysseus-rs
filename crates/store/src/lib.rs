@@ -234,10 +234,163 @@ impl MigrationReport {
 }
 
 /// Resolves `DATA_DIR`, mirroring `DATA_DIR` handling in `src/constants.py`.
+///
+/// Split from the environment read so it is a pure function and therefore testable
+/// without mutating process state — which matters because `std::env::set_var` is
+/// `unsafe` in edition 2024 and `unsafe_code` is denied workspace-wide.
+///
+/// Misresolution here is not cosmetic: `app.db` and the `auth.json` /
+/// `sessions.json` beside it are found through this same directory, so pointing
+/// it somewhere else splits the database from the credential store.
 fn default_data_dir() -> PathBuf {
-    std::env::var("DATA_DIR")
-        .ok()
-        .map(|dir| dir.trim().to_owned())
+    resolve_data_dir(std::env::var("DATA_DIR").ok())
+}
+
+/// The pure resolution rule: a set, non-blank value wins; anything else is
+/// `./data`.
+fn resolve_data_dir(raw: Option<String>) -> PathBuf {
+    raw.map(|dir| dir.trim().to_owned())
         .filter(|dir| !dir.is_empty())
         .map_or_else(|| PathBuf::from("data"), PathBuf::from)
+}
+
+#[cfg(test)]
+mod permission_tests {
+    //! `restrict_permissions` is the only thing standing between a shared machine
+    //! and a world-readable credential store, and its sidecar coverage was
+    //! invisible to CI.
+    //!
+    //! The existing test in `tests/baseline.rs` stats `app.db` and nothing else.
+    //! Nothing in the workspace sets `journal_mode=WAL`, so no `-wal`/`-shm` file
+    //! exists at assert time, and `restrict_permissions` guards every path with
+    //! `if path.exists()`. Deleting `.chain(self.sidecars())` therefore left the
+    //! whole suite green — verified by mutation, not assumed.
+    //!
+    //! The sidecars are created explicitly here rather than coaxed out of SQLite:
+    //! the contract is "if this file exists, tighten it", and manufacturing the
+    //! file tests that contract directly. Relying on journal mode would make the
+    //! test silently vacuous again the moment that setting changes.
+
+    use {
+        super::{Store, default_data_dir},
+        std::{
+            os::unix::fs::PermissionsExt as _,
+            path::{Path, PathBuf},
+        },
+    };
+
+    /// Panics rather than asserting, because a missing file here means the test
+    /// setup is wrong and there is nothing meaningful left to compare.
+    fn mode_of(path: &Path) -> u32 {
+        let metadata = std::fs::metadata(path).expect("stat the file under test");
+        metadata.permissions().mode() & 0o777
+    }
+
+    /// A store with a migrated database and all three sidecars present, each
+    /// deliberately world-readable so tightening them is observable.
+    fn store_with_permissive_sidecars() -> (tempfile::TempDir, Store, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("app.db");
+        let store = Store::open(&db);
+        store.migrate().expect("migrate");
+
+        let wide = std::fs::Permissions::from_mode(0o644);
+        let mut sidecars = Vec::new();
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", db.display()));
+            std::fs::write(&path, b"x").expect("write sidecar");
+            std::fs::set_permissions(&path, wide.clone()).expect("loosen sidecar");
+            assert_eq!(mode_of(&path), 0o644, "precondition");
+            sidecars.push(path);
+        }
+        std::fs::set_permissions(&db, wide).expect("loosen db");
+        (dir, store, sidecars)
+    }
+
+    #[test]
+    fn the_database_and_every_sidecar_are_tightened_to_0600() {
+        let (_dir, store, sidecars) = store_with_permissive_sidecars();
+        store.restrict_permissions().expect("restrict");
+
+        assert_eq!(
+            mode_of(store.path()),
+            0o600,
+            "the database itself must be owner-only"
+        );
+        for sidecar in &sidecars {
+            assert_eq!(
+                mode_of(sidecar),
+                0o600,
+                "{} must be tightened too: skipping the sidecars leaks database \
+                 contents through a readable write-ahead log",
+                sidecar.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_sidecar_created_after_the_first_call_is_tightened_on_the_next() {
+        // SQLite creates `-wal`/`-shm` lazily, so the first call at startup may
+        // find nothing to tighten. The guarantee has to hold on every call, not
+        // just the one that happens to run first.
+        let (_dir, store, _sidecars) = store_with_permissive_sidecars();
+        store.restrict_permissions().expect("first restrict");
+
+        let late = PathBuf::from(format!("{}-wal", store.path().display()));
+        std::fs::write(&late, b"x").expect("write late sidecar");
+        std::fs::set_permissions(&late, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+
+        store.restrict_permissions().expect("second restrict");
+        assert_eq!(
+            mode_of(&late),
+            0o600,
+            "a sidecar that appears later must still be tightened"
+        );
+    }
+
+    #[test]
+    fn restricting_is_idempotent_and_survives_absent_sidecars() {
+        // The startup path calls this on a database that may have no sidecars at
+        // all, and may call it repeatedly. Neither may be an error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("app.db"));
+        store.migrate().expect("migrate");
+        store.restrict_permissions().expect("first");
+        store.restrict_permissions().expect("second");
+        assert_eq!(mode_of(store.path()), 0o600);
+    }
+
+    #[test]
+    fn a_blank_data_dir_falls_back_to_data_and_a_real_one_is_honoured() {
+        // Misresolution splits `app.db` from `auth.json`/`sessions.json`, which
+        // are found through this same directory. Nothing tested the rule at all.
+        //
+        // Pure rather than environment-mutating: `std::env::set_var` is `unsafe`
+        // in edition 2024 and `unsafe_code` is denied workspace-wide, so the
+        // environment route is not available. Testing `resolve_data_dir` directly
+        // is better anyway — no global state, so it cannot race another test.
+        use super::resolve_data_dir;
+
+        // The docker-compose case: the variable is declared but the host never set
+        // it, so the container injects an empty value. That must not become the
+        // data directory.
+        for blank in [None, Some(String::new()), Some(String::from("   "))] {
+            assert_eq!(
+                resolve_data_dir(blank.clone()),
+                PathBuf::from("data"),
+                "{blank:?} must fall back to ./data"
+            );
+        }
+
+        // Surrounding whitespace is trimmed rather than becoming part of the path,
+        // which would create a directory literally named " /srv/data".
+        assert_eq!(
+            resolve_data_dir(Some(String::from("  /srv/odysseus  "))),
+            PathBuf::from("/srv/odysseus")
+        );
+        assert_eq!(
+            resolve_data_dir(Some(String::from("relative/path"))),
+            PathBuf::from("relative/path")
+        );
+    }
 }

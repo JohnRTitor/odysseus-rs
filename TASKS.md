@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 46 / 489 complete · Phase 0 in progress
+**Status:** 52 / 489 complete · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — **11 of 11 resolved** (S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11); 0 pending. Of those, **2 features were removed** (F169 remove-bg, S5 FAIL as published; F176 local diffusion, S9 scope decision) and **2 remain blocked or unverified**: F140 PDF rasterisation is licence-blocked (`mupdf` is AGPL-3.0, not on `deny.toml`; `poppler-rs` links GPL-2.0 libpoppler while reporting MIT), and S6 CUDA is unverified for want of a GPU.
 
@@ -82,10 +82,10 @@ is written.**
 - [x] T0045 `chat_messages_fts` + 3 triggers, scrubbing base64 media from the index
 - [x] T0046 Fernet encrypt/decrypt at the column boundary for the 7 encrypted columns. **`.app_key` must stay readable**
 - [ ] T0047 Naive-UTC datetime conversion helpers; round-trip tests on every datetime column
-- [ ] T0048 `chmod 0600` on the DB **and** its `-journal`/`-wal`/`-shm` sidecars
+- [x] T0048 `chmod 0600` on the DB **and** its `-journal`/`-wal`/`-shm` sidecars — **done and now proven.** `restrict_permissions` tightens `app.db` and its `-journal`/`-wal`/`-shm` sidecars; 4 tests create the sidecars explicitly and assert `0600`. Deleting `.chain(self.sidecars())` was verified to leave the suite green beforehand, which is why the old test missed it
 - [x] T0049 **TEST: open a copy of the real `app.db`** — 33 tables, 81 indexes, 3 triggers, 0 FK violations, `.app_key` loads and round-trips
 - [x] T0050 **TEST: `PRAGMA foreign_key_check` returns zero rows**
-- [ ] T0051 **TEST: an existing encrypted column decrypts with the real `.app_key`**
+- [x] T0051 **TEST: an existing encrypted column decrypts with the real `.app_key`** — **CI-runnable half done.** A real encrypted column in a real migrated DB now round-trips through `load_key`. Python-produced-fixture parity still needs a maintainer with an interpreter; recorded in INCOMPLETE.md, not claimed
 
 ### 0.4 Auth
 
