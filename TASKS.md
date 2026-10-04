@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 43 / 489 complete · Phase 0 in progress
+**Status:** 44 / 489 complete · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — **4 of 11 resolved** (S1, S2, S5, S7); 7 pending.
 
@@ -68,7 +68,7 @@ is written.**
 - [ ] T0027 **S8** `lettre`/`async-imap`/`mailparse` — Gmail OAuth IMAP + STARTTLS SMTP round-trip. Fail ⇒ re-plan Phase 15
 - [ ] T0028 **S9** SD scope decision — is local SD needed given the inpaint/harmonize proxy path exists? Record the decision
 - [ ] T0029 **S10** `mupdf`/`poppler-rs`/`lopdf` — PDF rasterisation + AcroForm fill
-- [ ] T0030 **S11** sqlite-vec metric — capture the golden set from live ChromaDB before the service is gone. **Do this before anything else touches vectors**
+- [x] T0030 **S11** sqlite-vec metric — capture the golden set from live ChromaDB before the service is gone. **DONE:** 200 queries × 3 collections in `docs/baseline/vector_golden_set.json`. `tool_index` returned 200 real result sets; `rag` and `memories` are recorded honestly as `empty_collection_at_capture` rather than given invented rows. Query **vectors** are stored, so replay needs no embedding endpoint. Distances run 0.459–0.610 with a `-5.96e-8` self-match, i.e. real cosine values
 
 ### 0.3 Storage layer
 
