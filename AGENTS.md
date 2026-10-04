@@ -248,6 +248,61 @@ cached LLM responses, tool results, approval records, and vector rows (`PERFORMA
 - Check whether the stdlib or an existing dependency covers a need before adding a crate. Declare versions in `[workspace.dependencies]`; set `default-features = false` and enable only what is used.
 - Run `cargo deny check advisories licenses bans` and `cargo audit` before committing dependency changes.
 
+#### 12.3.1 Licence policy — resolve, never silently drop
+
+**A licence concern is a reason to investigate, not a reason to remove a feature.** No
+crate or capability is dropped for licensing without a recorded, reviewed decision.
+`INCOMPLETE.md` §3 requires a documented reason for every removal, and "the licence was
+inconvenient" is not one.
+
+Escalation ladder, in order — stop at the first that works:
+
+1. **It was never incompatible.** Check what the project's own licence already
+   permits before treating anything as a blocker. This project is
+   `AGPL-3.0-or-later`, so linking an `AGPL-3.0`, `GPL-3.0` or `MPL-2.0` dependency
+   is compatible by construction (AGPL §13 permits linking with GPL-3.0). The
+   frequent outcome is that the only obstacle is our own allow-list in
+   `deny.toml`, which is a config decision, not a legal one — so make the config
+   change, with a written justification, and keep the feature.
+2. **Substitute.** A different crate achieving the same capability under a
+   compatible licence is a substitution, not a loss. Record what was chosen and
+   why.
+3. **Isolate behind a process boundary.** No linking relationship exists across a
+   process boundary, which changes the question from linking to distribution. This
+   is not a workaround invented for licensing — it is already this project's
+   architecture twice over: `odysseus-ml` owns `ort`/`ort-sys` "isolated so a swap
+   is a single-crate change" (§8/§9), and `REWRITE_PLAN.md:66-68` places the
+   diffusion backend out-of-process with the note that "anything replacing them
+   inherits that placement". A capability that cannot be linked may still be
+   driven over a pipe.
+4. **Reimplement.** Justified when the required surface is small — the point is
+   that `rembg-rs` cost 240 packages to do a job whose graph is ~150 lines
+   (spike S5).
+5. **Drop**, only with the reason written down in `INCOMPLETE.md` §3 and a
+   statement of which rungs were attempted and why each failed.
+
+**Escalate rather than adjudicate.** Licence compatibility has edge cases
+(codec patents, geo/databases, clause interactions, whether a dependency's
+* transitive* obligations differ from its declared licence) that a maintainer
+should not settle alone. When the answer is not obvious from the licences
+themselves, record the question, the options, and a recommendation, and ask.
+
+#### 12.3.2 A `-sys` crate's licence is not its own
+
+`cargo deny` reads the licence declared in the Rust dependency graph. A `-sys`
+crate declares the licence of *itself* — usually MIT — while binding to a C
+library whose licence may be entirely different. `poppler-rs` reports MIT and
+links GPL-2.0-or-later `libpoppler` via `poppler-sys-rs`; `cargo deny` waves it
+through. This is a **false negative**, the dangerous direction: the tool reports
+"fine" and a copyleft obligation ships.
+
+So the rule cuts the other way from the rest of this section. When a `-sys` or
+`-build` crate is added, the licence to verify is the **C library it links**, not
+the Rust wrapper, and the linkage must be recorded explicitly. The obligation is
+to *prove* the licence, never to avoid `-sys` crates in order to dodge the check —
+refusing them would push us toward hand-writing FFI bindings, which is a worse
+outcome than either the dependency or the paper trail.
+
 ---
 
 ## 13. Commands
