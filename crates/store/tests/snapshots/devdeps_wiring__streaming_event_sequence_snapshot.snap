@@ -1,0 +1,10 @@
+---
+source: crates/store/tests/devdeps_wiring.rs
+assertion_line: 108
+expression: snapshot
+---
+{"type":"start","session":"s1"}
+{"type":"delta","text":"Hello"}
+{"type":"delta","text":", world"}
+{"type":"done","tokens":7}
+-- events: 4

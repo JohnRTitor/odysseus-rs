@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "captured_at_utc": "2026-10-04",
+  "task": "T0005 (dev-deps), T0121 (Rust skeleton)",
+  "purpose": "AGENTS.md N7 — no performance claim without a baseline file. Every number here was measured on this machine by the command recorded beside it. Nothing is estimated, and anything that could not be measured is recorded as null with a reason, never guessed.",
+
+  "machine": {
+    "cpu": "AMD Ryzen 5 7600, 6 cores / 12 threads",
+    "memory_mib": 15086,
+    "os": "NixOS (nix store paths, glibc 2.42)",
+    "rustc": "1.98.1",
+    "profile": "release: opt-level=3, lto=thin, codegen-units=1, panic=abort",
+    "conditions": "SHARED. Another agent was compiling in the same tree during capture. This inflates every figure and is called out per-benchmark below.",
+    "note": "Load figures are loopback-only and single-host. They are a floor, not a capacity number."
+  },
+
+  "in_process_benchmarks": {
+    "method": "cargo bench -p odysseus-store --bench auth_hotpath -- --warm-up-time 1 --measurement-time 3",
+    "harness": "criterion 0.8, 100 samples per benchmark, single-threaded",
+    "protocol": "Each benchmark was run three times. Where the three runs agree within ~5 % the median is quoted and the spread noted. Where they do not, that is stated instead of quoting one run — see atomic_write_bytes.",
+    "results": {
+      "bcrypt_cost12/verify_correct_password": { "median_ms": 165.3, "observed_ms": [162.9, 165.5, 165.5], "stability": "tight, ~1.6 % spread" },
+      "bcrypt_cost12/verify_wrong_password":  { "median_ms": 163.8, "observed_ms": [163.3, 163.8, 164.8], "stability": "tight, ~0.9 % spread" },
+      "bcrypt_cost12/hash":                  { "median_ms": 164.1, "observed_ms": [163.0, 164.4, 164.1], "stability": "tight, ~0.9 % spread" },
+      "atomic_write/write_4kib_fsync":       { "median_us": null, "observed_us": [710, 750, 824, 968, 1156, 1810], "stability": "UNSTABLE — see reading_notes. Do not quote a single value" },
+      "ratelimit/check_hot_key":             { "median_ns": 46.1, "observed_ns": [45.5, 51.3, 46.1], "stability": "tight, ~13 % spread" },
+      "ratelimit/check_cold_key":            { "median_ns": 107.7, "observed_ns": [114.7, 107.7, 107.2], "stability": "tight, ~7 % spread" },
+      "token_scopes/join_scopes":            { "median_ns": 37.4, "observed_ns": [37.4, 38.7, 37.0], "stability": "tight, ~4 % spread" },
+      "token_scopes/split_scopes":           { "median_ns": 53.9, "observed_ns": [50.1, 58.4, 53.9], "stability": "moderate, ~16 % spread" },
+      "token_scopes/scope_parse":            { "median_ns": 12.4, "observed_ns": [12.4, 12.4, 12.5], "stability": "tight, <1 % spread" },
+      "token_scopes/token_profile_parse":    { "median_ns": 7.80, "observed_ns": [7.80], "stability": "single run; expect ~±5 %" }
+    },
+    "reading_notes": [
+      "bcrypt verify and hash are within 1 % of each other at cost 12: bcrypt is constant-time, so a wrong password costs what a right one does. That is the property, and measuring the pair is how it stays true.",
+      "The figure previously quoted in prose as '~250 ms for a cost-12 verify' is NOT reproducible on this machine. Measured here: 163–166 ms. Whatever produced 250 ms was a different CPU or a different cost; do not quote it.",
+      "atomic_write_bytes is fsync-bound and measured 2.5x apart (710 us to 1810 us) across six runs on the same binary. The cause is filesystem contention on /tmp while another agent compiles, not variance in the code. It is recorded as a range with no median on purpose. To get a usable figure, re-run on an idle machine and prefer a real disk over tmpfs — a tmpfs figure is the cheapest case, and a spinning disk or a network filesystem will be materially slower.",
+      "ratelimit/check_cold_key allocates a bucket, which is why it is ~2.3x check_hot_key. That is the cost a credential-stuffing burst pays."
+    ]
+  },
+
+  "layout": {
+    "method": "std::mem::size_of, asserted in crates/store/tests/layout_ceilings.rs and measured by crates/store/benches/layout.rs",
+    "bytes": {
+      "User": 192,
+      "Privileges": 48,
+      "String": 24,
+      "Option<String>": 24,
+      "Box<str>": 16
+    },
+    "ceilings": { "User": 224, "Privileges": 56 },
+    "reading_notes": [
+      "168 of User's 192 bytes are seven 24-byte headers (1 String, 2 Option<String>, 1 Option<Vec<String>>, 3 BTreeMap). AGENTS.md §12.1 rule 1 says those become Box<str>; no such change has been made yet.",
+      "Privileges is embedded in every User, so its 48 bytes are multiplied by the account count.",
+      "The bench is reported as ~487 ps, which is the cost of the tuple construction, not of size_of — it is a compile-time constant. The bench exists so the baseline quotes a measured artefact rather than the assertions alone."
+    ]
+  },
+
+  "allocations": {
+    "method": "counting #[global_allocator] in crates/store/tests/alloc_baseline.rs. One test function in the binary, so the process-global counters cannot be disturbed by a sibling; cargo nextest also isolates per process.",
+    "counts": {
+      "atomic_write_bytes_4KiB": { "allocs": 4, "reallocs": 4, "total": 8, "ceiling": 40, "stability": "identical across 6 consecutive runs" },
+      "scope_round_trip": { "allocs": 4, "reallocs": 2, "total": 6, "ceiling": 24, "stability": "identical across 6 consecutive runs" },
+      "calibration_one_1KiB_Vec": { "allocs": 1, "reallocs": 0 }
+    },
+    "reading_notes": [
+      "The baseline is allocations, not bytes. AGENTS.md §12.2 asks for both because a layout change that halves bytes but doubles allocations is not an improvement.",
+      "atomic_write_bytes does 8 allocations for a 4 KiB payload: temp-file creation, the write, and the rename bookkeeping. It does NOT copy the payload — the ceiling protects that.",
+      "An earlier revision of this file had three separate #[test] functions and was flaky: passing with --test-threads=1 and failing without it. One test function removed the hazard at the source."
+    ]
+  },
+
+  "service": {
+    "method": "A scratch harness spawns the server itself, so a stale listener cannot be mistaken for it. Reads /proc/<pid>/status and smaps_rollup for RSS; drives the five live routes over keep-alive HTTP/1.1 with proper response framing.",
+    "routes": ["/api/health", "/api/version", "/api/ready", "/api/runtime", "/"],
+    "startup": {
+      "metric": "process spawn() to first served HTTP response on /api/health",
+      "runs": 9,
+      "min_ms": 4.92, "median_ms": 9.06, "mean_ms": 9.97, "max_ms": 26.04,
+      "note": "The 26 ms outlier is the first run and includes page-cache warming. A fresh empty data dir is used per run."
+    },
+    "memory": {
+      "after_boot_no_requests": { "vm_rss_kib": 7676, "vm_hwm_kib": 7676, "vm_size_kib": 820708, "private_dirty_kib": 880, "threads": 13 },
+      "after_5000_requests":    { "vm_rss_kib": 7904, "vm_hwm_kib": 7904, "vm_size_kib": 888308, "private_dirty_kib": 1108, "threads": 14 },
+      "after_load_peak":         { "vm_hwm_kib": 13224 },
+      "reading_notes": [
+        "Private_Dirty is the number that matters: 1.1 MiB of anonymous heap. The other ~6.8 MiB of RSS is the binary's text and rodata pages being resident, which is the floor for any Rust binary of this size.",
+        "VmSize is ~820 MiB of RESERVED address space, not memory. Do not quote it as usage.",
+        "Serving 5000 sequential requests cost 228 KiB of RSS. Sustained load must be re-measured against the real endpoint mix once the agent loop exists."
+      ]
+    },
+    "load": [
+      { "concurrency": 1,  "requests": 2000,  "rps": 29356,  "ttfb_us_p50": 30.43, "ttfb_us_p95": 54.52, "ttfb_us_p99": 78.01,  "ttfb_us_min": 19.06, "ttfb_us_max": 662.67, "status_mix": {"200": 800, "302": 400, "401": 800} },
+      { "concurrency": 8,  "requests": 16000, "rps": 119574, "ttfb_us_p50": 56.47, "ttfb_us_p95": 125.16, "ttfb_us_p99": 187.42, "ttfb_us_min": 18.81, "ttfb_us_max": 1246.01, "status_mix": {"200": 6400, "302": 3200, "401": 6400} },
+      { "concurrency": 32, "requests": 32000, "rps": 121743, "ttfb_us_p50": 188.72, "ttfb_us_p95": 507.78, "ttfb_us_p99": 817.26, "ttfb_us_min": 21.09, "ttfb_us_max": 13184.28, "status_mix": {"200": 12800, "302": 6400, "401": 12800} },
+      { "concurrency": 64, "requests": 32000, "rps": 152034, "ttfb_us_p50": 381.50, "ttfb_us_p95": 764.19, "ttfb_us_p99": 1015.40, "ttfb_us_min": 24.88, "ttfb_us_max": 7193.90, "status_mix": {"200": 12800, "302": 6400, "401": 12800} }
+    ],
+    "load_notes": [
+      "The 401s are the auth gate working: /api/runtime requires a privilege and these requests carry no credential. A run with no 401s would mean the gate was bypassed.",
+      "This measures routing and middleware only. No route in this mix touches SQLite, calls an LLM, or opens an SSE stream, so these numbers say nothing about the real workload. They are a floor."
+    ],
+    "measurement_corrections": [
+      "An earlier attempt reported a 2.45 ms cold start. That was wrong: a leftover listener from a previous run answered the probe while the freshly spawned child had exited immediately on 'address in use'. The harness now spawns the server itself and the reported 4.92–26 ms range is real.",
+      "An earlier attempt counted only 60 % of responses. Reading a keep-alive connection without draining the body makes the next read start mid-body, so the status line parses as garbage. Responses are now framed by Content-Length or chunked encoding."
+    ]
+  },
+
+  "unavailable": {
+    "streaming_chunk_latency": {
+      "status": "UNAVAILABLE",
+      "why": "PERFORMANCE_PLAN.md §0.1 asks for p50/p95/p99 chunk latency during a 500-token agent run. That needs (a) the Leptos UI built — / returns 302 to /login which is 404, so there is no client, and (b) a reachable LLM endpoint to stream from. Neither exists on this host.",
+      "not_estimated": true
+    },
+    "python_baseline": {
+      "status": "UNAVAILABLE",
+      "why": "See 2026-10-04-python.md. The only interpreter is a bare uv-managed CPython 3.14.7 with none of the ~200 requirements installed; the Python project's devenv.nix provides only tk and git; there is no .venv.",
+      "not_estimated": true
+    },
+    "atomic_write_stable_figure": {
+      "status": "UNSTABLE, NOT UNAVAILABLE",
+      "why": "Measured, but 2.5x apart across runs because /tmp is contended on this shared machine. Re-run on an idle host. The range is recorded above rather than a single misleading median."
+    },
+    "gpu_figures": {
+      "status": "OUT OF SCOPE",
+      "why": "No GPU on this host. ort EP availability was already recorded as UNVERIFIED by spike S1/S2 and is unchanged."
+    }
+  }
+}

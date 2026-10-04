@@ -140,16 +140,40 @@ wasm-bindgen-futures = "0.4"
 gloo-net = "0.6"
 gloo-timers = { version = "0.3", features = ["futures"] }
 
-# --- dev / test ---
-criterion = "0.8"
-insta = "1"
-proptest = "1"
+# --- dev / test (T0005) ---
+# Cargo has no inheritable `[workspace.dev-dependencies]`: a member crate's
+# `workspace = true` can only resolve against `[workspace.dependencies]`, so
+# test tooling has to live here. It stays out of every member's *runtime*
+# dependency set because no member lists these under `[dependencies]`.
+#
+# Declared `default-features = false` where the defaults pull machinery this
+# workspace does not use (AGENTS.md §12.3). Each entry states what it is for,
+# because a dev-dependency nobody exercises is one the next tidy-up deletes.
+#
+# criterion   micro-benchmark harness for `docs/baseline/`. Drops `rayon`
+#             (parallel benches) and `plotters` (gnuplot): the baselines are
+#             single-threaded measurements and commit JSON, not charts.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support", "html_reports"] }
+# proptest    property-based tests for the sanitizers and parsers (AGENTS.md §11:
+#             port the Python token-by-token fuzz tests). Drops `fork` and
+#             `timeout` — every property here is pure and in-process, so that
+#             machinery would only slow the suite down.
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
+# insta       snapshot tests for SSE event sequences (AGENTS.md §11). No
+#             `yaml`/`redactions` extras: the payloads are JSON-shaped and
+#             nothing here needs redaction.
+insta = { version = "1", default-features = false }
+# pretty_assertions  readable multi-line diffs. Drops `nightly`, which only adds
+#             `std::backtrace`-based diff rendering.
+pretty_assertions = { version = "1", default-features = false, features = ["std"] }
+# mockall     mock trait implementations. Off the `log`/nightly backtrace paths.
+mockall = { version = "0.15", default-features = false }
+# tempfile    already consumed by odysseus-store and odysseus-web. `getrandom`
+#             makes generated names unguessable, which matters for the
+#             `chmod 0600` files the tests create.
 tempfile = { version = "3", features = ["getrandom"] }
-pretty_assertions = "1"
-mockall = "0.15"
 wiremock = "0.6"
 tokio-test = "0.4"
-
 [profile.release]
 opt-level = 3
 lto = "thin"

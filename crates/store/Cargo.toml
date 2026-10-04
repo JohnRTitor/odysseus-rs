@@ -26,6 +26,23 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 [dev-dependencies]
+criterion = { workspace = true }
 fernet = { workspace = true }
+insta = { workspace = true }
+mockall = { workspace = true }
+pretty_assertions = { workspace = true }
+proptest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+
+# Store owns the login hot path (bcrypt, the atomic auth.json write), the rate
+# limiter, the token prefix cache and the on-disk session/user records, so its
+# benches live here rather than in a top-level directory. `harness = false`
+# hands the target to criterion instead of libtest. See `docs/baseline/`.
+[[bench]]
+name = "auth_hotpath"
+harness = false
+
+[[bench]]
+name = "layout"
+harness = false
