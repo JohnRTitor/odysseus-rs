@@ -44,3 +44,23 @@ jobs:
       # rather than as one FAIL line among the suite.
       - name: Dependency rules
         run: cargo nextest run --profile ci --test dependency_rules
+
+      # T0004. `cargo deny` reads only what a crate *declares* on crates.io, so it
+      # cannot see the licence of a native library linked at build time --
+      # `poppler-rs` declares MIT and links GPL-2.0 libpoppler. This reads the
+      # committed Cargo.lock plus the vendored crate sources and fails closed when
+      # a crate that compiles C is missing from tools/native-deps.toml.
+      #
+      # `cargo fetch --locked` first. The checker reads `build.rs` out of
+      # ~/.cargo/registry/src, which a fresh runner does not have. The check does
+      # NOT pass vacuously in that state -- verified: with an empty registry it
+      # reports every stanza as stale and exits 1 -- but that failure mode is a
+      # confusing "remove these four stanzas" error rather than the real one. The
+      # fetch makes the step report what it is actually about. `--locked` so the
+      # committed Cargo.lock is what gets audited; a silently-updated lockfile
+      # would audit a graph nobody committed.
+      - name: Fetch dependency sources
+        run: cargo fetch --locked
+
+      - name: Native licences
+        run: cargo run --manifest-path tools/check-sys-licenses/Cargo.toml

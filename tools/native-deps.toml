@@ -12,7 +12,7 @@
 # make the answer unavoidable. Any crate that links native code must be listed
 # here with the native licence it actually pulls in.
 #
-# `tools/check-sys-licenses.rs` enforces that, and fails closed: a native-linking
+# `tools/check-sys-licenses/` enforces that, and fails closed: a native-linking
 # crate that is NOT in this file fails the build. That default is the point.
 # Failing open here means shipping a GPL binary that every licence report called
 # clean.
@@ -31,7 +31,7 @@
 
 # --- The real ones: crates in this graph that compile or link native code ---
 #
-# Detected by `tools/check-sys-licenses.rs` from each crate's build script
+# Detected by `tools/check-sys-licenses/` from each crate's build script
 # invoking `cc`, not from the `-sys` name suffix. The suffix is an unreliable
 # proxy: `js-sys`, `linux-raw-sys` and `windows-sys` all match it and none of
 # them compiles any C. Conversely `sqlite-vec` compiles C and does not match it.

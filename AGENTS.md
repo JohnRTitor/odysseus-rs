@@ -312,6 +312,7 @@ outcome than either the dependency or the paper trail.
 cargo fmt -- --config imports_granularity=One,unstable_features=true \
   && cargo clippy --all-targets --all-features -- -D warnings \
   && cargo nextest run --profile ci \
+  && cargo run --manifest-path tools/check-sys-licenses/Cargo.toml \
   && git diff --exit-code
 
 cargo test -p <crate> --test <name>   # single test target
@@ -320,6 +321,29 @@ cargo leptos build --release
 cargo deny check advisories licenses bans && cargo audit
 cargo bench --no-run                  # compile gate
 ```
+
+The `check-sys-licenses` step is **in the gate and in CI**, not one or the other,
+because they catch different failures:
+
+- **In the §13 sequence** so it runs on every machine before every commit. That is
+  where it has the most value: a licence decision is a judgement call, and the
+  moment to make it is while writing the line that adds the dependency, not in a
+  PR review three days later.
+- **In CI** because the gate is only as strong as its least-watched step. §13 is a
+  documented convention; a job in `.github/workflows/ci.yml` is a build failure
+  that nobody can approve around.
+
+`git diff --exit-code` is **not** a substitute. It asserts the working tree is
+clean after `cargo fmt`; it has no opinion about what is in the lockfile. The
+native-licence check reads `Cargo.lock` and the vendored crate sources and answers
+a question no diff can pose — is the licence of the C library this dependency
+links recorded and approved in `tools/native-deps.toml`. That question is exactly
+the one `cargo deny` cannot answer either: it reads only what a crate *declares*
+on crates.io, while the native library's licence lives in a system package or a
+vendored C tree. `poppler-rs` reports MIT and links GPL-2.0 `libpoppler`; see
+`deny.toml`'s closing section. So the sequence is
+`cargo deny` (declared licences) **and** this checker (linked native licences) —
+neither subsumes the other.
 
 ## 14. Workflow
 
