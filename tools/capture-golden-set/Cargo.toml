@@ -1,0 +1,26 @@
+# Not a workspace member. Captures the ChromaDB vector golden set that
+# `DATA_MIGRATION.md` §5.3 requires, from a **live** ChromaDB instance.
+#
+#   cargo run --manifest-path tools/capture-golden-set/Cargo.toml -- \
+#       --chroma http://127.0.0.1:8100 \
+#       --out docs/baseline/vector_golden_set.json
+#
+# Kept out of the workspace for the same reason as `tools/dump-baseline`: this
+# tool's entire value is that it runs once, by hand, against a service that will
+# not exist in CI. It must never become part of the shipped build graph.
+#
+# It is IRREVERSIBLE-input-dependent. The ChromaDB service and its data
+# directory are the only copy of the calibration baseline; once they are gone the
+# golden set cannot be recaptured. See README.md in this directory.
+[package]
+name = "capture-golden-set"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
+ureq = { version = "3", features = ["json"] }
+
+[workspace]

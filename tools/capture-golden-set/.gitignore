@@ -1,0 +1,4 @@
+# Build output for this tool only. The root .gitignore covers /target, which is
+# the workspace target; a non-member crate builds into its own directory, and
+# committing it would add hundreds of MiB of artefacts.
+/target
