@@ -325,6 +325,9 @@ impl Provider {
         if host_matches(url, "moonshot.ai") || host_matches(url, "moonshot.cn") {
             return Provider::Moonshot;
         }
+        if is_chatgpt_subscription_base(url) {
+            return Provider::ChatGptSubscription;
+        }
         if host_matches(url, "cerebras.ai") {
             return Provider::Cerebras;
         }
@@ -333,6 +336,28 @@ impl Provider {
         }
         Provider::OpenAi
     }
+}
+
+/// True for a ChatGPT-subscription base URL.
+///
+/// Ports `is_chatgpt_subscription_base` (`src/chatgpt_subscription.py:64`).
+///
+/// The host test is **exact** (`host == "chatgpt.com"`), not `host_matches` — a
+/// subdomain is not the subscription endpoint, and this is the one place the
+/// Python deliberately narrows rather than widens. The path is either exactly
+/// `/backend-api/codex` or below it.
+///
+/// Positioning matters: this sits between `moonshot` and `cerebras` because that
+/// is where `_detect_provider` puts it. Getting it wrong does not merely reorder a
+/// check — it decides whether a subscription endpoint resolves to
+/// `/backend-api/codex/responses` or is treated as generic OpenAI-compatible, which
+/// is the difference between a working Codex route and a 404.
+#[must_use]
+pub fn is_chatgpt_subscription_base(url: &str) -> bool {
+    let parts = UrlParts::parse(url);
+    let path = parts.path.trim_end_matches('/');
+    parts.host == "chatgpt.com"
+        && (path == "/backend-api/codex" || path.starts_with("/backend-api/codex/"))
 }
 
 impl fmt::Display for Provider {
@@ -1370,25 +1395,32 @@ pub enum Discovery {
 
 /// The URL a provider's model list lives at.
 ///
-/// Ports `build_models_url` (`src/endpoint_resolver.py:286`). The important
-/// behaviour is that a base with **no path** gets `/v1` inserted (issue #25) while
-/// an explicit non-empty path is left alone, so a `/openai` prefix keeps working.
-#[must_use]
-pub fn models_url(base_url: &str, provider: Provider) -> Option<String> {
-    if provider.is_discovery_only() {
-        return None;
-    }
-    let base = base_url.trim().trim_end_matches('/');
-    // Ollama's native surface lists models at /api/tags, not /v1/models.
-    if provider == Provider::Ollama {
-        return Some(format!("{base}/api/tags"));
-    }
-    let parts = UrlParts::parse(base);
-    if parts.path.is_empty() || parts.path == "/" {
-        Some(format!("{base}/v1/models"))
-    } else {
-        Some(format!("{base}/models"))
-    }
+/// **Delegates to [`crate::model_endpoints_resolver::models_url`].** This function
+/// used to hold its own copy of the logic, which is exactly the duplication
+/// `src/endpoint_resolver.py` was written to remove ("Consolidates the 4+ copies of
+/// `normalize_base` / `resolve_endpoint` logic into one place"). Two copies of a
+/// provider-dispatch table drift, and they had already drifted: the copy here
+/// inserted `/v1` for *any* pathless base, while the resolver honours Python's
+/// `V1_MODELS_BY_DEFAULT_HOSTS` allow-list and leaves an unrecognised remote host
+/// at `/models`.
+///
+/// The `provider` argument is retained for source compatibility but **ignored** —
+/// the resolver detects the provider from the URL, which is what
+/// `build_models_url` does. Passing a provider that disagrees with
+/// `Provider::detect(base)` used to be able to produce a URL that contradicted the
+/// base it was given.
+///
+/// # Errors
+///
+/// Propagates [`crate::model_endpoints_resolver::ResolveError`] when the base
+/// carries a query string or fragment. `discover_models` maps that to a validation
+/// failure, since a stored base with a query is a configuration error, not a
+/// transient one.
+pub fn models_url(
+    base_url: &str,
+    _provider: Provider,
+) -> Result<Option<String>, crate::model_endpoints_resolver::ResolveError> {
+    crate::model_endpoints_resolver::models_url(base_url)
 }
 
 /// Auth headers for a probe.
@@ -1430,8 +1462,14 @@ pub fn discover_models(
         ));
     }
     let provider = Provider::detect(base);
-    let Some(url) = models_url(base, provider) else {
-        return Ok(Discovery::Unsupported(provider));
+    let url = match models_url(base, provider) {
+        Ok(Some(url)) => url,
+        Ok(None) => return Ok(Discovery::Unsupported(provider)),
+        Err(_) => {
+            return Err(EndpointError::Validation(
+                "base_url must not include a query string or fragment".into(),
+            ));
+        }
     };
 
     let response = match transport.get(&url, &probe_headers(api_key), timeout) {
@@ -1541,7 +1579,7 @@ pub enum EndpointError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, crate::model_endpoints_resolver::ResolveError};
 
     #[test]
     fn url_parts_splits_the_shapes_provider_detection_needs() {
@@ -1576,21 +1614,58 @@ mod tests {
     }
 
     #[test]
-    fn models_url_inserts_v1_only_for_a_bare_host() {
+    fn models_url_delegates_to_the_resolver() {
+        // Compared against the whole `Result` rather than unwrapped: this asserts
+        // the error case too, and keeps `.expect` out of the crate's `#[cfg(test)]`
+        // code, where `expect_used` is denied.
         assert_eq!(
-            models_url("http://localhost:1234", Provider::OpenAi).as_deref(),
-            Some("http://localhost:1234/v1/models")
-        );
-        assert_eq!(
-            models_url("http://localhost:1234/openai", Provider::OpenAi).as_deref(),
-            Some("http://localhost:1234/openai/models"),
+            models_url("http://192.168.1.50:1234/openai", Provider::OpenAi),
+            Ok(Some("http://192.168.1.50:1234/openai/models".to_owned())),
             "an explicit path must keep its semantics"
         );
         assert_eq!(
-            models_url("http://localhost:11434", Provider::Ollama).as_deref(),
-            Some("http://localhost:11434/api/tags")
+            models_url("http://192.168.1.50:1234", Provider::OpenAi),
+            Ok(Some("http://192.168.1.50:1234/models".to_owned()))
         );
-        assert_eq!(models_url("http://x", Provider::ChatGptSubscription), None);
+        assert_eq!(
+            models_url("http://localhost:11434", Provider::Ollama),
+            Ok(Some("http://localhost:11434/api/tags".to_owned()))
+        );
+        assert_eq!(
+            models_url("https://chatgpt.com/backend-api/codex", Provider::OpenAi),
+            Ok(None),
+            "the provider argument is ignored; the URL decides"
+        );
+    }
+
+    /// A pathless base only gains `/v1` for a host on the resolver's allow-list.
+    ///
+    /// This corrects a T0303 assertion that claimed a LAN IP gets `/v1`. Python's
+    /// `build_models_url` gates on `is_local = {localhost, 127.0.0.1, ::1,
+    /// host.docker.internal}` plus `api.deepseek.com`/`api.openai.com`, and comments
+    /// the reason: "For non-local unknown hosts, do not invent `/v1`; append
+    /// `/models` to the caller's base so look-alike provider hosts stay generic."
+    ///
+    /// Worth raising upstream: LM Studio's default port is 1234 and it serves
+    /// `/v1/models`, so a LAN LM Studio configured without a path is probed at
+    /// `/models` and will 404. Ported as-is because the Python is the specification,
+    /// but it looks like an oversight in the allow-list rather than a decision.
+    #[test]
+    fn a_pathless_lan_base_does_not_get_v1_invented() {
+        assert_eq!(
+            models_url("http://192.168.1.50:1234", Provider::OpenAi),
+            Ok(Some("http://192.168.1.50:1234/models".to_owned()))
+        );
+        // ...while an allow-listed pathless remote host does.
+        assert_eq!(
+            models_url("https://api.openai.com", Provider::OpenAi),
+            Ok(Some("https://api.openai.com/v1/models".to_owned()))
+        );
+        // And a query string is rejected rather than mangled.
+        assert_eq!(
+            models_url("http://h/v1?key=secret", Provider::OpenAi),
+            Err(ResolveError::QueryOrFragment)
+        );
     }
 
     #[test]

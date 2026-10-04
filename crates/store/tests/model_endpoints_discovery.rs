@@ -9,8 +9,8 @@
 use std::{cell::RefCell, collections::BTreeMap, time::Duration};
 
 use odysseus_store::model_endpoints::{
-    Discovery, ModelTransport, ProbeResponse, Provider, TransportError, discover_models,
-    models_url, probe_headers,
+    Discovery, EndpointError, ModelTransport, ProbeResponse, Provider, TransportError,
+    discover_models, models_url, probe_headers,
 };
 
 /// A transport that records what it was asked and replies from a script.
@@ -167,14 +167,37 @@ fn the_api_key_is_sent_as_a_bearer_header_and_only_when_present() {
 /// the real detection needs those two helpers ported.
 #[test]
 fn a_provider_with_no_model_list_is_reported_as_unsupported_not_as_empty() {
-    assert_eq!(models_url("http://x", Provider::ChatGptSubscription), None);
+    // The provider argument is ignored — the URL decides — so an unknown host
+    // falls through to OpenAI and does get a model-list URL.
+    assert_eq!(
+        models_url("http://x", Provider::ChatGptSubscription)
+            .expect("valid base")
+            .as_deref(),
+        Some("http://x/models")
+    );
+    // The subscription base itself has none.
+    assert_eq!(
+        models_url("https://chatgpt.com/backend-api/codex", Provider::OpenAi).expect("valid base"),
+        None
+    );
     assert!(Provider::ChatGptSubscription.is_discovery_only());
 
-    // Until the detection helper is ported, such a base is classified OpenAI and
-    // therefore probed. Pinning today's behaviour makes the gap visible in the
-    // diff that eventually closes it.
+    // T0303 left this as a documented gap: the subscription base was classified
+    // OpenAI and therefore probed. T0306 ports `is_chatgpt_subscription_base`, so
+    // the base is now recognised and reported unsupported rather than probed at a
+    // URL that does not exist. The gap-assertion below is what changed.
     assert_eq!(
         Provider::detect("https://chatgpt.com/backend-api/codex"),
+        Provider::ChatGptSubscription
+    );
+    // The host test is exact, not a subdomain match.
+    assert_eq!(
+        Provider::detect("https://api.chatgpt.com/backend-api/codex"),
+        Provider::OpenAi
+    );
+    // A path that is merely below codex is not a subscription base.
+    assert_eq!(
+        Provider::detect("https://chatgpt.com/backend-api/other"),
         Provider::OpenAi
     );
 }
@@ -273,22 +296,59 @@ fn a_blank_base_url_is_rejected_before_any_transport_work() {
 #[test]
 fn the_probe_url_respects_an_explicit_path_prefix() {
     // issue #25: a bare host needs /v1 inserted, an explicit path must not be.
+    //
+    // This also corrects a T0303 expectation: it asserted `/v1/models` for the LAN
+    // IP below, but Python's allow-list for `/v1` insertion is
+    // {localhost, 127.0.0.1, ::1, host.docker.internal, api.deepseek.com,
+    // api.openai.com}. An unrecognised remote host gets `/models` appended to its
+    // base instead, deliberately, "so look-alike provider hosts stay generic".
     assert_eq!(
-        models_url("http://192.168.1.50:1234", Provider::OpenAi).as_deref(),
-        Some("http://192.168.1.50:1234/v1/models")
+        models_url("http://192.168.1.50:1234", Provider::OpenAi)
+            .expect("valid base")
+            .as_deref(),
+        Some("http://192.168.1.50:1234/models")
     );
     assert_eq!(
-        models_url("http://192.168.1.50:1234/openai/v1", Provider::OpenAi).as_deref(),
+        models_url("http://192.168.1.50:1234/openai/v1", Provider::OpenAi)
+            .expect("valid base")
+            .as_deref(),
         Some("http://192.168.1.50:1234/openai/v1/models")
     );
     assert_eq!(
-        models_url("http://192.168.1.50:1234/", Provider::OpenAi).as_deref(),
-        Some("http://192.168.1.50:1234/v1/models"),
-        "a trailing slash is still a bare host"
+        models_url("http://192.168.1.50:1234/", Provider::OpenAi)
+            .expect("valid base")
+            .as_deref(),
+        Some("http://192.168.1.50:1234/models"),
+        "a trailing slash is still a pathless host"
+    );
+    // An allow-listed pathless host does get the /v1 segment.
+    assert_eq!(
+        models_url("https://api.openai.com", Provider::OpenAi)
+            .expect("valid base")
+            .as_deref(),
+        Some("https://api.openai.com/v1/models")
     );
     assert_eq!(
-        models_url("https://api.anthropic.com", Provider::Anthropic).as_deref(),
+        models_url("https://api.anthropic.com", Provider::Anthropic)
+            .expect("valid base")
+            .as_deref(),
         Some("https://api.anthropic.com/v1/models")
+    );
+}
+
+/// A base carrying a query string is a configuration error, not a probe to attempt.
+#[test]
+fn a_base_with_a_query_is_a_validation_error_not_a_probe() {
+    let err = discover_models(
+        &FakeTransport::new(Vec::new()),
+        "http://192.168.1.50:1234/v1?key=secret",
+        None,
+        Duration::from_millis(10),
+    )
+    .expect_err("a query must be rejected");
+    assert!(
+        matches!(err, EndpointError::Validation(_)),
+        "expected a validation error, got {err:?}"
     );
 }
 
