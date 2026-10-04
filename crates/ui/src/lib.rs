@@ -6,3 +6,7 @@
 //! Violating this is an architectural defect, not a style preference.
 
 #![deny(missing_docs)]
+
+pub mod theme;
+
+pub use theme::{SyntaxVars, THEMES, Theme, syntax_vars, theme};

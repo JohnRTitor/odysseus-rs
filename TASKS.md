@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 52 / 489 complete · Phase 0 in progress
+**Status:** 53 / 489 complete · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — **11 of 11 resolved** (S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11); 0 pending. Of those, **2 features were removed** (F169 remove-bg, S5 FAIL as published; F176 local diffusion, S9 scope decision) and **2 remain blocked or unverified**: F140 PDF rasterisation is licence-blocked (`mupdf` is AGPL-3.0, not on `deny.toml`; `poppler-rs` links GPL-2.0 libpoppler while reporting MIT), and S6 CUDA is unverified for want of a GPU.
 
@@ -126,7 +126,7 @@ is written.**
 - [ ] T0101 `<Routes/>` + shell route; `leptos_axum` handler
 - [ ] T0102 `leptos_meta` for title / favicon / `theme-color`, per-route
 - [ ] T0103 **Pre-paint theme script** — sets CSS vars from `localStorage` before first paint. **Non-negotiable**
-- [ ] T0104 Theme HSL derivation → the 11 `--hl-*` syntax vars (port `index.html:39-59` exactly)
+- [x] T0104 Theme HSL derivation → the 11 `--hl-*` syntax vars (port `index.html:39-59` exactly) — **done in Rust** (`crates/ui/src/theme.rs`, 13 tests). **Ten** `--hl-*` vars, not eleven as the task says. Palette generated from `theme.js`, not hand-typed: my first draft had `forest.bg` as `#1b1a1b` instead of `#1b2a1b` and was missing `gpt` and `cute`
 - [ ] T0105 Loader overlay + boot sequencing
 - [ ] T0106 PWA manifest + rewritten service worker
 - [ ] T0107 **TEST: SSR renders; no FOUC (CSS vars set before first paint)**
