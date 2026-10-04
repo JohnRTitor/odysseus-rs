@@ -214,50 +214,44 @@ redistributed **model weights**. Not a blocker here, but any future spike that v
 weights needs one.
 
 
-## S3 — SAM ONNX export — ✅ **PREMISE CONFIRMED / SCOPE-CHANGE**
+## S4 — `any-tts` Kokoro backend — ✅ **YES, and `kokoroxide` is moot**
 
-**The claim in `INCOMPLETE.md` is correct, and it is sharper than it looked.** Upstream
-exports the prompt encoder and mask decoder only. The ViT image encoder is not in the
-graph, so the export alone cannot run SAM.
-
-Verified in source, not from the README:
+`any-tts` 0.1.3 provides Kokoro as a **default feature**, not as an example.
 
 | Evidence | Finding |
 |---|---|
-| `segment_anything/utils/onnx.py` | `grep -c image_encoder` → **1**. The single occurrence is `model.image_encoder.img_size` (line 35), which reads a config attribute. The encoder is **never called**. |
-| `SamOnnxModel::forward` (`onnx.py:108-116`) | First parameter is `image_embeddings: torch.Tensor` — an **input**. |
-| `scripts/export_onnx_model.py:130-137` | `dummy_inputs["image_embeddings"] = torch.randn(1, embed_dim, *embed_size)`. The exporter feeds embeddings in. |
-| `torch.onnx.export` | Traces only what `forward` executes, so the ViT is pruned from the graph. |
-| Script docstring | "Export the SAM prompt encoder and mask decoder to an ONNX model" — accurate. |
+| `src/lib.rs:23` | `kokoro` — "Build Kokoro model support (**default**)" |
+| `src/lib.rs:84-86` | `#[cfg(feature = "kokoro")]` → `models::kokoro::KokoroModel::load(config)` |
+| `src/models/kokoro/` | 11 modules, a full implementation: `albert.rs` (PL-BERT text encoder), `decoder.rs` (ISTFTNet), `phonemizer.rs` + `english_g2p.rs` + `espeak_compat.rs`, `style_encoder.rs`, `prosody.rs`, `text_encoder.rs` |
+| `examples/generate_kokoro.rs` | 19 sample utterances across en / en-gb |
 
-### What the encoder pass needs, precisely
+**Answer to the spike question: yes.** `kokoroxide` 0.1.5 (explicitly WIP, 7 stars) is
+moot and should not be evaluated further.
 
-The missing graph is small and its contract is fixed. For `vit_b`
-(`build_sam.py:37-43`: `embed_dim=768, depth=12, num_heads=12,
-global_attn_indexes=[2,5,8,11]`; `image_encoder.py:20-27`: `img_size=1024,
-patch_size=16, out_chans=256`):
+### Two things the README does not tell you
 
-| | |
-|---|---|
-| Input | `[1, 3, 1024, 1024]` f32 |
-| Output | `[1, 256, 64, 64]` f32 |
-| Matches the decoder's input | `embed_dim = 256` (`MASK_EMBED_DIM`) and `embed_size = (64, 64)` — i.e. `[1, 256, 64, 64]`, so the two graphs compose |
-
-Producing it is a ~15-line wrapper around `sam.image_encoder` and one
-`torch.onnx.export` call. **This was not done here: there is no Python interpreter and
-no PyTorch on this host, and the ViT-B checkpoint is 93.7 M parameters (~375 MB fp32).**
-So the encoder pass remains **unmeasured** — no timing is claimed.
+1. **It is `candle`, not `ort`.** `candle-core`/`candle-nn`/`candle-transformers` 0.10.2.
+   AGENTS.md assigns `ort`/`ort-sys` exclusively to `odysseus-ml`; this would add a
+   **second ML runtime** to the workspace. That is a deliberate decision, not a detail.
+2. **The voice assets are not obtainable in the shape it wants.** `model.rs:397-403`
+   loads `voices/{name}.pt` — a PyTorch bare tensor per voice. The canonical
+   `hexgrad/Kokoro-82M` repo publishes `kokoro-v1_0.pth` with the voices packed inside,
+   and the split-voice repos (`onnx-community/Kokoro-82M-v1.0-ONNX`) publish
+   `voices/*.bin`, not `.pt`. So materialising the voice files needs a one-time
+   PyTorch extraction step, even though the runtime is pure Rust.
 
 | Item | Finding |
 |---|---|
-| Weights | `facebook/sam-vit-base`, **Apache-2.0**, 93.7 M params |
-| Runtime | `ort` 2.0.0-rc.13 (already pinned by S1/S2) — no new runtime |
-| Verdict | Premise confirmed. Upstream artefact missing but trivially producible |
+| Version | **0.1.3** (matches the 0.1.3 in the maturity table) |
+| Licence | **MIT OR Apache-2.0** — already allowed by `deny.toml` |
+| Weights | `hexgrad/Kokoro-82M`, **Apache-2.0** |
+| Transitive deps | **357** (the candle stack dominates) |
 
-**Recommendation:** keep F168, scope it as *two* graphs plus the pre/post
-(resize-longest-side-to-1024, pad, normalise) wrapper, and drop the assumption that an
-upstream artefact exists. Do not remove the feature: the work is bounded and
-well-understood. Requires a host with PyTorch for the export step, once.
+**Not run.** Weights were not fetched, so **no audio was synthesised and no quality or
+latency figure is claimed.** One incidental finding: `KokoroModel::load` returned `Ok`
+against an **empty** model directory, so it does not validate assets at load time —
+a misconfigured model path surfaces later, at synthesis. Worth a startup probe in
+Phase 22 rather than trusting `load`.
 
 
 ---
