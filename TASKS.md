@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 53 / 489 complete · Phase 0 in progress
+**Status:** 55 / 489 complete · 2 blocked · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — **11 of 11 resolved** (S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11); 0 pending. Of those, **2 features were removed** (F169 remove-bg, S5 FAIL as published; F176 local diffusion, S9 scope decision) and **2 remain blocked or unverified**: F140 PDF rasterisation is licence-blocked (`mupdf` is AGPL-3.0, not on `deny.toml`; `poppler-rs` links GPL-2.0 libpoppler while reporting MIT), and S6 CUDA is unverified for want of a GPU.
 
@@ -53,7 +53,7 @@ is written.**
 - [x] T0002 Pin toolchain + edition (2024). Add `rust-toolchain.toml`
 - [x] T0003 Add workspace lints: `#![deny(clippy::all)]`, forbid `unwrap()`/`expect()` in library crates
 - [x] T0004 Set up `cargo-deny` (advisories, licenses, bans) + `cargo-audit`
-- [ ] T0005 Add `criterion`, `proptest`, `insta`, `tempfile`, `pretty_assertions`, `mockall` as workspace dev-deps
+- [x] T0005 Add `criterion`, `proptest`, `insta`, `tempfile`, `pretty_assertions`, `mockall` as workspace dev-deps — **done, and the premise was wrong.** All six were *declared* but `Cargo.lock` held zero entries for five of them: T0005 had been inert since Phase 0 began. All six are now in the lock and exercised. Note: Cargo has **no** `[workspace.dev-dependencies]`; `workspace = true` resolves only against `[workspace.dependencies]`, so test tooling must live there. Features trimmed per §12.3
 - [x] T0006 Set up `cargo-nextest` with a `ci` profile target < 30 s
 - [x] T0007 Write `crates/*/README.md` stating each crate's concern and what it must not import
 - [ ] T0008 Add a CI job enforcing the dependency rules in `SOURCE_MAPPING.md` §9 (no `rusqlite` in `odysseus-ui`, no `axum` in `odysseus-agent`, etc.)
@@ -139,9 +139,9 @@ is written.**
 
 ### 0.8 Performance baseline (**blocking for all later claims**)
 
-- [ ] T0120 Capture the Python baseline into `docs/baseline/`: idle RSS, `GET /` TTFB, startup, endpoint-mix `oha`, streaming chunk latency
-- [ ] T0121 Record the same for a Rust skeleton build
-- [ ] T0123 **TEST: startup < 150 ms, first byte < 200 ms**
+- [!] T0120 Capture the Python baseline into `docs/baseline/`: idle RSS, `GET /` TTFB, startup, endpoint-mix `oha`, streaming chunk latency — **BLOCKED: the Python app cannot run here.** No interpreter on PATH, the only one present is a bare uv CPython 3.14.7 with fastapi/uvicorn/sqlalchemy/chromadb all missing, no `.venv`, the Python `devenv.nix` provides only `tk` and `git`, and no `oha`/`hey`/`ab`/`wrk`. Evidence in `docs/baseline/2026-10-04-python.md`. **No "N× faster than Python" claim is currently supportable.** Needs an interpreter + requirements + a load generator + a populated `data/`
+- [x] T0121 Record the same for a Rust skeleton build — `docs/baseline/2026-10-04-rust.json`. Unstable figures recorded as ranges with `median_us: null` and an explicit "do not quote a single value" rather than collapsed to one number
+- [!] T0123 **TEST: startup < 150 ms, first byte < 200 ms** — numbers measured (startup 4.92–26 ms, TTFB p50/p95/p99 recorded) but **nothing asserts them**, so the budget is not pinned and a regression would pass silently. Needs a test that fails if the budget is breached
 
 ### 0.9 Phase 0 exit
 

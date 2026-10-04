@@ -272,7 +272,7 @@ mod permission_tests {
     //! test silently vacuous again the moment that setting changes.
 
     use {
-        super::{Store, default_data_dir},
+        super::Store,
         std::{
             os::unix::fs::PermissionsExt as _,
             path::{Path, PathBuf},
