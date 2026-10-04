@@ -1,0 +1,26 @@
+# Not a workspace member. Fails the build when a crate that compiles or links
+# native C/C++ is present without its native library's licence being recorded in
+# `tools/native-deps.toml`.
+#
+#   cargo run --manifest-path tools/check-sys-licenses/Cargo.toml
+#
+# Kept out of the workspace so this build-time audit tool never becomes part of
+# the shipped binary's dependency graph -- the same reason `tools/dump-baseline`
+# is separate. It also means it needs no dependency on anything we ship: the whole
+# point is to check the graph before cargo-deny does, so it must not be able to
+# perturb what it audits.
+#
+# Zero dependencies on purpose. It reads `Cargo.lock` and the vendored crate
+# sources directly, so an advisory against this tool cannot take the licence gate
+# down with it.
+[package]
+name = "check-sys-licenses"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "check-sys-licenses"
+path = "src/main.rs"

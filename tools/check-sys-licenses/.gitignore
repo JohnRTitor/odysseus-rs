@@ -1,0 +1,8 @@
+# Build output for this standalone tool. The workspace .gitignore covers
+# `/target` at the root only, and this crate is deliberately not a workspace
+# member, so its target directory needs ignoring here.
+/target
+
+# Cargo.lock IS committed for this crate: it is a binary, not a library, and
+# zero-dependency tools should still build reproducibly. The root lockfile is
+# a separate file and is unaffected.

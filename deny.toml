@@ -176,3 +176,38 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # crates.io itself is allowed above. Local path dependencies are always
 # permitted by cargo-deny's model, which is what lets the 12 workspace crates
 # resolve at all.
+
+# ===========================================================================
+# What this file cannot check
+# ===========================================================================
+#
+# Everything above reads the licence a crate *declares*. That number says nothing
+# about the licence of a native library the crate links at build time, because
+# that fact is not in the Rust dependency graph -- it is in a system package or a
+# vendored C tree.
+#
+# `poppler-rs` is the worked example, and it is why this note exists:
+#
+#   * crates.io reports **MIT** for `poppler-rs`.
+#   * It depends on `poppler-sys-rs`, a gir binding to the **system**
+#     `libpoppler` (`Gir.toml`: `library = "Poppler"`).
+#   * `libpoppler` is **GPL-2.0-or-later**.
+#
+# `cargo deny check licenses` passes on that graph. So does `cargo audit`. There
+# is no configuration of this file that could catch it, because the information
+# required is not present in anything cargo-deny reads. A global `deny` entry for
+# `poppler-sys-rs` would only ever catch that one crate by name; it would not
+# catch the next one, and cargo-deny has no per-dependent-crate scoping with which
+# to say "deny this crate *when it appears under that one*".
+#
+# The gap is closed outside this file, by:
+#
+#   tools/native-deps.toml          the approved list, with each native licence
+#                                    recorded and justified
+#   tools/check-sys-licenses/       the checker that fails closed on anything
+#                                    that compiles native code and is not listed
+#
+# `cargo deny check licenses` must be run *together with* that checker. Passing
+# the first is not evidence about native code, and this file's absence of a
+# `[[licenses.exceptions]]` entry for a given crate must not be read as approval
+# of anything behind it.

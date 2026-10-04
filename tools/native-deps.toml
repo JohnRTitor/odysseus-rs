@@ -1,0 +1,98 @@
+# Approved native (C/C++) dependencies.
+#
+# `deny.toml` checks what a crate *declares* on crates.io. It cannot see the
+# licence of a native library a crate links at build time, because that fact
+# appears nowhere in the Rust dependency graph -- it lives in the system package
+# or in a vendored C tree. `poppler-rs` is the worked example: crates.io reports
+# MIT, and it depends on `poppler-sys-rs`, which binds the system `libpoppler`,
+# which is GPL-2.0-or-later. Both `cargo deny` and `cargo audit` pass on that
+# graph. Nothing in the metadata can distinguish it from a clean tree.
+#
+# So this file is the **only** place that question is answered, and it exists to
+# make the answer unavoidable. Any crate that links native code must be listed
+# here with the native licence it actually pulls in.
+#
+# `tools/check-sys-licenses.rs` enforces that, and fails closed: a native-linking
+# crate that is NOT in this file fails the build. That default is the point.
+# Failing open here means shipping a GPL binary that every licence report called
+# clean.
+#
+# Format — one stanza per crate, blank-line separated:
+#
+#   crate = "name"          exact crate name, as it appears in Cargo.lock
+#   links = "what it links" the native library, and whether it is vendored
+#   license = "SPDX"        the licence of THAT LIBRARY, not of the Rust crate
+#   note = "..."            why this is acceptable; required, no default
+#
+# `license` is deliberately about the native library. For every entry below it
+# happens to equal the Rust crate's own licence, which is the good case: the
+# binding adds nothing. The whole point of the file is that when they DIVERGE,
+# this line is where the stricter truth is recorded.
+
+# --- The real ones: crates in this graph that compile or link native code ---
+#
+# Detected by `tools/check-sys-licenses.rs` from each crate's build script
+# invoking `cc`, not from the `-sys` name suffix. The suffix is an unreliable
+# proxy: `js-sys`, `linux-raw-sys` and `windows-sys` all match it and none of
+# them compiles any C. Conversely `sqlite-vec` compiles C and does not match it.
+# That is why this file is keyed on evidence rather than on a name pattern.
+#
+# Every entry below was found by that detection, not chosen by name.
+
+[libsqlite3-sys]
+links = "SQLite, vendored (the `bundled` feature compiles sqlite3.c from the crate)"
+license = "blessing"
+note = """\
+SQLite is public domain. `sqlite3.h` states it in the author's own words: "The\
+ author disclaims copyright to this source code. In place of a legal notice,\
+ here is a blessing: May you do good and not evil." Not an SPDX identifier, so\
+ it is recorded as the blessing it is rather than forced into a neighbouring\
+ identifier. `LICENSE-MIT` on the Rust crate is a separate and compatible grant.\
+ Permissive, no reciprocity, nothing to comply with beyond attribution."""
+
+[sqlite-vec]
+links = "sqlite-vec, vendored (build.rs compiles sqlite-vec.c, a loadable SQLite extension)"
+license = "MIT OR Apache-2.0"
+note = """\
+Upstream `asg017/sqlite-vec` ships LICENSE-MIT and LICENSE-APACHE and the\
+ repository is tagged "Apache-2.0 license, MIT license". The vendored C is\
+ covered by the same grant as the Rust binding -- verified against the upstream\
+ repository, not just the crates.io `license = "MIT/Apache-2.0"` field, because\
+ that field is exactly the thing this file exists to distrust. The extension\
+ loads into SQLite as a dynamically-loaded module, so it is linked into the\
+ shipped binary only when the feature is enabled. Permissive."""
+
+[sqlite-wasm-rs]
+links = "SQLite, compiled to wasm32 (a build-script `cc::Build` targeting wasm32-unknown-unknown)"
+license = "blessing"
+note = """\
+Same public-domain SQLite as `libsqlite3-sys`, reached through the wasm\
+ dependency chain. Recorded separately because it is a distinct crate reaching\
+ the same C library by a different route, and because a future dependency bump\
+ could change what it compiles. Permissive."""
+
+[alloca]
+links = "none — alloca.c is a self-contained shim (a VLA wrapper, plus _alloca under MSVC). No external native library."
+license = "MIT"
+note = """\
+Found by the checker's evidence-based detection rather than by name, which is the\
+ only reason it is recorded at all -- `alloca` has no `-sys` suffix. The vendored C\
+ is its own; it does not bind any system library, so there is no second licence\
+ to reconcile. `LICENSE` in the crate is MIT (Copyright (c) 2021 Adel Prokurov)\
+ and the Rust crate declares the same, so the two agree.\
+ Reached only through `criterion`, which is a **dev-dependency**, so this code is\
+ never linked into the shipped binary -- recorded anyway because the check reports\
+ the whole lockfile rather than only what `cargo build --release` would pull in, and\
+ because a dev-dependency can become a real one without anyone noticing the change.\
+ Permissive."""
+
+# --- Deliberately absent ---
+#
+# `poppler-rs` — crates.io says MIT, links system libpoppler, which is
+# GPL-2.0-or-later. Refused (SPIKE_RESULTS.md S10, F140). If it is ever added,
+# it must be added here first, with the GPL licence recorded, so the addition
+# fails rather than passing silently.
+#
+# `js-sys`, `linux-raw-sys`, `windows-sys` — match the `-sys` suffix but
+# compile no C. Nothing to record. If a future version starts shelling out to a
+# C toolchain, the checker finds it via the build script and it must come here.
