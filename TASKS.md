@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 36 / 489 complete · Phase 0 in progress
+**Status:** 43 / 489 complete · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — **4 of 11 resolved** (S1, S2, S5, S7); 7 pending.
 
@@ -108,14 +108,14 @@ is written.**
 - [x] T0084 `CompressionLayer` that **does not compress `text/event-stream`**
 - [x] T0085 `TimeoutLayer` — 45 s + the **10 exempt prefixes**. Found+fixed a Python bug: `/api/chat` matched `/api/chatgpt-subscription/*`
 - [x] T0086 Slow-request log (0.75 s threshold)
-- [ ] T0087 `AuthLayer` implementing the **exact 7-step gate order** (`API_MIGRATION.md` §2.1)
-- [ ] T0088 `_is_trusted_loopback` — reject any of the 7 proxy-forwarded headers
-- [ ] T0089 Internal-tool header + `compare_digest` + optional `X-Odysseus-Owner` impersonation
-- [ ] T0090 Exempt paths: 10 exact + `/static` prefix + the task-webhook regex `^/api/tasks/[^/]+/webhook/[^/]+/?$`
-- [ ] T0091 Identity helpers: `raw_user` / `effective_user` / `is_delegated` / `require_user` / `require_owner` / `require_privilege` / `require_admin` / `require_api_token_scope`
-- [ ] T0092 **TEST: bearer token resolves `effective_user` correctly (never the `"api"` pseudo-user for ownership)** — port of `test_email_owner_scope.py`
-- [ ] T0093 **TEST: CORS preflight reaches CORS, not the auth gate** — `test_cors_preflight.py`
-- [ ] T0094 **TEST: tunnel/proxy headers defeat loopback trust** — `test_cors_preflight.py` sibling
+- [x] T0087 `AuthLayer` implementing the **exact 7-step gate order** (`API_MIGRATION.md` §2.1)
+- [x] T0088 `_is_trusted_loopback` — reject any of the 7 proxy-forwarded headers
+- [x] T0089 Internal-tool header + `compare_digest` + optional `X-Odysseus-Owner` impersonation
+- [x] T0090 Exempt paths: **11** exact (the task said 10; `app.py:264-276` has eight `/api/auth/*` plus `/api/health`, `/api/version` and `/login`) + `/static` prefix + the task-webhook regex `^/api/tasks/[^/]+/webhook/[^/]+/?$`
+- [ ] T0091 Identity helpers — **8 of 9 done.** `raw_user` / `effective_user` / `is_delegated` / `require_user` / `require_privilege` / `require_admin` / `require_api_token_scope` all land in `crates/web/src/identity.rs`. Missing `require_owner`, blocked on Phase 15: `email_helpers.require_owner` is `require_user` plus an `email_accounts` lookup that **404s** on an owner mismatch, and that table does not exist yet. Porting only the auth half would be a `require_user` under a misleading name that silently skips the ownership assertion — worse than not having itn_scope`
+- [x] T0092 **TEST: bearer token resolves `effective_user` correctly (never the `"api"` pseudo-user for ownership)** — port of `test_email_owner_scope.py`
+- [x] T0093 **TEST: CORS preflight reaches CORS, not the auth gate** — `test_cors_preflight.py`
+- [x] T0094 **TEST: tunnel/proxy headers defeat loopback trust** — `test_cors_preflight.py` sibling
 
 ### 0.6 Leptos shell
 

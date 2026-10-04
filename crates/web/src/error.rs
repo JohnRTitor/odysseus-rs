@@ -83,6 +83,15 @@ pub enum AppError {
     /// A storage-layer failure.
     #[error(transparent)]
     Store(#[from] odysseus_store::StoreError),
+
+    /// An `auth.json` / `sessions.json` failure.
+    ///
+    /// Kept distinct from [`AppError::Store`] because these sidecars are the
+    /// credential store: a caller must be able to tell "the database is
+    /// unavailable" from "the credentials are unreadable", and both must fail
+    /// closed rather than degrade to an unauthenticated state.
+    #[error(transparent)]
+    Auth(#[from] odysseus_store::auth::AuthError),
 }
 
 impl AppError {
@@ -103,7 +112,10 @@ impl AppError {
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
             Self::Status { status, .. } => *status,
-            Self::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            // Credential-store failures are 500, never 401: a 401 would tell the
+            // client its credentials were wrong, sending it to /login when the
+            // real problem is that the server cannot read auth.json.
+            Self::Store(_) | Self::Auth(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -122,7 +134,7 @@ impl AppError {
             Self::Unavailable(_) => "Unavailable",
             Self::Timeout => "Timeout",
             Self::Status { .. } => "Error",
-            Self::Store(_) => "Internal error",
+            Self::Store(_) | Self::Auth(_) => "Internal error",
         }
     }
 }

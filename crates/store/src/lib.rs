@@ -55,6 +55,19 @@ pub enum StoreError {
     /// Encryption or decryption failed.
     #[error("crypto error: {0}")]
     Crypto(#[from] crate::crypto::CryptoError),
+
+    /// `auth.json` could not be read while resolving token ownership.
+    ///
+    /// Distinct from [`StoreError::Io`] because the failure is in a JSON sidecar
+    /// rather than the database, and because the caller must treat it as
+    /// *fail closed* — never as "no owners exist", which would revoke every
+    /// token (`AGENTS.md` §6).
+    #[error("auth.json error: {0}")]
+    Auth(String),
+
+    /// A path could not be used because it is malformed for the operation.
+    #[error("invalid path: {0}")]
+    Path(String),
 }
 
 /// Convenience alias.
@@ -92,6 +105,30 @@ impl Store {
     #[must_use]
     pub fn open_default() -> Self {
         Self::open(default_data_dir().join("app.db"))
+    }
+
+    /// The directory holding the database.
+    ///
+    /// [`crate::auth::AuthStore`] keeps `auth.json` and `sessions.json` beside
+    /// the DB rather than in it, so it needs this to find the same directory. A
+    /// bare filename with no parent yields an empty path, which would place the
+    /// sidecars in the process CWD — so the parent is required to exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the database path has no parent directory.
+    pub fn data_dir(&self) -> Result<PathBuf> {
+        self.path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(
+                || {
+                    Err(StoreError::Path(
+                        "database path has no parent directory".into(),
+                    ))
+                },
+                |parent| Ok(parent.to_path_buf()),
+            )
     }
 
     /// The on-disk path.

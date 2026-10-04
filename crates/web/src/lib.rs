@@ -28,10 +28,12 @@
 
 pub mod app;
 pub mod error;
+pub mod identity;
 pub mod middleware;
 pub mod routes;
 
 pub use {
-    app::{AppState, router},
+    app::{AppState, router, router_without_auth, secured},
     error::{AppError, AppResult},
+    identity::{AuthContext, BypassConfig},
 };

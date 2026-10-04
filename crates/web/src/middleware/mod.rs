@@ -14,6 +14,7 @@ use {
     },
 };
 
+pub mod auth;
 pub mod security;
 pub mod slow_log;
 pub mod timeout;

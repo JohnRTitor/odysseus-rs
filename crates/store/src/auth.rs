@@ -776,6 +776,22 @@ impl AuthStore {
         Ok(!self.load_auth()?.users.is_empty())
     }
 
+    /// Every username that currently exists, lowercased.
+    ///
+    /// This is the input [`crate::api_tokens::OwnerResolver`] needs, and it is
+    /// the reason an API token whose owner has been deleted stops working: the
+    /// prefix cache is rebuilt against this set, so the stale row is dropped
+    /// rather than left matching nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError`] if `auth.json` cannot be read. Callers must not
+    /// turn a failure into an empty set — an empty set would silently revoke
+    /// every token, and the Python original propagates the error and 401s.
+    pub fn known_owners(&self) -> Result<std::collections::BTreeSet<String>, AuthError> {
+        Ok(self.load_auth()?.users.into_keys().collect())
+    }
+
     /// Hashes a password for storage.
     ///
     /// # Errors
@@ -1877,6 +1893,33 @@ impl AuthStore {
             path: self.sessions_path.display().to_string(),
             source,
         })
+    }
+}
+
+/// Adapts [`AuthStore`] to the [`OwnerResolver`] the API-token cache needs.
+///
+/// This is the join between the two halves of authentication that Python keeps
+/// implicit by passing `auth_manager` around: a token row is only usable while
+/// its `owner` names an account that still exists in `auth.json`.
+#[derive(Debug, Clone)]
+pub struct AuthOwners(AuthStore);
+
+impl AuthOwners {
+    /// Wraps an auth store.
+    #[must_use]
+    pub fn new(auth: AuthStore) -> Self {
+        Self(auth)
+    }
+}
+
+impl crate::api_tokens::OwnerResolver for AuthOwners {
+    fn known_owners(&self) -> Result<std::collections::BTreeSet<String>, crate::StoreError> {
+        // An unreadable auth.json must NOT become an empty set: that would look
+        // like "every owner was deleted" and revoke all tokens, whereas Python
+        // propagates the error and 401s the request.
+        self.0
+            .known_owners()
+            .map_err(|e| crate::StoreError::Auth(e.to_string()))
     }
 }
 
