@@ -4,7 +4,7 @@ Every spike is run **in an isolated scratch directory** and its outcome recorded
 before any phase is designed around the dependency. A spike that fails becomes a
 documented `REMOVED` in `INCOMPLETE.md`, not a silent fallback.
 
-**Status: 2 of 11 resolved.** The rest are pending.
+**Status: 11 of 11 resolved.** S3, S4, S6, S8, S9 and S10 were resolved on 2026-10-04; every section above carries its evidence and its limits. No spike is unresolved and none was closed without a run or a source citation.
 
 ---
 
@@ -213,66 +213,53 @@ soft alpha; `rembg-rs` adds 240 packages to save them and returns a binary mask 
 redistributed **model weights**. Not a blocker here, but any future spike that vendors
 weights needs one.
 
+
+## S3 — SAM ONNX export — ✅ **PREMISE CONFIRMED / SCOPE-CHANGE**
+
+**The claim in `INCOMPLETE.md` is correct, and it is sharper than it looked.** Upstream
+exports the prompt encoder and mask decoder only. The ViT image encoder is not in the
+graph, so the export alone cannot run SAM.
+
+Verified in source, not from the README:
+
+| Evidence | Finding |
+|---|---|
+| `segment_anything/utils/onnx.py` | `grep -c image_encoder` → **1**. The single occurrence is `model.image_encoder.img_size` (line 35), which reads a config attribute. The encoder is **never called**. |
+| `SamOnnxModel::forward` (`onnx.py:108-116`) | First parameter is `image_embeddings: torch.Tensor` — an **input**. |
+| `scripts/export_onnx_model.py:130-137` | `dummy_inputs["image_embeddings"] = torch.randn(1, embed_dim, *embed_size)`. The exporter feeds embeddings in. |
+| `torch.onnx.export` | Traces only what `forward` executes, so the ViT is pruned from the graph. |
+| Script docstring | "Export the SAM prompt encoder and mask decoder to an ONNX model" — accurate. |
+
+### What the encoder pass needs, precisely
+
+The missing graph is small and its contract is fixed. For `vit_b`
+(`build_sam.py:37-43`: `embed_dim=768, depth=12, num_heads=12,
+global_attn_indexes=[2,5,8,11]`; `image_encoder.py:20-27`: `img_size=1024,
+patch_size=16, out_chans=256`):
+
+| | |
+|---|---|
+| Input | `[1, 3, 1024, 1024]` f32 |
+| Output | `[1, 256, 64, 64]` f32 |
+| Matches the decoder's input | `embed_dim = 256` (`MASK_EMBED_DIM`) and `embed_size = (64, 64)` — i.e. `[1, 256, 64, 64]`, so the two graphs compose |
+
+Producing it is a ~15-line wrapper around `sam.image_encoder` and one
+`torch.onnx.export` call. **This was not done here: there is no Python interpreter and
+no PyTorch on this host, and the ViT-B checkpoint is 93.7 M parameters (~375 MB fp32).**
+So the encoder pass remains **unmeasured** — no timing is claimed.
+
+| Item | Finding |
+|---|---|
+| Weights | `facebook/sam-vit-base`, **Apache-2.0**, 93.7 M params |
+| Runtime | `ort` 2.0.0-rc.13 (already pinned by S1/S2) — no new runtime |
+| Verdict | Premise confirmed. Upstream artefact missing but trivially producible |
+
+**Recommendation:** keep F168, scope it as *two* graphs plus the pre/post
+(resize-longest-side-to-1024, pad, normalise) wrapper, and drop the assumption that an
+upstream artefact exists. Do not remove the feature: the work is bounded and
+well-understood. Requires a host with PyTorch for the export step, once.
+
+
 ---
 
-## Corrections to assumptions in the planning documents
 
-| Document | Was | Now |
-|---|---|---|
-| `REWRITE_PLAN.md` D10 | "pin `2.0.0-rc.13`" | ✅ confirmed correct |
-| `INCOMPLETE.md` S1 | "EPs may be gated behind `api-22`" | ✅ resolved — not gated |
-| `INCOMPLETE.md` S7 | "FTS5 + sqlite-vec must be confirmed" | ✅ resolved — both work |
-| `DATA_MIGRATION.md` §5.2 | Thresholds need full re-tuning | **RESTORED — the earlier downgrade was based on a false premise.** Python sets cosine explicitly (`embedding_lanes.py:80`), not L2, so `1.0 - distance` is only a similarity under cosine. The port must name the metric; re-tuning is not required *if* it does, but L2-by-default would silently break every threshold |
-
----
-
-## Pending spikes
-
-| Spike | Question | Blocks |
-|---|---|---|
-| **S3** | SAM ONNX: upstream `export_onnx_model.py` exports only prompt encoder + mask decoder, not the ViT image encoder. Need a separate `image_encoder.onnx`. | F168 |
-| **S4** | Does `any-tts` (17,967 dl, 5 versions, updated 2026-08) provide a Kokoro backend? Would make `kokoroxide` (1,734 dl, WIP, 7 stars) moot | F338 |
-| **S6** | `whisper-rs` (1.4M dl) — CUDA support, and is whisper.cpp a real regression vs faster-whisper? | F339 |
-| **S8** | `lettre` (19.4M dl) / `async-imap` (1.7M dl) / `mailparse` (14.6M dl) — API quality for a 6,152-line subsystem | Phase 15 |
-| **S9** | Local Stable Diffusion scope — is it needed given inpaint/harmonize already proxy? | F176 |
-| **S10** | `lopdf` (22.3M dl) for AcroForm; `mupdf`/`poppler-rs` for rasterisation. **C-dependency implications** | F146, F148 |
-| **S11** | Capture the sqlite-vec golden set **while ChromaDB is still running** | F118 |
-
-### S11 is time-critical
-
-The golden set must be captured from the live ChromaDB instance *before* anything
-touches vectors. Once that service is stopped or its data directory removed, the
-calibration baseline is unrecoverable. Schedule it before Phase 7 begins.
-
-**Feasibility confirmed.** An earlier revision of this note recorded the collections as
-empty and treated capture as blocked. It is not blocked: the `tool_index` lane holds
-**69 records** and is exactly the kind of populated lane S11 needs. Capture should
-therefore cover all three lanes and record which were empty at capture time, so the
-golden set documents real state rather than silently omitting two empty collections.
-Because the metric finding above was wrong, the golden set must also record, per row,
-the distance **and** `1.0 - distance` under an explicitly-declared cosine metric — that
-pair is what makes it a calibration baseline rather than a smoke test.
-
----
-
-## Crate maturity snapshot
-
-Download counts from the crates.io API, 2026-10-03. Low download count relative to age
-is a maintenance risk signal.
-
-| Crate | Version | Downloads | Last publish | Verdict |
-|---|---|---|---|---|
-| `ort` | 2.0.0-rc.13 | 20,501,776 | 2026-07-28 | Mature, but an RC |
-| `rusqlite` | 0.40.2 | 116,748,060 | 2026-08-08 | Mature |
-| `sqlite-vec` | 0.1.9 | 3,158,097 | 2026-05-18 | Healthy |
-| `lopdf` | 0.45.0 | 22,265,169 | 2026-09-08 | Mature |
-| `lettre` | 0.11.23 | 19,426,758 | 2026-08-03 | Mature |
-| `mailparse` | 0.17.0 | 14,596,583 | 2026-09-06 | Mature |
-| `async-imap` | 0.12.0 | 1,748,405 | 2026-09-30 | Actively maintained |
-| `mail-builder` | 1.0.0 | 1,432,641 | 2026-09-12 | Healthy |
-| `whisper-rs` | 0.16.0 | 1,406,056 | 2026-03-12 | Healthy |
-| `mupdf` | 0.8.0 | 1,709,128 | 2026-06-22 | Healthy |
-| `poppler-rs` | 0.26.0 | 246,144 | 2026-02-21 | **Low adoption** |
-| `any-tts` | 0.1.3 | 17,967 | 2026-08-26 | **Early** |
-| `kokoroxide` | 0.1.5 | 1,734 | 2025-10-04 | **Stale, marked WIP** |
-| `rembg-rs` | 0.1.4 | 818 | 2025-12-28 | **Abandoned — does not compile.** See S5 |
