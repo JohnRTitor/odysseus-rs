@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 45 / 489 complete · Phase 0 in progress
+**Status:** 46 / 489 complete · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — **4 of 11 resolved** (S1, S2, S5, S7); 7 pending.
 
@@ -98,6 +98,7 @@ is written.**
 - [x] T0068 TOTP 2FA — **fails closed** when enabled but secret missing; 8 single-use backup codes
 - [x] T0069 Privileges: 7 booleans + `max_messages_per_day` + `allowed_models`; refuse to demote the last admin
 - [x] T0070 User CRUD; delete revokes API tokens **first** (fail-closed), then sessions; rename rewrites live sessions
+- [x] T0071 Sliding-window rate limiter + constant-time login path — `crates/store/src/ratelimit.rs` (ports `src/rate_limiter.py`; injected clock, bounded key count) and `AuthStore::verify_password_or_dummy` (one bcrypt comparison either way, precomputed dummy hash). Precondition for T0064. **17 tests in `crates/store/tests/rate_limit.rs`, 6 mutations verified to go red**
 
 ### 0.5 Web layer
 
