@@ -214,44 +214,45 @@ redistributed **model weights**. Not a blocker here, but any future spike that v
 weights needs one.
 
 
-## S4 — `any-tts` Kokoro backend — ✅ **YES, and `kokoroxide` is moot**
+## S6 — `whisper-rs` CPU transcription — ✅ **PASS (CUDA unverified)**
 
-`any-tts` 0.1.3 provides Kokoro as a **default feature**, not as an example.
-
-| Evidence | Finding |
-|---|---|
-| `src/lib.rs:23` | `kokoro` — "Build Kokoro model support (**default**)" |
-| `src/lib.rs:84-86` | `#[cfg(feature = "kokoro")]` → `models::kokoro::KokoroModel::load(config)` |
-| `src/models/kokoro/` | 11 modules, a full implementation: `albert.rs` (PL-BERT text encoder), `decoder.rs` (ISTFTNet), `phonemizer.rs` + `english_g2p.rs` + `espeak_compat.rs`, `style_encoder.rs`, `prosody.rs`, `text_encoder.rs` |
-| `examples/generate_kokoro.rs` | 19 sample utterances across en / en-gb |
-
-**Answer to the spike question: yes.** `kokoroxide` 0.1.5 (explicitly WIP, 7 stars) is
-moot and should not be evaluated further.
-
-### Two things the README does not tell you
-
-1. **It is `candle`, not `ort`.** `candle-core`/`candle-nn`/`candle-transformers` 0.10.2.
-   AGENTS.md assigns `ort`/`ort-sys` exclusively to `odysseus-ml`; this would add a
-   **second ML runtime** to the workspace. That is a deliberate decision, not a detail.
-2. **The voice assets are not obtainable in the shape it wants.** `model.rs:397-403`
-   loads `voices/{name}.pt` — a PyTorch bare tensor per voice. The canonical
-   `hexgrad/Kokoro-82M` repo publishes `kokoro-v1_0.pth` with the voices packed inside,
-   and the split-voice repos (`onnx-community/Kokoro-82M-v1.0-ONNX`) publish
-   `voices/*.bin`, not `.pt`. So materialising the voice files needs a one-time
-   PyTorch extraction step, even though the runtime is pure Rust.
+Transcribes correctly on CPU with **zero word errors**, measured against the
+published transcript of whisper.cpp's own `samples/jfk.wav`.
 
 | Item | Finding |
 |---|---|
-| Version | **0.1.3** (matches the 0.1.3 in the maturity table) |
-| Licence | **MIT OR Apache-2.0** — already allowed by `deny.toml` |
-| Weights | `hexgrad/Kokoro-82M`, **Apache-2.0** |
-| Transitive deps | **357** (the candle stack dominates) |
+| Crate | **0.16.0**, **Unlicense** (allowed by `deny.toml`) |
+| Vendored C | whisper.cpp, **MIT** |
+| Model | `ggml-tiny.en.bin`, **77.11 MB** |
+| Transcript | *"And so my fellow Americans ask not what your country can do for you ask what you can do for your country."* |
+| WER vs published reference | **0.000** (0 errors / 22 words) |
+| Speed | **4,498 ms for 11.0 s audio = 2.45× realtime**, beam search, tiny.en, no GPU |
+| GPU | `whisper_backend_init_gpu: no GPU found` — CPU path only |
 
-**Not run.** Weights were not fetched, so **no audio was synthesised and no quality or
-latency figure is claimed.** One incidental finding: `KokoroModel::load` returned `Ok`
-against an **empty** model directory, so it does not validate assets at load time —
-a misconfigured model path surfaces later, at synthesis. Worth a startup probe in
-Phase 22 rather than trusting `load`.
+### Build requirements not in the README
+
+`whisper-rs-sys` needs **cmake** and **libclang** at build time. Neither is in
+`devenv.nix`: the first build failed with `is cmake not installed?`, and bindgen then
+failed with `'stdio.h' file not found`. Resolved for the spike by putting
+`cmake 4.4.3` on `PATH` and setting `LIBCLANG_PATH` +
+`BINDGEN_EXTRA_CLANG_ARGS` to a glibc include dir. **This is a real gap in the dev
+shell** — `cmake` should be added to `devenv.nix` packages, which is outside this
+spike's ownership.
+
+### Is whisper.cpp a regression against faster-whisper?
+
+**Not answered, and not answerable here.** faster-whisper is CTranslate2, which needs
+a Python environment with cuDNN/cuBLAS; there is no interpreter on this host, so no
+side-by-side was possible. Stating a parity verdict without running both would be
+exactly the kind of claim this document exists to prevent.
+
+What *is* established: whisper-rs produces a **correct** transcription on CPU, so it is
+not a functional regression. faster-whisper's documented advantages (CUDA via cuDNN,
+int8 quantisation, batching) are all **GPU-side**, and CUDA is unverified here for the
+same reason as S1/S2. Re-confirm on a CUDA machine before Phase 22 relies on it.
+
+**Verdict: PASS.** F339 stays. **CUDA/TensorRT runtime is UNVERIFIED**, same caveat as
+S1/S2.
 
 
 ---
