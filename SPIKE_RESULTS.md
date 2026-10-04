@@ -214,46 +214,52 @@ redistributed **model weights**. Not a blocker here, but any future spike that v
 weights needs one.
 
 
-## S6 — `whisper-rs` CPU transcription — ✅ **PASS (CUDA unverified)**
+## S8 — `lettre` / `async-imap` / `mailparse` — ✅ **PASS (XOAUTH2 verified on the wire)**
 
-Transcribes correctly on CPU with **zero word errors**, measured against the
-published transcript of whisper.cpp's own `samples/jfk.wav`.
+**Phase 15 does not need re-planning.** Gmail OAuth2 works on both halves, and the
+XOAUTH2 SASL string — the single most error-prone part — was checked byte-for-byte
+against Google's published format by running a real SMTP dialogue.
 
-| Item | Finding |
-|---|---|
-| Crate | **0.16.0**, **Unlicense** (allowed by `deny.toml`) |
-| Vendored C | whisper.cpp, **MIT** |
-| Model | `ggml-tiny.en.bin`, **77.11 MB** |
-| Transcript | *"And so my fellow Americans ask not what your country can do for you ask what you can do for your country."* |
-| WER vs published reference | **0.000** (0 errors / 22 words) |
-| Speed | **4,498 ms for 11.0 s audio = 2.45× realtime**, beam search, tiny.en, no GPU |
-| GPU | `whisper_backend_init_gpu: no GPU found` — CPU path only |
+```
+lettre test_connection -> Ok(true)
+wire:  AUTH XOAUTH2 dXNlcj1hbGljZUBleGFtcGxlLmNvbQFhdXRoPUJlYXJlciB5YTI5LmEwQWZINlNNQngtYWNjZXNzLXRva2VuAQE=
+bytes: user=alice@example.com\u{1}auth=Bearer ya29.a0AfH6SMBx-access-token\u{1}\u{1}
+```
 
-### Build requirements not in the README
+Google publishes that exact layout (`user=` + `\x01` + `auth=Bearer ` + token + `\x01\x01`).
 
-`whisper-rs-sys` needs **cmake** and **libclang** at build time. Neither is in
-`devenv.nix`: the first build failed with `is cmake not installed?`, and bindgen then
-failed with `'stdio.h' file not found`. Resolved for the spike by putting
-`cmake 4.4.3` on `PATH` and setting `LIBCLANG_PATH` +
-`BINDGEN_EXTRA_CLANG_ARGS` to a glibc include dir. **This is a real gap in the dev
-shell** — `cmake` should be added to `devenv.nix` packages, which is outside this
-spike's ownership.
+| Crate | Version | Licence | Evidence |
+|---|---|---|---|
+| `lettre` | 0.11.23 | MIT | `transport/smtp/authentication.rs:117-123` builds the XOAUTH2 string; verified on the wire above |
+| `async-imap` | 0.12.0 | MIT OR Apache-2.0 | `client.rs:244-297` `authenticate("XOAUTH2", &auth)` with a custom `Authenticator` (`type Response: AsRef<[u8]>`) |
+| `mailparse` | 0.17.0 | 0BSD | multipart/alternative parsed: 2 parts, subject recovered |
 
-### Is whisper.cpp a regression against faster-whisper?
+Transitive deps: **132** for all three.
 
-**Not answered, and not answerable here.** faster-whisper is CTranslate2, which needs
-a Python environment with cuDNN/cuBLAS; there is no interpreter on this host, so no
-side-by-side was possible. Stating a parity verdict without running both would be
-exactly the kind of claim this document exists to prevent.
+### Three gotchas worth writing down
 
-What *is* established: whisper-rs produces a **correct** transcription on CPU, so it is
-not a functional regression. faster-whisper's documented advantages (CUDA via cuDNN,
-int8 quantisation, batching) are all **GPU-side**, and CUDA is unverified here for the
-same reason as S1/S2. Re-confirm on a CUDA machine before Phase 22 relies on it.
+1. **XOAUTH2 is not in lettre's defaults.** `DEFAULT_MECHANISMS = [Plain, Login]`
+   (`authentication.rs:10`). You must pass
+   `.authentication(vec![Mechanism::Xoauth2])` explicitly, with the bearer token as
+   `Credentials::new(user, token)`. Fail-safe in practice — Gmail rejects PLAIN — but
+   the failure will read as "auth failed", not "you forgot the mechanism".
+2. **`.tls()` is feature-gated.** It only exists under a TLS backend feature
+   (`tokio1-native-tls` / `tokio1-rustls` / …). With `default-features = false` the
+   builder has no TLS method at all, which fails at compile time rather than silently
+   sending mail in the clear. Use `Tls::Required` on port 587 (STARTTLS, MITM-safe) or
+   `Tls::Wrapper` on 465 (implicit).
+3. **Gmail IMAP is implicit TLS on 993, not STARTTLS.** `async-imap` supports it via
+   `async_imap::connect((domain, 993), domain, tls)` with an
+   `async_native_tls::TlsConnector`. Gmail advertises `LOGINDISABLED`, so XOAUTH2 is the
+   only path — which is what you want.
 
-**Verdict: PASS.** F339 stays. **CUDA/TensorRT runtime is UNVERIFIED**, same caveat as
-S1/S2.
+The async-imap `Authenticator` shape is also the right place for **token refresh
+mid-handshake**, which a fixed lettre `Credentials` cannot do. Note that as a real
+design constraint for Phase 15: the SMTP bearer token must be re-read per send.
 
+**Verdict: PASS.** End-to-end against Gmail is **UNVERIFIED** — no credentials — but the
+mechanism, the encoding and the TLS modes are all confirmed, which is the part that
+would have failed.
 
 ---
 
