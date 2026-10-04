@@ -344,34 +344,113 @@ disappear because matching is structural rather than first-registered.
 
 ## 9. Target crate dependency graph
 
-```
-odysseus-domain          (no deps)
-    ▲   ▲   ▲
-    │   │   │
-odysseus-store           (rusqlite, sqlite-vec, bcrypt, fernet, ...)
-    ▲   ▲
-    │   └── odysseus-llm        (reqwest, tokio)
-    │           ▲
-odysseus-tools ──────────┤
-    ▲                   │
-odysseus-agent ──────────┤
-    ▲                   │
-odysseus-services ◄──────┤
-    ▲                   │
-odysseus-integrations ──┤
-                        │
-odysseus-web ───────────┤
-                        │
-odysseus-ui ─────────────┘
-                        │
-apps/odysseus-server ────┘
-```
+### 9.1 Target internal edges
 
-Enforced rules (to be asserted with `cargo` layer checks or `cargo deny`):
+The target graph is **derived from the "May import" column of the architecture
+table in `AGENTS.md` §8**, not drawn by hand. The previous revision of this
+section was an ASCII diagram, and it had drifted: it drew
+`odysseus-integrations -> odysseus-llm`, which `AGENTS.md` §8 forbids, and its
+`▲` edges were ambiguous about direction. A derived table cannot drift that way.
 
-- `odysseus-domain` depends on nothing internal.
-- `odysseus-store` never imports `axum`, `leptos`, or `reqwest`.
-- `odysseus-ui` never imports `rusqlite` or `reqwest`.
-- `odysseus-agent` never imports `axum`.
-- Only `odysseus-web` knows about HTTP status codes.
-- `odysseus-ml` (`ort`) is isolated so a swap is a single-crate change.
+| Crate | May import (internal) |
+|---|---|
+| `odysseus-domain` | — |
+| `odysseus-store` | `odysseus-domain` |
+| `odysseus-llm` | — |
+| `odysseus-agent` | `odysseus-domain`, `odysseus-llm`, `odysseus-tools` |
+| `odysseus-tools` | `odysseus-domain`, `odysseus-store` |
+| `odysseus-services` | all non-web crates |
+| `odysseus-integrations` | `odysseus-domain`, `odysseus-services` |
+| `odysseus-web` | everything |
+| `odysseus-ui` | `odysseus-domain` |
+| `odysseus-ml` | `odysseus-domain` |
+
+Two cells are permissions rather than enumerations, and are spelled out because
+they are the ones most often misread:
+
+- `odysseus-services` may import **all non-web crates**. That includes
+  `odysseus-agent`: services compose agent capabilities, so this edge is
+  intended, not a layering violation.
+- `odysseus-web` may import **everything**, `odysseus-ui` included, because SSR
+  renders the UI in-process.
+
+`odysseus-ml` had no row in `AGENTS.md` §8 until this revision; it now has one,
+and may import `odysseus-domain` for shared value types.
+
+### 9.2 Internal edges declared today
+
+Generated from the manifests via
+`cargo metadata --format-version 1 --no-deps`. This is the *current* state, not
+the target of §9.1, and the two are kept apart so an empty crate cannot be
+mistaken for a finished one.
+
+| Crate | Internal deps declared today |
+|---|---|
+| `odysseus-domain` | — |
+| `odysseus-store` | `odysseus-domain` |
+| `odysseus-llm` | — |
+| `odysseus-agent` | — |
+| `odysseus-tools` | — |
+| `odysseus-services` | — |
+| `odysseus-integrations` | — |
+| `odysseus-web` | `odysseus-domain`, `odysseus-store` |
+| `odysseus-ui` | — |
+| `odysseus-ml` | — |
+| `odysseus-server` (app) | `odysseus-domain`, `odysseus-store`, `odysseus-web` |
+| `odysseus-cli` (app) | `odysseus-domain` |
+
+Six of the ten library crates declare no internal dependencies at all, because
+they are still empty scaffolds. A green §9.2 therefore means "nothing has been
+built yet", not "the architecture is satisfied".
+
+This table is checked against the manifests by
+`crates/web/tests/dependency_rules.rs`, so it cannot silently go stale.
+
+### 9.3 Enforced rules
+
+One row per crate. Each states the crate's prohibited dependencies and cites
+`AGENTS.md` §8 as the source of truth. `crates/web/tests/dependency_rules.rs`
+asserts these, and additionally parses **this table and the `AGENTS.md` §8 table
+and fails if they disagree** — so neither document can be changed without the
+other.
+
+| Crate | Must NOT declare | Source |
+|---|---|---|
+| `odysseus-domain` | *(none — see the additional rule below)* | `AGENTS.md` §8 |
+| `odysseus-store` | `axum`, `leptos`, `reqwest` | `AGENTS.md` §8; `SOURCE_MAPPING.md` §9 |
+| `odysseus-llm` | `axum`, `leptos` | `AGENTS.md` §8 |
+| `odysseus-agent` | `axum`, `leptos` | `AGENTS.md` §8 |
+| `odysseus-tools` | `axum` | `AGENTS.md` §8 |
+| `odysseus-services` | `axum`, `leptos` | `AGENTS.md` §8 |
+| `odysseus-integrations` | `axum`, `leptos` | `AGENTS.md` §8 |
+| `odysseus-web` | *(none — it may import everything)* | `AGENTS.md` §8 |
+| `odysseus-ui` | `rusqlite`, `reqwest` | `AGENTS.md` §8 |
+| `odysseus-ml` | `axum`, `leptos` | `AGENTS.md` §8 |
+
+All prohibitions are **direct dependencies only**. A transitive edge arriving
+underneath a crate from an unrelated dependency belongs to the crate that
+introduced it; asserting on the transitive closure would let an upstream release
+break an unrelated crate's build over a change nobody here made. Development
+and build dependencies *are* included, because a boundary that leaks through a
+test-only edge is not a boundary.
+
+`AGENTS.md` §8 additionally forbids three things that name no crate and are
+therefore **not mechanically enforceable**: "business logic" (`odysseus-llm`,
+`odysseus-web`), "agent-loop control flow" (`odysseus-tools`), and bare "SQL"
+(`odysseus-ui`). They remain review rules. This is a known, deliberate gap.
+
+### 9.4 Additional rules
+
+| Rule | Applies to |
+|---|---|
+| depends on no internal crate | `odysseus-domain` |
+| `ort` and `ort-sys` may be declared only by | `odysseus-ml` |
+
+The `odysseus-ml` row enforces the isolation this section previously described
+only in prose ("`odysseus-ml` (`ort`) is isolated so a swap is a single-crate
+change"). The rest of that intent — that inference stays reachable through one
+crate — is a review property, not a dependency claim.
+
+One further rule from this section is **not** enforceable as a dependency
+constraint: "only `odysseus-web` knows about HTTP status codes" is a property of
+which types a crate references, and asserting it would mean parsing Rust source.

@@ -122,6 +122,14 @@ Additional rules:
 | `odysseus-integrations` | `domain`, `services` | `axum`, `leptos` |
 | `odysseus-web` | everything | business rules |
 | `odysseus-ui` | `domain` | `rusqlite`, `reqwest`, SQL |
+| `odysseus-ml` | `domain`, `ort`, `ort-sys` | `axum`, `leptos`, business rules |
+
+`odysseus-ml` had no row here until T0008's follow-up, though the crate, this
+table's own §9 counterpart (`SOURCE_MAPPING.md` §9), and the workspace all
+existed. It may import `odysseus-domain` for shared value types, and owns the
+`ort` / `ort-sys` runtime so a swap of the inference backend is a single-crate
+change. **Nothing outside `odysseus-ml` may declare `ort` or `ort-sys`**, and
+that rule is enforced in CI.
 
 Violations are architectural defects.
 

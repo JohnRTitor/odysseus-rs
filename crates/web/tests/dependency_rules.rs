@@ -24,21 +24,39 @@
 //! is still a declaration in that crate's manifest, and a boundary that leaks
 //! through test-only edges is not a boundary.
 //!
+//! # The rules are parsed from the documents, not transcribed here
+//!
+//! A hardcoded copy of the rule table is a fourth place to forget to update, and
+//! it silently rots the moment a document changes. So this file **parses** the
+//! two tables that state the rules -- `AGENTS.md` §8 (the source of truth) and
+//! `SOURCE_MAPPING.md` §9.3 -- and asserts against what it finds. A rule added
+//! to a document is enforced immediately, with no edit here.
+//!
+//! Two guards keep that honest:
+//!
+//!   * `the_two_documents_agree_on_every_rule` fails if §8 and §9.3 diverge.
+//!     They had already drifted once (§9 named four crates, §8 named ten) and
+//!     nothing noticed, because nothing compared them.
+//!   * `every_rule_names_a_real_crate_and_every_crate_is_ruled_on` fails if a
+//!     rule names a crate that no longer exists (it would match nothing) or a
+//!     new crate has no row (nothing would constrain it).
+//!
 //! # Rules that cannot be checked here
 //!
-//! Two §9 rules are statements about source code rather than manifests and are
-//! **not** enforced by this test:
+//! Some boundaries are statements about source code rather than manifests, and
+//! are **not** enforced by this test:
 //!
 //!   * "Only `odysseus-web` knows about HTTP status codes" -- a property of which
 //!     types a crate references. Enforcing it would mean parsing Rust source.
-//!   * "`odysseus-ml` is isolated so a swap is a single-crate change" -- enforced
-//!     here only as far as it is a dependency claim: nothing outside
-//!     `odysseus-ml` may declare `ort`. The rest is a review property.
+//!   * "business logic", "agent-loop control flow", bare "SQL" -- `AGENTS.md` §8
+//!     forbids these for three crates, but none of them names a crate, so no
+//!     dependency graph can express them. They stay review rules, recorded here
+//!     so the gap is visible rather than forgotten.
 //!
-//! `AGENTS.md` §8 additionally forbids three things that name no crate --
-//! "business logic", "agent-loop control flow", and bare "SQL". A dependency graph
-//! cannot express those; they stay review rules, named here so the gap is
-//! recorded rather than silently forgotten.
+//! The `odysseus-ml` isolation rule *is* enforced, as far as it is a dependency
+//! claim: nothing outside `odysseus-ml` may declare `ort` or `ort-sys`. The rest
+//! of that intent -- that inference stays reachable through one crate -- remains
+//! a review property.
 //!
 //! # Test seam
 //!
@@ -89,17 +107,6 @@ struct Dependency {
     kind: Option<String>,
 }
 
-/// "This crate must never declare these dependencies."
-#[derive(Debug)]
-struct Forbidden<'a> {
-    /// Crate the rule constrains.
-    crate_name: &'a str,
-    /// Dependency names it must not declare, under any dependency kind.
-    deps: &'a [&'a str],
-    /// Where the rule is written, quoted in the failure message.
-    source: &'a str,
-}
-
 /// "This dependency may be declared only by this crate."
 #[derive(Debug)]
 struct Isolated<'a> {
@@ -118,49 +125,147 @@ const DOMAIN: &str = "odysseus-domain";
 /// Prefix identifying a first-party crate.
 const INTERNAL_PREFIX: &str = "odysseus-";
 
-/// Rules of the form "crate X must never declare D".
+/// The binary crates in `apps/`, which sit above the architecture rather than
+/// inside it. `AGENTS.md` §8 tabulates the ten *library* crates, so these two are
+/// exempt from the "every crate needs a rule row" check: they exist to compose
+/// the library, and requiring a row would mean inventing prohibitions nobody
+/// agreed to.
+const APPS: &[&str] = &["odysseus-server", "odysseus-cli"];
+
+/// Rules of the form "crate X must never declare D", parsed from the documents.
 ///
-/// Every entry cites the document that states it. Where `AGENTS.md` §8 is
-/// stricter than `SOURCE_MAPPING.md` §9 the stricter union is enforced, because
-/// the tighter boundary is the one the project actually wants held; the
-/// discrepancy is recorded for T0008 rather than resolved silently.
-const FORBIDDEN: &[Forbidden<'_>] = &[
-    Forbidden {
-        crate_name: "odysseus-store",
-        deps: &["axum", "leptos", "reqwest"],
-        source: "SOURCE_MAPPING.md §9 and AGENTS.md §8 (identical)",
-    },
-    Forbidden {
-        crate_name: "odysseus-llm",
-        deps: &["axum", "leptos"],
-        source: "AGENTS.md §8 (`business logic` also forbidden; not expressible here)",
-    },
-    Forbidden {
-        crate_name: "odysseus-agent",
-        deps: &["axum", "leptos"],
-        source: "AGENTS.md §8; SOURCE_MAPPING.md §9 lists `axum` only (see report)",
-    },
-    Forbidden {
-        crate_name: "odysseus-tools",
-        deps: &["axum"],
-        source: "AGENTS.md §8 (`agent-loop control flow` also forbidden; not expressible here)",
-    },
-    Forbidden {
-        crate_name: "odysseus-services",
-        deps: &["axum", "leptos"],
-        source: "AGENTS.md §8 (absent from SOURCE_MAPPING.md §9)",
-    },
-    Forbidden {
-        crate_name: "odysseus-integrations",
-        deps: &["axum", "leptos"],
-        source: "AGENTS.md §8 (absent from SOURCE_MAPPING.md §9)",
-    },
-    Forbidden {
-        crate_name: "odysseus-ui",
-        deps: &["rusqlite", "reqwest"],
-        source: "SOURCE_MAPPING.md §9 and AGENTS.md §8 (identical; §8 also forbids bare `SQL`)",
-    },
-];
+/// The table is **derived, not transcribed**. `AGENTS.md` §8 is the source of
+/// truth; `SOURCE_MAPPING.md` §9.3 restates it per crate. `rules_from_agents()`
+/// and `rules_from_source_mapping()` parse each, and
+/// `the_two_documents_agree_on_every_rule` fails if they diverge. That is what
+/// keeps the earlier drift from recurring: a rule added to one document without
+/// the other is a test failure, not a stale comment.
+///
+/// Each entry records which documents stated it, so a failure names its source.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DocumentRule {
+    crate_name: String,
+    deps: Vec<String>,
+}
+
+/// Splits a markdown table row into trimmed cells.
+fn cells(line: &str) -> Vec<&str> {
+    line.trim()
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect()
+}
+
+/// Strips markdown emphasis and code ticks from a cell.
+fn plain(cell: &str) -> String {
+    let mut out = String::with_capacity(cell.len());
+    let mut ticks = false;
+    for ch in cell.chars() {
+        match ch {
+            '`' => ticks = !ticks,
+            '*' | '(' | ')' if !ticks => {}
+            _ => out.push(ch),
+        }
+    }
+    out.trim().to_owned()
+}
+
+/// Parses the rule table out of a markdown table.
+///
+/// `deps_column` selects which cell holds the prohibition list. It is a parameter
+/// because the two tables do not agree on column order: `AGENTS.md` §8 is
+/// `Crate | May import | Must NOT import`, while `SOURCE_MAPPING.md` §9.3 is
+/// `Crate | Must NOT declare | Source`. Reading the wrong column is a silent,
+/// catastrophic failure -- it once reported `odysseus-store`'s *permitted*
+/// `rusqlite` and `sqlite-vec` as violations -- so each caller names the column
+/// explicitly rather than both assuming the same layout.
+///
+/// Prose cells are ignored: only cells that reduce to a bare comma-separated list
+/// of lowercase crate names contribute entries. That is what lets a row such as
+/// `odysseus-domain | (none - see the additional rule below)` parse as "no
+/// prohibitions" instead of being mistaken for a dependency called "none".
+fn parse_rules(text: &str, deps_column: usize) -> Vec<DocumentRule> {
+    let mut rules = Vec::new();
+    for line in text.lines() {
+        if !line.trim_start().starts_with('|') {
+            continue;
+        }
+        let parsed = cells(line);
+        let [name_cell, rest @ ..] = parsed.as_slice() else {
+            continue;
+        };
+        let name = plain(name_cell);
+        if !name.starts_with(INTERNAL_PREFIX) {
+            continue;
+        }
+        let Some(deps_cell) = rest.get(deps_column) else {
+            continue;
+        };
+        let deps: Vec<String> = plain(deps_cell)
+            .split(',')
+            .map(|dep| dep.trim().to_owned())
+            .filter(|dep| {
+                !dep.is_empty()
+                    && dep
+                        .chars()
+                        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+            })
+            .collect();
+        rules.push(DocumentRule {
+            crate_name: name,
+            deps,
+        });
+    }
+    rules
+}
+
+/// The rules stated in `AGENTS.md` §8's "Must NOT import" column.
+///
+/// # Errors
+///
+/// Returns a boxed error if the file cannot be read.
+fn rules_from_agents() -> Result<Vec<DocumentRule>, Box<dyn std::error::Error>> {
+    let text = std::fs::read_to_string(repo_root()?.join("AGENTS.md"))?;
+    let section = text
+        .split("## 8. Architecture")
+        .nth(1)
+        .and_then(|rest| rest.split("## 9.").next())
+        .ok_or("could not locate the AGENTS.md §8 architecture table")?;
+    // Column 0 of the remainder is "May import", so the prohibitions are column 1.
+    Ok(parse_rules(section, 1))
+}
+
+/// The rules stated in `SOURCE_MAPPING.md` §9.3.
+///
+/// # Errors
+///
+/// Returns a boxed error if the file cannot be read or §9.3 is missing.
+fn rules_from_source_mapping() -> Result<Vec<DocumentRule>, Box<dyn std::error::Error>> {
+    let text = std::fs::read_to_string(repo_root()?.join("SOURCE_MAPPING.md"))?;
+    let section = text
+        .split("### 9.3 Enforced rules")
+        .nth(1)
+        .and_then(|rest| rest.split("### 9.4").next())
+        .ok_or("could not locate the SOURCE_MAPPING.md §9.3 rule table")?;
+    // Here column 0 of the remainder is already "Must NOT declare".
+    Ok(parse_rules(section, 0))
+}
+
+/// The repository root, resolved from this crate's manifest directory.
+///
+/// # Errors
+///
+/// Returns a boxed error if `CARGO_MANIFEST_DIR` is somehow unset or is not a
+/// path, which would otherwise silently resolve the rules against nothing.
+fn repo_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    Ok(dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("CARGO_MANIFEST_DIR is not inside the workspace")?
+        .to_path_buf())
+}
 
 /// Rules of the form "only crate X may declare D".
 const ISOLATED: &[Isolated<'_>] = &[
@@ -272,6 +377,9 @@ fn members_by_name(metadata: &Metadata) -> Result<BTreeSet<&str>, Box<dyn std::e
 }
 
 /// Finds a member by exact crate name.
+///
+/// The `path+` check keeps a registry package that happens to share a name with
+/// a workspace member from being mistaken for it.
 fn member<'a>(metadata: &'a Metadata, name: &str) -> Option<&'a Package> {
     metadata
         .packages
@@ -289,21 +397,21 @@ fn kind_label(dep: &Dependency) -> &str {
     }
 }
 
-/// Every rule violation in `metadata`.
-fn check(metadata: &Metadata) -> Vec<Violation> {
+/// Every rule violation in `metadata`, given the rules parsed from `AGENTS.md` §8.
+fn check(metadata: &Metadata, rules: &[DocumentRule]) -> Vec<Violation> {
     let mut violations = Vec::new();
 
-    for rule in FORBIDDEN {
-        let Some(package) = member(metadata, rule.crate_name) else {
+    for rule in rules {
+        let Some(package) = member(metadata, &rule.crate_name) else {
             continue;
         };
         for dep in &package.dependencies {
-            if rule.deps.contains(&dep.name.as_str()) {
+            if rule.deps.iter().any(|forbidden| forbidden == &dep.name) {
                 violations.push(Violation {
                     crate_name: package.name.clone(),
                     forbidden_dep: format!("{} ({})", dep.name, kind_label(dep)),
                     manifest_path: package.manifest_path.display().to_string(),
-                    source: rule.source,
+                    source: "AGENTS.md §8",
                 });
             }
         }
@@ -334,7 +442,7 @@ fn check(metadata: &Metadata) -> Vec<Violation> {
                     crate_name: domain.name.clone(),
                     forbidden_dep: format!("{} ({})", dep.name, kind_label(dep)),
                     manifest_path: domain.manifest_path.display().to_string(),
-                    source: "SOURCE_MAPPING.md §9 and AGENTS.md §8 (`odysseus-domain` depends on nothing internal)",
+                    source: "AGENTS.md §8 (`odysseus-domain` depends on nothing internal)",
                 });
             }
         }
@@ -342,19 +450,20 @@ fn check(metadata: &Metadata) -> Vec<Violation> {
 
     violations
 }
-
 /// The real gate. Fails the build on any violation in this workspace.
 ///
 /// # Errors
 ///
-/// Propagates any error from locating the manifest or running `cargo metadata`.
+/// Propagates any error from locating the manifest, running `cargo metadata`, or
+/// reading the rule documents.
 #[test]
 fn no_crate_violates_the_architecture_dependency_rules() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = manifest_path()?;
     let metadata = load_metadata(&manifest)?;
     let names = members_by_name(&metadata)?;
+    let rules = rules_from_agents()?;
 
-    let violations = check(&metadata);
+    let violations = check(&metadata, &rules);
     if !violations.is_empty() {
         let mut report = format!(
             "\n{} architectural dependency violation(s) in {}:{}",
@@ -367,88 +476,131 @@ fn no_crate_violates_the_architecture_dependency_rules() -> Result<(), Box<dyn s
         );
         report.push_str(
             "\n\nThese are architectural defects, not style preferences (AGENTS.md §8). \
-             Fix the dependency, or change the rule in SOURCE_MAPPING.md §9 and AGENTS.md \
-             §8 if the boundary itself moved.",
+             Fix the dependency, or change AGENTS.md §8 and SOURCE_MAPPING.md §9.3 \
+             together if the boundary itself moved.",
         );
         return Err(report.into());
     }
 
     println!(
-        "checked {} workspace members against {} `must not declare` rules, {} isolation rules, \
-         and the `odysseus-domain` internal-dependency rule",
+        "checked {} workspace members against {} documented rules, {} isolation rules, and \
+         the `odysseus-domain` internal-dependency rule",
         names.len(),
-        FORBIDDEN.len(),
+        rules.len(),
         ISOLATED.len()
     );
     Ok(())
 }
 
-/// Guards the checker itself: the rule table must not be silently emptied.
+/// The two documents must state the same rules.
 ///
-/// A rule table that accidentally loses an entry still passes the gate above,
-/// because a checker with no rules reports no violations. This asserts the table
-/// still names the crates and dependencies the documents forbid, so deleting a
-/// rule is a test failure rather than a silent loss of coverage.
+/// This is the anti-drift property. `SOURCE_MAPPING.md` §9.3 drifted from
+/// `AGENTS.md` §8 precisely because nothing compared them: §9 named four crates,
+/// §8 named ten, and the two were never reconciled. If a rule is added to one
+/// document and not the other, this fails -- so the "which document is right"
+/// question cannot be answered by picking whichever one the CI happens to read.
 ///
 /// # Errors
 ///
-/// Propagates any error from locating the manifest or running `cargo metadata`.
+/// Propagates any error reading either document.
 #[test]
-fn the_rule_table_still_covers_every_documented_rule() -> Result<(), Box<dyn std::error::Error>> {
+fn the_two_documents_agree_on_every_rule() -> Result<(), Box<dyn std::error::Error>> {
+    let agents = rules_from_agents()?;
+    let mapping = rules_from_source_mapping()?;
+
+    assert!(
+        !agents.is_empty(),
+        "no rules parsed from AGENTS.md §8; the parser has drifted from the table"
+    );
+
+    let mut agents_sorted = agents.clone();
+    let mut mapping_sorted = mapping.clone();
+    agents_sorted.sort();
+    mapping_sorted.sort();
+
+    assert_eq!(
+        agents_sorted, mapping_sorted,
+        "AGENTS.md §8 and SOURCE_MAPPING.md §9.3 disagree. AGENTS.md §8 is the source of \
+         truth, so update §9.3 to match it in the same commit."
+    );
+    Ok(())
+}
+
+/// Every rule must name a crate that exists, and every **library crate** must be
+/// ruled on.
+///
+/// Two failure modes this catches: a rule naming a crate that was renamed (the
+/// rule would silently never match anything), and a new library crate being
+/// added with no row in either document (so nothing constrains it at all).
+///
+/// The second half covers `crates/*` only. `AGENTS.md` §8 is deliberately a table
+/// of the ten *library* crates; `apps/odysseus-server` and `odysseus-cli` are
+/// binaries whose whole purpose is to compose the library, so they sit above the
+/// architecture rather than inside it. Requiring a row for them would mean
+/// inventing prohibitions nobody agreed to.
+///
+/// # Errors
+///
+/// Propagates any error reading the documents or running `cargo metadata`.
+#[test]
+fn every_rule_names_a_real_crate_and_every_library_crate_is_ruled_on()
+-> Result<(), Box<dyn std::error::Error>> {
     let metadata = load_metadata(&manifest_path()?)?;
     let names = members_by_name(&metadata)?;
+    let rules = rules_from_agents()?;
 
-    for expected in [
-        DOMAIN,
-        "odysseus-store",
-        "odysseus-ui",
-        "odysseus-agent",
-        "odysseus-llm",
-        "odysseus-tools",
-        "odysseus-services",
-        "odysseus-integrations",
-        "odysseus-ml",
-        "odysseus-web",
-    ] {
+    for rule in &rules {
         assert!(
-            names.contains(expected),
-            "expected {expected} to be a workspace member; the rule table is keyed by name \
-             and would silently skip a rule for a renamed crate"
+            names.contains(rule.crate_name.as_str()),
+            "AGENTS.md §8 rules `{}`, which is not a workspace member; a rule for a crate \
+             that does not exist matches nothing",
+            rule.crate_name
         );
     }
 
-    // The exact prohibition sets, so a well-meaning edit to one of them has to be
-    // a deliberate change to this assertion too.
-    let covered: BTreeSet<(&str, &str)> = FORBIDDEN
-        .iter()
-        .flat_map(|rule| rule.deps.iter().map(move |dep| (rule.crate_name, *dep)))
-        .collect();
-    let expected: BTreeSet<(&str, &str)> = [
-        ("odysseus-store", "axum"),
-        ("odysseus-store", "leptos"),
-        ("odysseus-store", "reqwest"),
-        ("odysseus-llm", "axum"),
-        ("odysseus-llm", "leptos"),
-        ("odysseus-agent", "axum"),
-        ("odysseus-agent", "leptos"),
-        ("odysseus-tools", "axum"),
-        ("odysseus-services", "axum"),
-        ("odysseus-services", "leptos"),
-        ("odysseus-integrations", "axum"),
-        ("odysseus-integrations", "leptos"),
-        ("odysseus-ui", "rusqlite"),
-        ("odysseus-ui", "reqwest"),
-    ]
-    .into_iter()
-    .collect();
-    assert_eq!(covered, expected, "the enforced prohibition set changed");
+    for name in &names {
+        if APPS.contains(name) {
+            continue;
+        }
+        assert!(
+            rules.iter().any(|rule| rule.crate_name == *name),
+            "{name} is a library crate with no row in the AGENTS.md §8 rule table. Add one, \
+             even if its prohibition set is empty, so the omission is deliberate."
+        );
+    }
+    Ok(())
+}
 
-    let isolated: BTreeSet<(&str, &str)> =
-        ISOLATED.iter().map(|rule| (rule.dep, rule.owner)).collect();
-    assert_eq!(
-        isolated,
-        BTreeSet::from([("ort", "odysseus-ml"), ("ort-sys", "odysseus-ml")]),
-        "the enforced isolation set changed"
+/// The `odysseus-ml` isolation rule must exist in both documents.
+///
+/// `odysseus-ml` is the one crate with no `axum`/`leptos` row in either document
+/// before this revision, and the `ort` isolation rule is the only thing keeping
+/// the inference runtime swappable. If a future edit drops the crate from the
+/// table, nothing should notice silently.
+///
+/// # Errors
+///
+/// Propagates any error reading either document.
+#[test]
+fn the_ml_isolation_rule_is_present_in_both_documents() -> Result<(), Box<dyn std::error::Error>> {
+    let agents = std::fs::read_to_string(repo_root()?.join("AGENTS.md"))?;
+    let mapping = std::fs::read_to_string(repo_root()?.join("SOURCE_MAPPING.md"))?;
+
+    assert!(
+        agents.contains("| `odysseus-ml` |"),
+        "AGENTS.md §8 has no `odysseus-ml` row"
+    );
+    assert!(
+        agents.contains("`ort`, `ort-sys`"),
+        "AGENTS.md §8's `odysseus-ml` row does not name the ort dependencies it owns"
+    );
+    assert!(
+        mapping.contains("### 9.4 Additional rules"),
+        "SOURCE_MAPPING.md §9.4 is missing"
+    );
+    assert!(
+        mapping.contains("`ort` and `ort-sys` may be declared only by"),
+        "SOURCE_MAPPING.md §9.4 does not state the ort isolation rule"
     );
     Ok(())
 }
@@ -491,7 +643,7 @@ fn the_checker_detects_a_forbidden_dependency_it_was_built_to_catch()
     std::fs::write(root.join("crates/store/src/lib.rs"), "")?;
 
     let metadata = load_metadata(&root.join("Cargo.toml"))?;
-    let violations = check(&metadata);
+    let violations = check(&metadata, &rules_from_agents()?);
 
     assert_eq!(
         violations.len(),
@@ -550,7 +702,7 @@ fn a_renamed_dependency_is_still_caught_by_its_upstream_name()
     std::fs::write(root.join("crates/agent/src/lib.rs"), "")?;
 
     let metadata = load_metadata(&root.join("Cargo.toml"))?;
-    let violations = check(&metadata);
+    let violations = check(&metadata, &rules_from_agents()?);
 
     assert_eq!(
         violations.len(),
