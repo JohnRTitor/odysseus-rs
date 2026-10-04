@@ -275,23 +275,6 @@ pub fn consume_backup_code(stored: &[String], presented: &str) -> Option<Vec<Str
     Some(remaining)
 }
 
-/// Whether a user with 2FA enabled may be let in.
-///
-/// The single most security-relevant function in this module, and the reason it
-/// exists separately: `auth.py:526-548` checks `totp_enabled` *first* and returns
-/// `True` when it is false, then fails closed when the flag is set but the secret
-/// is missing. Both halves are load-bearing and the order is not interchangeable.
-#[must_use]
-pub fn admits_login(totp_enabled: bool, secret_present: bool) -> bool {
-    if !totp_enabled {
-        // No second factor was ever enrolled, so there is nothing to fail.
-        return true;
-    }
-    // Enabled with no secret means a corrupt or half-written auth.json. Refusing
-    // is the whole point: the alternative bypasses 2FA entirely.
-    secret_present
-}
-
 /// Lowercase hex, matching `secrets.token_hex`.
 fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -364,23 +347,6 @@ mod tests {
         let shown = format!("{generated:?}");
         assert_eq!(shown, "REDACTED");
         assert!(!shown.contains(&secret_to_base32(&generated)));
-    }
-
-    // -- the fail-closed gate ----------------------------------------------
-
-    #[test]
-    fn two_factor_disabled_admits_and_enabled_without_a_secret_refuses() {
-        // auth.py:529-537. The two halves are not interchangeable.
-        assert!(
-            admits_login(false, false),
-            "no second factor enrolled means nothing to fail"
-        );
-        assert!(admits_login(false, true),);
-        assert!(
-            !admits_login(true, false),
-            "enabled with no secret must fail closed, not bypass 2FA"
-        );
-        assert!(admits_login(true, true));
     }
 
     // -- code verification --------------------------------------------------

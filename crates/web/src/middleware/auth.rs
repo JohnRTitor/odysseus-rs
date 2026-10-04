@@ -328,7 +328,14 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Extracts the session cookie value.
-fn session_cookie(headers: &HeaderMap) -> Option<String> {
+///
+/// `pub(crate)` rather than private because `/api/auth/status` and
+/// `/api/auth/logout` are in [`AUTH_EXEMPT_EXACT`], so the gate returns before
+/// inserting an `AuthContext` and those handlers must read the cookie themselves.
+/// A second parser would be an auth bug, not duplication: `logout` could revoke a
+/// token the gate never validated, and `status` could report a different user
+/// than the one the gate admitted.
+pub(crate) fn session_cookie(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(header::COOKIE)?.to_str().ok()?;
     raw.split(';')
         .filter_map(|pair| pair.trim().split_once('='))

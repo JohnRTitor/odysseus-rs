@@ -1077,6 +1077,12 @@ impl AuthStore {
 
         // Step 2: enabled with no secret at all is a corrupt auth.json. Fail closed.
         // `auth.py:532-537` records that this once returned true.
+        //
+        // This is the only place the "fail closed when 2FA is on but unusable" rule
+        // is decided. It used to also live in `totp::admits_login`, whose unit test
+        // covered a function no production path called -- so the tested function and
+        // the load-bearing one were different objects. `tests/totp_flows.rs` plants
+        // the corrupt state through the raw file and exercises the real path.
         let Some(stored) = user.totp_secret.clone().filter(|s| !s.trim().is_empty()) else {
             tracing::error!(user = %key, "totp_enabled with no secret; refusing");
             return Ok(false);

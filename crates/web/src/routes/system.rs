@@ -47,14 +47,19 @@ pub async fn version() -> Json<VersionBody> {
 pub async fn ready(State(state): State<AppState>) -> Result<Json<ReadinessBody>, crate::AppError> {
     // Opening a connection is the cheapest real check that the database is
     // usable; it runs on the blocking pool per D11.
-    let report = odysseus_store::blocking::spawn_blocking({
+    //
+    // The `?` is load-bearing. `spawn_blocking` returns
+    // `Result<Result<Connection, StoreError>, JoinError>`, and peeling only the
+    // outer `JoinError` — then discarding the inner — reported `ready: true`
+    // while every DB-backed route was 500ing, so a degraded instance was never
+    // recycled. §5 forbids swallowing a write error, and this is the same shape.
+    odysseus_store::blocking::spawn_blocking({
         let store = state.store.clone();
         move || store.connect()
     })
     .await
-    .map_err(|e| crate::AppError::Unavailable(format!("database check failed: {e}")))?;
-
-    let _ = report;
+    .map_err(|e| crate::AppError::Unavailable(format!("database check failed: {e}")))?
+    .map_err(|e| crate::AppError::Unavailable(format!("database unusable: {e}")))?;
 
     Ok(Json(ReadinessBody {
         ready: true,
@@ -153,5 +158,81 @@ fn ollama_base_url() -> String {
         String::from("http://host.docker.internal:11434/v1")
     } else {
         String::from("http://127.0.0.1:11434/v1")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::ready,
+        axum::{
+            Router,
+            body::Body,
+            http::{Request, StatusCode},
+            routing::get,
+        },
+        odysseus_store::Store,
+        std::sync::Arc,
+        tower::ServiceExt as _,
+    };
+
+    use crate::AppState;
+
+    fn state_over(store: Store) -> AppState {
+        let auth = odysseus_store::auth::AuthStore::new(store.data_dir().expect("data dir"));
+        AppState {
+            api_tokens: Arc::new(odysseus_store::api_tokens::ApiTokenStore::new(
+                store.clone(),
+            )),
+            auth: Arc::new(auth),
+            store: Arc::new(store),
+            internal_tool_token: Arc::from("t"),
+            localhost_bypass: false,
+            request_timeout: std::time::Duration::from_secs(45),
+            slow_request_threshold: std::time::Duration::from_secs_f64(0.75),
+        }
+    }
+
+    async fn probe(state: AppState) -> StatusCode {
+        Router::new()
+            .route("/api/ready", get(ready))
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ready")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("oneshot")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn readiness_is_200_when_the_database_opens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_over(Store::open(dir.keep().join("app.db")));
+        assert_eq!(probe(state).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_is_503_when_the_database_cannot_be_opened() {
+        // The whole reason `/api/ready` exists separately from `/api/health`. This
+        // branch was unreachable: the handler peeled the outer `JoinError` and
+        // discarded the inner `Result`, so it reported `ready: true` while every
+        // DB-backed route was failing, and an orchestrator never recycled the
+        // instance.
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A regular file where a directory must be: `connect` calls
+        // `create_dir_all` on the parent, which cannot succeed.
+        let blocker = dir.keep().join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("write blocker");
+
+        let state = state_over(Store::open(blocker.join("nested").join("app.db")));
+        assert_eq!(
+            probe(state).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unusable database must not report ready"
+        );
     }
 }

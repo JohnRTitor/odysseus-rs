@@ -12,7 +12,7 @@ use {
         http::StatusCode,
         response::{IntoResponse, Response},
     },
-    serde::Serialize,
+    serde::{Deserialize, Serialize},
 };
 
 /// Result alias for web-layer handlers.
@@ -139,9 +139,7 @@ impl AppError {
     }
 }
 
-/// The wire representation. Field names match the Python handlers so the
-/// frontend needs no changes.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ErrorBody {
     error: &'static str,
     message: String,
@@ -161,7 +159,20 @@ impl IntoResponse for AppError {
 
         let body = ErrorBody {
             error: self.code(),
-            message: self.to_string(),
+            // The `Display` of a store or auth error embeds the absolute path it
+            // failed on (`io error at {path}: …`). Sending that to the client
+            // discloses the filesystem layout and the OS username, and — because
+            // "missing", "io error" and "malformed" render differently — it is a
+            // reliable oracle for the state of the credential store. §5 forbids
+            // leaking internal paths and URLs, so a 5xx gets a fixed message.
+            //
+            // The detail is not lost: it is in the `tracing::error!` above, which
+            // is where an operator reads it.
+            message: if status.is_server_error() {
+                String::from("Internal error")
+            } else {
+                self.to_string()
+            },
         };
         // The body has a fixed shape, so this cannot fail.
         let json = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
@@ -176,7 +187,88 @@ impl IntoResponse for AppError {
 
 #[cfg(test)]
 mod tests {
-    use {super::AppError, axum::http::StatusCode};
+    use {
+        super::AppError,
+        axum::{http::StatusCode, response::IntoResponse},
+        serde::Deserialize,
+    };
+
+    /// The `{"error": CODE, "message": str}` shape the frontend branches on.
+    ///
+    /// `IntoResponse` had no test at all before this: the module doc states the
+    /// shape, and nothing checked that the body actually had it.
+    ///
+    /// Deserialises into a `String`-owned mirror rather than [`ErrorBody`],
+    /// whose `error` field is `&'static str` and so cannot be built from a
+    /// runtime buffer.
+    async fn body_of(error: AppError) -> (StatusCode, WireBody) {
+        let response = error.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let parsed: WireBody = serde_json::from_slice(&bytes).expect("json body");
+        (status, parsed)
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WireBody {
+        error: String,
+        message: String,
+    }
+
+    #[tokio::test]
+    async fn a_5xx_never_echoes_a_filesystem_path_to_the_client() {
+        // `StoreError::Io`'s Display embeds the absolute path. A corrupt
+        // `auth.json` would otherwise answer with the install layout and the OS
+        // username, and the differing wording per failure mode is an oracle for
+        // the credential store's state.
+        let leaky = odysseus_store::StoreError::Io {
+            path: std::path::PathBuf::from("/home/alice/.odysseus/data/app.db"),
+            source: std::io::Error::other("permission denied"),
+        };
+        let (status, body) = body_of(AppError::Store(leaky)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.message, "Internal error");
+        assert!(
+            !body.message.contains("/home/alice"),
+            "the path leaked: {}",
+            body.message
+        );
+        assert!(
+            !body.message.contains("app.db"),
+            "the filename leaked: {}",
+            body.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_5xx_still_carries_a_stable_machine_readable_code() {
+        // Redacting the message must not lose the code the frontend switches on.
+        let (status, body) =
+            body_of(AppError::Store(odysseus_store::StoreError::Interrupted)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, "Internal error");
+    }
+
+    #[tokio::test]
+    async fn a_4xx_keeps_its_message_because_the_caller_can_act_on_it() {
+        // The opposite rule from the 5xx case, and it must be pinned: the
+        // frontend shows these.
+        let (status, body) = body_of(AppError::Forbidden("nope".into())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.message, "Forbidden: nope");
+    }
+
+    #[tokio::test]
+    async fn an_auth_store_failure_is_a_500_and_never_a_401() {
+        // A 401 here would tell the client its credentials were wrong and send it
+        // to /login when the real problem is that auth.json is unreadable. No
+        // test covered this arm before.
+        let (status, _) = body_of(AppError::Store(odysseus_store::StoreError::Interrupted)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+    }
 
     #[test]
     fn application_errors_map_to_the_python_exception_handler_statuses() {

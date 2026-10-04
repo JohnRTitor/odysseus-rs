@@ -13,7 +13,10 @@
 
 use std::path::PathBuf;
 
-use odysseus_store::{Store, crypto};
+use odysseus_store::{
+    Store,
+    crypto::{self, ENCRYPTED_PREFIX},
+};
 
 /// Absolute path to the migrations directory, resolved at compile time.
 fn migrations_dir() -> PathBuf {
@@ -334,10 +337,22 @@ fn opens_a_real_python_created_database_when_available() -> Result<(), Box<dyn s
         let mut checked = 0;
         for row in rows {
             let stored = row?;
+            // This used to assert `maybe_decrypt(x) == maybe_decrypt(x)`, which
+            // compares an expression to itself and cannot fail for any
+            // implementation. The property worth pinning is that decryption
+            // actually *happened* — `maybe_decrypt` passes plaintext through
+            // untouched by design, so a regression that stopped decrypting would
+            // still have satisfied the old assertion.
+            let plaintext = crypto::maybe_decrypt(&key, &stored)?;
+            assert!(
+                !plaintext.starts_with(ENCRYPTED_PREFIX),
+                "a value stored as {ENCRYPTED_PREFIX}… must decrypt, not pass through: \
+                 got {plaintext:?}"
+            );
             assert_eq!(
+                plaintext,
                 crypto::maybe_decrypt(&key, &stored)?,
-                crypto::maybe_decrypt(&key, &stored)?,
-                "decryption must be deterministic"
+                "decryption must be deterministic across calls"
             );
             checked += 1;
         }

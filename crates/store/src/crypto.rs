@@ -46,6 +46,13 @@ pub enum CryptoError {
     Decrypt(String),
 }
 
+/// The marker distinguishing a ciphertext from a plaintext value.
+///
+/// Matches the Python format exactly (`core/crypto.py`): a stored value is
+/// encrypted iff it begins with this. The three idempotence checks in the Python
+/// migrations rely on it, so changing it would make them re-encrypt on every run.
+pub const ENCRYPTED_PREFIX: &str = "enc:";
+
 /// Loads a Fernet key from disk.
 ///
 /// # Errors
@@ -77,7 +84,7 @@ pub fn encrypt(key: &Fernet, plaintext: &str) -> String {
     if plaintext.is_empty() {
         return String::new();
     }
-    format!("enc:{}", key.encrypt(plaintext.as_bytes()))
+    format!("{ENCRYPTED_PREFIX}{}", key.encrypt(plaintext.as_bytes()))
 }
 
 /// Decrypts a value produced by [`encrypt`].
@@ -92,7 +99,7 @@ pub fn encrypt(key: &Fernet, plaintext: &str) -> String {
 /// Returns [`CryptoError::Decrypt`] if the value is prefixed but cannot be
 /// decrypted.
 pub fn maybe_decrypt(key: &Fernet, stored: &str) -> Result<String, CryptoError> {
-    let Some(token) = stored.strip_prefix("enc:") else {
+    let Some(token) = stored.strip_prefix(ENCRYPTED_PREFIX) else {
         return Ok(stored.to_owned());
     };
     let plaintext = key
@@ -107,7 +114,7 @@ pub fn maybe_decrypt(key: &Fernet, stored: &str) -> Result<String, CryptoError> 
 /// because the Python migrations rely on being idempotent.
 #[must_use]
 pub fn is_encrypted(stored: &str) -> bool {
-    stored.starts_with("enc:")
+    stored.starts_with(ENCRYPTED_PREFIX)
 }
 
 #[cfg(test)]
@@ -172,5 +179,82 @@ mod tests {
             !stored.contains("hunter2"),
             "plaintext must not be recoverable by eye"
         );
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    //! `load_key` had no test anywhere in the workspace: its only caller is the
+    //! real-database check in `tests/baseline.rs`, which returns early when
+    //! `DATA_DIR` is unset — so in CI it was dead code. It is also the function
+    //! whose doc calls the 44-byte Fernet format a hard compatibility requirement,
+    //! so "the key loads" is worth proving directly.
+
+    use {
+        super::{CryptoError, ENCRYPTED_PREFIX, encrypt, load_key, maybe_decrypt},
+        fernet::Fernet,
+    };
+
+    fn write(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".app_key");
+        std::fs::write(&path, contents).expect("write key");
+        (dir, path)
+    }
+
+    #[test]
+    fn a_generated_key_loads_and_round_trips() {
+        let key = Fernet::generate_key();
+        let (_dir, path) = write(&key);
+        let loaded = load_key(&path).expect("load");
+        let sealed = encrypt(&loaded, "hello");
+        assert!(sealed.starts_with(ENCRYPTED_PREFIX));
+        assert_eq!(maybe_decrypt(&loaded, &sealed).expect("decrypt"), "hello");
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_tolerated_because_the_python_writes_a_trailing_newline() {
+        let key = Fernet::generate_key();
+        let (_dir, path) = write(&format!("{key}\n"));
+        assert!(
+            load_key(&path).is_ok(),
+            "a trailing newline must not break it"
+        );
+    }
+
+    #[test]
+    fn a_non_fernet_key_is_rejected_rather_than_accepted_as_something_weaker() {
+        let (_dir, path) = write("definitely-not-a-fernet-key");
+        // Mapped to `()` first: `expect_err` and `panic!("{other:?}")` would both
+        // need `Fernet: Debug`, which it deliberately is not — a key must never be
+        // printable. `clippy::panic` is denied workspace-wide, so this is asserted
+        // rather than panicked.
+        let outcome: Result<(), CryptoError> = load_key(&path).map(|_| ());
+        assert!(
+            matches!(outcome, Err(CryptoError::InvalidKey(_))),
+            "a malformed key must be refused with InvalidKey"
+        );
+    }
+
+    #[test]
+    fn a_missing_key_file_reports_the_path_it_tried() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope");
+        let outcome: Result<(), CryptoError> = load_key(&missing).map(|_| ());
+        assert!(
+            matches!(
+                outcome,
+                Err(CryptoError::ReadKey { ref path, .. }) if path.ends_with("nope")
+            ),
+            "a missing key file must report ReadKey naming the path it tried"
+        );
+    }
+
+    #[test]
+    fn a_key_file_of_the_wrong_length_is_rejected() {
+        // A 32-byte secret is a valid key for many primitives but not for Fernet.
+        // Accepting it would mean writing ciphertext nothing else can read.
+        let (_dir, path) = write(&"A".repeat(32));
+        assert!(load_key(&path).is_err());
     }
 }
