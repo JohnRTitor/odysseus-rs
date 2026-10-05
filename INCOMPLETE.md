@@ -1,5 +1,5 @@
-# INCOMPLETE.md — Authoritative Status Registerseen: 1 (conditional) |
-| Spikes resolved
+# INCOMPLETE.md — Authoritative Status Register
+
 **This file is authoritative.** It lists every feature that is `PARTIAL` or
 `UNIMPLEMENTED`. It must be updated whenever implementation begins.
 
@@ -304,6 +304,41 @@ Also corrected during the port, and worth stating because the task text was wron
 entries, not 8 — `embedding` and `reranker` were missing from the summary. The
 `models[0]` fallback is preserved deliberately: when every id is non-chat it returns
 the first rather than `None`, making it a best-effort pick rather than a filter.
+
+### 4.4 T0110 audit — what `style-src` actually governs
+
+Measured against the Python source, because the task text implies the JS style
+writes are the problem and they are not.
+
+| Surface | Count | Governed by `style-src`? |
+|---|---|---|
+| `style="…"` attributes in `static/index.html` | 430 | **Yes** |
+| `style="…"` attributes in `static/login.html` | 5 | **Yes** |
+| `<style>` blocks in those two documents | 2 | **Yes** |
+| `style="…` inside server-rendered Python strings | 0 | — |
+| JS writes via `el.style.x = …` / `setProperty` | 3,234 across 86 files | **No** |
+
+**CSP does not restrict CSSOM writes.** `style-src` gates `<style>` elements and
+`style=` attributes *as parsed from markup*; programmatic assignment through
+`el.style` is not a CSP-checked operation — which is why CSP has no mechanism to
+stop `el.style.background = url(...)`. The 3,234 JS writes are a maintainability
+concern, not a policy one, and they do **not** have to be converted before
+`style-src` can drop `'unsafe-inline'`.
+
+The 435 markup attributes are the real inventory, and they are small: sampling
+shows they are overwhelmingly static layout declarations — `display:none` (45),
+`flex:1` (18), `margin-bottom:8px` (18), `flex-shrink:0;opacity:0.5` (10),
+`vertical-align:-2px;margin-right:5px;opacity:0.6` (29), and similar. None are
+computed at render time, so they move to utility classes mechanically, with no
+behaviour change and no dynamic-value problem to solve.
+
+This is why `style-src 'self'` was tightened rather than 'nonce-only' (T0112): the
+Rust Leptos shell emits no `style=` attribute and no `<style>` element, so a nonce
+would authorise an inline style nothing produces. When the Python shell's two
+documents are ported, their 435 attributes become classes — they do not earn an
+escape hatch back. Asserted by
+`the_served_page_contains_nothing_the_tightened_policy_blocks`, which fails if a
+markup style attribute or `<style>` block reappears.
 
 ---
 

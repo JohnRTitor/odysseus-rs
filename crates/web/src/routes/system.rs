@@ -125,11 +125,24 @@ pub async fn ui_shell(
     leptos_axum::render_app_to_stream_with_context(
         move || {
             leptos::prelude::provide_context(odysseus_ui::Nonce(nonce.0.clone()));
-            // `ResponseOptions` is deliberately NOT provided here. `handle_response`
-            // already provides the instance the response is actually built from,
-            // *before* calling this closure — so providing another here shadows it
-            // and a component's `set_status` would amend a copy that is thrown away.
-            // That is why the 404 came back as 200 on the first attempt.
+
+            // Leptos's own nonce, replaced with ours.
+            //
+            // `handle_response` calls `leptos::nonce::provide_nonce()` before it
+            // invokes this closure, which generates a **fresh random** nonce and
+            // stamps it onto the hydration `<script>` tags. Nothing makes it match
+            // the one in our `script-src`. So out of the box Leptos emits
+            // `<script nonce="12E3Gq...">` under a header that authorises
+            // `<script nonce="cbd0ba...">` — the browser refuses both hydration
+            // scripts, and the page silently never becomes interactive. No status
+            // code and no server log betrays it.
+            //
+            // Overriding it here is the only fix available: `Nonce`'s field is
+            // `pub(crate)`, but `Nonce::from_value` is public, and this closure runs
+            // after `provide_contexts`, so the provided value shadows Leptos's.
+            // `tests/ui_shell.rs` asserts every `<script>` carries the header nonce,
+            // which is the assertion that would have caught this.
+            leptos::prelude::provide_context(leptos::nonce::Nonce::from_value(nonce.0.clone()));
         },
         odysseus_ui::App,
     )(request)

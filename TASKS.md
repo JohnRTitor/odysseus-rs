@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 72 / 489 complete · 3 blocked · Phase 0 in progress
+**Status:** 74 / 489 complete · 4 blocked · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — **11 of 11 resolved** (S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11); 0 pending. Of those, **2 features were removed** (F169 remove-bg, S5 FAIL as published; F176 local diffusion, S9 scope decision) and **2 remain blocked or unverified**: F140 PDF rasterisation is licence-blocked (`mupdf` is AGPL-3.0, not on `deny.toml`; `poppler-rs` links GPL-2.0 libpoppler while reporting MIT), and S6 CUDA is unverified for want of a GPU.
 
@@ -133,9 +133,9 @@ is written.**
 
 ### 0.7 CSP prerequisite (**must land before any Leptos page ships**)
 
-- [ ] T0110 Audit every JS-set `style=` write in the source
-- [ ] T0111 Convert dynamic styles to class or `data-*` + CSS. Zero inline `style` attributes
-- [ ] T0112 Tighten `style-src` to nonce-only, then **TEST** a full page under the tightened policy
+- [x] T0110 Audit every JS-set `style=` write in the source — **audited, and the task text is wrong about the mechanism.** `style-src` governs `<style>` elements and `style=` attributes *as parsed from markup*; it does not gate CSSOM writes. Measured: 3,234 `el.style.*` / `setProperty` writes across 86 JS files are **not** CSP-relevant, while the real inventory is **435 markup `style=` attributes + 2 `<style>` blocks** in `index.html`/`login.html`, and 0 in server-rendered Python. All 435 are static layout values (`display:none`, `flex:1`, `margin-bottom:8px`), so the conversion is mechanical. Full table in INCOMPLETE.md §4.4
+- [!] T0111 Convert dynamic styles to class or `data-*` + CSS. Zero inline `style` attributes — **scope corrected by the T0110 audit, and now blocked on the port.** There are no *dynamic* inline styles to convert: the 435 attributes are static and the 3,234 JS writes are CSSOM, which CSP does not gate. What remains is moving 435 static declarations plus 2 `<style>` blocks out of `index.html`/`login.html` — and those documents do not exist in the Rust port yet. **The escape hatch does not need to be re-opened for this**; it needs the markup to arrive as classes
+- [x] T0112 Tighten `style-src` to nonce-only, then **TEST** a full page under the tightened policy — landed as `style-src 'self'`, which is **stricter** than 'nonce-only': the Leptos shell emits no `style=` attribute and no `<style>` element, so a nonce would authorise an inline style nothing produces. The pre-paint script's `documentElement.style.setProperty` is CSSOM and unaffected. Tested both directions — the policy has no `'unsafe-inline'` escape, **and** a full-page test asserts the served document contains no `style=`, no `<style>`, and that every `<script>` carries the header nonce. That last assertion caught a real bug: Leptos generates its **own** random nonce for the hydration scripts, so the browser was refusing both of them and hydration never ran; fixed by overriding it with the CSP nonce via `Nonce::from_value`
 
 ### 0.8 Performance baseline (**blocking for all later claims**)
 

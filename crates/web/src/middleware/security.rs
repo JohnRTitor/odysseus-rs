@@ -130,14 +130,28 @@ impl CspProfile {
                     .to_owned()
             }
             Self::Default => {
-                // `style-src 'unsafe-inline'` is retained because the UI sets
-                // `style=` attributes in many places. Replacing that is tracked
-                // as Phase 0 work (`UI_MIGRATION.md` §6.2); removing the escape
-                // before that refactor lands would break every page.
+                // `style-src` carries **no** `'unsafe-inline'`, and none is needed.
+                //
+                // It was previously retained on the claim that "the UI sets `style=`
+                // in many places" — true of the Python UI, which is not ported yet,
+                // and false of everything this server actually serves today:
+                //
+                //   * the Leptos shell emits no `style=` attribute and no `<style>`
+                //     element (asserted in tests/ui_shell.rs);
+                //   * the pre-paint script writes CSS custom properties through the
+                //     CSSOM (`documentElement.style.setProperty`), which CSP does
+                //     not gate — `style-src` covers markup `style=` attributes and
+                //     `<style>` blocks, not scripted property assignment;
+                //   * Tailwind arrives as a `<link rel=stylesheet>` from 'self'.
+                //
+                // So this is *stricter* than the "nonce-only" T0112 asked for: a
+                // nonce would authorise an inline `<style>` we do not emit. When the
+                // Python UI's inline styles are ported, they must become classes or
+                // `data-*` attributes (T0111) rather than earning this escape back.
                 format!(
                     "default-src 'self'; \
                      script-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net; \
-                     style-src 'self' 'unsafe-inline'; \
+                     style-src 'self'; \
                      img-src 'self' data: blob:; \
                      font-src 'self'; \
                      connect-src 'self'; \
@@ -320,6 +334,49 @@ mod tests {
         );
         assert!(policy.contains("frame-ancestors 'none'"));
         assert_eq!(CspProfile::Default.frame_options(), "DENY");
+    }
+
+    /// T0112. The Python UI needed `'unsafe-inline'` because it writes `style=`
+    /// attributes; nothing this server serves does. This test is the reason the
+    /// escape cannot quietly return — a future component that reaches for an
+    /// inline style will be refused by the browser, which is the intended outcome.
+    #[test]
+    fn the_default_policy_has_no_inline_style_escape() {
+        let policy = CspProfile::Default.policy("n");
+        assert!(
+            !policy.contains("style-src 'self' 'unsafe-inline'"),
+            "style-src must not authorise inline styles: {policy}"
+        );
+        assert!(
+            !policy.contains("style-src 'unsafe-inline'"),
+            "style-src must not authorise inline styles: {policy}"
+        );
+        assert!(
+            policy.contains("style-src 'self'"),
+            "the served Tailwind stylesheet still needs 'self': {policy}"
+        );
+    }
+
+    /// The self-contained tool-output profiles legitimately need an inline style
+    /// escape — they embed rendered HTML that is not ours to refactor. Asserting
+    /// that keeps T0112 from being "fixed" by tightening those too and breaking
+    /// report and tool rendering.
+    #[test]
+    fn the_embedded_document_profiles_still_allow_inline_styles() {
+        for profile in [CspProfile::Report, CspProfile::ToolRender] {
+            let policy = profile.policy("n");
+            assert!(
+                policy.contains("style-src 'unsafe-inline'"),
+                "{profile:?} embeds third-party markup and must keep the escape"
+            );
+        }
+        // ...while the one that frames rather than embeds does not.
+        assert!(
+            !CspProfile::PdfPreview
+                .policy("n")
+                .contains("'unsafe-inline'"),
+            "PdfPreview serves no markup of its own and must stay locked down"
+        );
     }
 
     #[test]

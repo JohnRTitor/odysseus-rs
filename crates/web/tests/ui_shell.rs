@@ -271,6 +271,79 @@ async fn the_favicon_is_served_from_the_static_mount() {
     );
 }
 
+/// T0112: the served document must contain nothing the tightened `style-src`
+/// blocks.
+///
+/// The policy test in `security.rs` proves the header is tight. This proves the page
+/// is *compatible* with it — a CSP that is correct on paper and that the page
+/// violates is just a broken page. Both directions have to hold, and only the
+/// combination means the escape can stay closed.
+///
+/// Checked rather than eyeballed because all three are invisible in a passing
+/// render: the browser silently drops a disallowed style, so the page still returns
+/// 200 and still looks structurally fine.
+#[tokio::test]
+async fn the_served_page_contains_nothing_the_tightened_policy_blocks() {
+    let (status, body, csp) = get_root().await;
+    assert_eq!(status, StatusCode::OK);
+
+    let csp = csp.expect("CSP header must be present");
+    assert!(
+        csp.contains("style-src 'self'") && !csp.contains("style-src 'self' 'unsafe-inline'"),
+        "this test is only meaningful under the tightened policy, got: {csp}"
+    );
+
+    // 1. No markup `style=` attribute anywhere. This is what `'unsafe-inline'` in
+    //    `style-src` used to authorise, and the reason the Python UI needed it.
+    assert!(
+        !body.contains("style="),
+        "the page must not use markup style attributes under `style-src 'self'`"
+    );
+
+    // 2. No <style> element. A stylesheet from 'self' is a <link>, which is fine;
+    //    an inline <style> block is not, and would need a nonce we do not issue.
+    assert!(
+        !body.contains("<style"),
+        "the page must not emit an inline <style> block under `style-src 'self'`"
+    );
+
+    // 3. Every <script> carries the nonce. A single un-nonced inline script means
+    //    the browser refuses it and hydration silently never runs — which is the
+    //    same class of failure as the 404 page once rendered with a 200.
+    let nonce = csp
+        .split("'nonce-")
+        .nth(1)
+        .and_then(|rest| rest.split('\'').next())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("");
+    assert!(!nonce.is_empty(), "no nonce in script-src: {csp}");
+
+    let scripts = body.matches("<script").count();
+    let nonced = body.matches(&format!("nonce=\"{nonce}\"")).count();
+    assert_eq!(
+        nonced, scripts,
+        "every <script> must carry the nonce; found {scripts} script tags and \
+         {nonced} nonces in: {body}"
+    );
+}
+
+/// T0112 again, from the other end: the stylesheet the page links must be loadable
+/// under `style-src 'self'`. A `<link>` to a served file is allowed; this guards
+/// against someone "fixing" a style problem by inlining the Tailwind output, which
+/// would work in dev and be blocked in production.
+#[tokio::test]
+async fn the_stylesheet_is_linked_not_inlined() {
+    let (status, body, _) = get_root().await;
+    assert_eq!(status, StatusCode::OK);
+    // Attribute order is not guaranteed — `leptos_meta` emits
+    // `<link id="leptos" rel="stylesheet" href="...">` — so both attributes are
+    // asserted independently rather than as one literal string.
+    assert!(
+        body.contains(r#"rel="stylesheet""#) && body.contains(r#"href="/pkg/odysseus-ui.css""#),
+        "Tailwind must arrive as a <link> from 'self', not as an inline <style>: {body}"
+    );
+}
+
 /// An unknown path must reach the Leptos `NotFound` route rather than axum's
 /// default empty 404 — the shell owns the 404 body, since it owns the document.
 #[tokio::test]
