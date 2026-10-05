@@ -344,6 +344,79 @@ async fn the_stylesheet_is_linked_not_inlined() {
     );
 }
 
+/// T0105. The loader must be *styled*, not merely present.
+///
+/// Every one of the Python overlay's eight inline style declarations became a
+/// Tailwind class in this port, which moved the failure mode: a missing class
+/// produces no error, no failed request and no visible symptom in any test that
+/// only checks the HTML. The overlay would simply stop covering the page, which is
+/// the exact failure it exists to prevent.
+///
+/// So this asserts the compiled stylesheet actually carries the declarations. It is
+/// deliberately a list of concrete CSS values rather than class names, because the
+/// class names are the thing that could silently stop matching — Tailwind emits
+/// `.5` for `opacity-50`, not `0.5`, so a literal-copy assertion would be brittle
+/// in exactly the wrong direction.
+#[tokio::test]
+async fn the_loader_overlay_is_actually_styled_by_the_compiled_css() {
+    let response = odysseus_web::app::router(&state())
+        .oneshot(from_loopback("/pkg/odysseus-ui.css"))
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("body reads");
+    let css = String::from_utf8_lossy(&bytes).into_owned();
+
+    for declaration in [
+        "position: fixed",              // covers the viewport
+        "inset: 0",                     //
+        "z-index: 99999",               // above everything
+        "flex-direction: column",       //
+        "align-items: center",          //
+        "justify-content: center",      //
+        "padding-top: 10px",            // room for the bouncing dot
+        "font-size: 11px",              //
+        "white-space: pre",             // the wave glyphs must not wrap
+        "transition-property: opacity", // the fallback fade
+    ] {
+        assert!(
+            css.contains(declaration),
+            "the loader depends on `{declaration}`, which the compiled stylesheet \
+             does not define -- a Tailwind class stopped matching"
+        );
+    }
+
+    // The wave's colour is a color-mix against the runtime theme custom property.
+    // Asserted separately because a `color-mix` typo fails silently into
+    // transparent text rather than into a missing declaration.
+    assert!(
+        css.contains("color-mix") && css.contains("--brand-color"),
+        "the wave colour must interpolate against --brand-color"
+    );
+}
+
+/// T0105. The overlay is server-rendered because its job is to cover the gap
+/// between the first byte and hydration — a client-rendered overlay arrives after
+/// the flash it exists to hide.
+#[tokio::test]
+async fn the_loader_overlay_is_in_the_served_document() {
+    let (status, body, _) = get_root().await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("id=\"app-loader\"") && body.contains("id=\"loader-wave\""),
+        "the overlay must be server-rendered, before the router; body was: {body}"
+    );
+    // And the script that animates and eventually removes it must be inline and
+    // nonce-gated, because its 5 s fallback covers a boot where the bundle never
+    // arrives -- which a bundled script could not do.
+    assert!(
+        body.contains("__odysseusLoaderWaveStop"),
+        "the loader's stop hook must be reachable from the shell"
+    );
+}
+
 /// An unknown path must reach the Leptos `NotFound` route rather than axum's
 /// default empty 404 — the shell owns the 404 body, since it owns the document.
 #[tokio::test]

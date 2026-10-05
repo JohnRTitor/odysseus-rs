@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 74 / 489 complete · 4 blocked · Phase 0 in progress
+**Status:** 79 / 489 complete · 4 blocked · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — **11 of 11 resolved** (S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11); 0 pending. Of those, **2 features were removed** (F169 remove-bg, S5 FAIL as published; F176 local diffusion, S9 scope decision) and **2 remain blocked or unverified**: F140 PDF rasterisation is licence-blocked (`mupdf` is AGPL-3.0, not on `deny.toml`; `poppler-rs` links GPL-2.0 libpoppler while reporting MIT), and S6 CUDA is unverified for want of a GPU.
 
@@ -131,7 +131,7 @@ is written.**
 - [ ] T0106 PWA manifest + rewritten service worker
 - [!] T0107 **TEST: SSR renders; no FOUC (CSS vars set before first paint)** — **SSR half proven by T0101; the no-FOUC half needs a browser.** Proven server-side: the script is inlined in `<head>` ahead of any styled content, carries the CSP nonce that authorises it, and sets every `--hl-*` variable `theme.rs` derives. Not proven: that the browser *executes* it before the first painted frame, which only a headless-browser assertion can show
 
-### 0.7 CSP prerequisite (**must land before any Leptos page ships**)
+- [x] T0105 Loader overlay + boot sequencing — server-rendered before the router, because its job is to cover the gap between the first byte and hydration; a client-rendered overlay arrives after the flash it exists to hide. All nine wave frames, the 150 ms interval and the 5 s/300 ms timings ported exactly, and the fallback **removes** the node rather than only fading it (the app reads its presence as "startup in progress"). The Python overlay's eight inline `style=` declarations became Tailwind classes, and its per-frame dot moves through a CSS custom property set via the CSSOM -- because CSP checks style attributes in markup parsed via `innerHTML` too, so the original interpolation would have been silently refused under `style-src 'self'`. Tests assert the served document has no inline style, and that the compiled stylesheet really carries the declarations the overlay depends on
 
 - [x] T0110 Audit every JS-set `style=` write in the source — **audited, and the task text is wrong about the mechanism.** `style-src` governs `<style>` elements and `style=` attributes *as parsed from markup*; it does not gate CSSOM writes. Measured: 3,234 `el.style.*` / `setProperty` writes across 86 JS files are **not** CSP-relevant, while the real inventory is **435 markup `style=` attributes + 2 `<style>` blocks** in `index.html`/`login.html`, and 0 in server-rendered Python. All 435 are static layout values (`display:none`, `flex:1`, `margin-bottom:8px`), so the conversion is mechanical. Full table in INCOMPLETE.md §4.4
 - [!] T0111 Convert dynamic styles to class or `data-*` + CSS. Zero inline `style` attributes — **scope corrected by the T0110 audit, and now blocked on the port.** There are no *dynamic* inline styles to convert: the 435 attributes are static and the 3,234 JS writes are CSSOM, which CSP does not gate. What remains is moving 435 static declarations plus 2 `<style>` blocks out of `index.html`/`login.html` — and those documents do not exist in the Rust port yet. **The escape hatch does not need to be re-opened for this**; it needs the markup to arrive as classes

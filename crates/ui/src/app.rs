@@ -36,6 +36,14 @@ use {
 /// paint, which is the entire problem this script exists to solve.
 pub const PREPAINT_SCRIPT: &str = include_str!("prepaint.js");
 
+/// The boot loader's behaviour, ported from `static/index.html:259-293`.
+///
+/// Inline and nonce-gated rather than bundled, because its 5 s fallback exists for
+/// exactly the case where the bundle never arrives — a script inside the bundle
+/// could not cover its own absence. See [`LOADER_SCRIPT`]'s own header for the CSP
+/// constraint that rules out the original's `innerHTML` interpolation.
+pub const LOADER_SCRIPT: &str = include_str!("loader.js");
+
 /// What `/settings` will eventually hold. Named so the string is greppable from both
 /// the Rust and the rendered HTML.
 pub const NOT_BUILT_SETTINGS: &str = "Account, provider and appearance settings.";
@@ -67,7 +75,7 @@ pub fn App() -> impl IntoView {
     // decision belongs to T0112, which tightens `script-src`; it is named here
     // because this component is where the two halves have to meet.
     let nonce = use_context::<Nonce>();
-    let nonce_attr = nonce.map(|n| n.0);
+    let nonce_attr = nonce.map(|n| n.0.clone());
 
     view! {
         <!DOCTYPE html>
@@ -96,9 +104,38 @@ pub fn App() -> impl IntoView {
                 // browser runs it during head parsing. That ordering *is* the
                 // mechanism: a script arriving after the stylesheet has painted
                 // cannot prevent the flash of the wrong theme.
-                <script inner_html=PREPAINT_SCRIPT nonce=nonce_attr></script>
+                <script inner_html=PREPAINT_SCRIPT nonce=nonce_attr.clone()></script>
             </head>
             <body>
+                // T0105. Rendered server-side, before the router, because its whole
+                // job is to cover the gap between the first byte and hydration —
+                // if it were client-rendered it would arrive after the flash it
+                // exists to hide.
+                //
+                // Every style is a Tailwind class. The Python original carries
+                // eight inline `style=` declarations on these two elements, which
+                // `style-src 'self'` now refuses outright (T0112). This is T0111
+                // applied prospectively: the port does not re-introduce the escape
+                // it would then have to be un-gated to support.
+                <div
+                    id="app-loader"
+                    class="fixed inset-0 z-[99999] flex flex-col items-center \
+                           justify-center gap-2 bg-[var(--bg,#282c34)] \
+                           transition-opacity duration-300"
+                >
+                    <div
+                        id="loader-wave"
+                        class="relative whitespace-pre pt-[10px] font-mono text-[11px] \
+                               leading-none opacity-50 \
+                               text-[color-mix(in_srgb,#9cdef2_62%,var(--brand-color,var(--red,#e06c75)))]"
+                    >
+                        "▁▂▃"
+                    </div>
+                </div>
+                // Inline and nonce-gated rather than part of the wasm hydrate path,
+                // because the 5 s fallback inside it exists precisely for a boot
+                // that never reaches the app bundle. See `loader.js`.
+                <script inner_html=LOADER_SCRIPT nonce=nonce_attr></script>
                 <Router>
                     <Routes fallback=NotFound>
                         <Route path=path!("") view=Home/>
@@ -190,7 +227,119 @@ pub fn NotFound() -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use {super::PREPAINT_SCRIPT, crate::theme::THEMES};
+    use {
+        super::{LOADER_SCRIPT, PREPAINT_SCRIPT},
+        crate::theme::THEMES,
+    };
+
+    /// T0105. The loader's whole purpose is to cover the gap between the first
+    /// byte and hydration, so it has to be in the server's HTML — not something a
+    /// client-side effect adds later, which would arrive after the flash it exists
+    /// to hide.
+    #[test]
+    fn the_loader_overlay_is_present_and_needs_no_inline_style() {
+        // Asserted against the *source*, since these are the two elements the
+        // Python gave eight inline `style=` declarations. Under `style-src 'self'`
+        // (T0112) the browser drops such an attribute with no error, leaving an
+        // unpositioned, unstyled overlay — the worst possible failure, because a
+        // loader that does not cover is worse than no loader.
+        let app = include_str!("app.rs");
+        for id in ["app-loader", "loader-wave"] {
+            assert!(
+                app.contains(&format!("id=\"{id}\"")),
+                "the {id} overlay element must be server-rendered"
+            );
+        }
+    }
+
+    /// The CSP trap this port had to avoid: the Python interpolated a `style=`
+    /// attribute into an `innerHTML` string, and CSP checks attributes in markup
+    /// parsed that way just as it does in server HTML. A regression here is
+    /// invisible server-side, so it is asserted here.
+    #[test]
+    fn the_loader_script_never_writes_an_inline_style_attribute() {
+        assert!(
+            !LOADER_SCRIPT.contains("style="),
+            "the loader script writes a style attribute; CSP blocks style= in \
+             markup parsed via innerHTML, so the moving dot would lose its position"
+        );
+        assert!(
+            !LOADER_SCRIPT.contains("cssText"),
+            "cssText assignment is another way to smuggle in an inline style block"
+        );
+        // The sanctioned alternative: the CSSOM, which CSP does not gate.
+        assert!(
+            LOADER_SCRIPT.contains("setProperty"),
+            "the per-frame offset must move to the dot through a CSS custom property"
+        );
+    }
+
+    /// The nine frames are data, not decoration. `render()` indexes them by `i`, so a
+    /// dropped or reordered frame changes the animation's rhythm rather than
+    /// failing visibly.
+    #[test]
+    fn the_loader_frames_match_the_python_source_exactly() {
+        let expected = [
+            ("▁▂▃", 9),
+            ("▂▃▄", 7),
+            ("▃▄▅", 5),
+            ("▄▅▆", 3),
+            ("▅▆▅", 1),
+            ("▆▅▄", 3),
+            ("▅▄▃", 5),
+            ("▄▃▂", 7),
+            ("▃▂▁", 9),
+        ];
+        for (wave, y) in expected {
+            assert!(
+                LOADER_SCRIPT.contains(&format!("wave: '{wave}', y: {y}")),
+                "missing or altered frame {wave} at y={y}"
+            );
+        }
+        assert_eq!(
+            LOADER_SCRIPT.matches("wave: '").count(),
+            expected.len(),
+            "the frame list must hold exactly {} entries",
+            expected.len()
+        );
+    }
+
+    /// The 5 s fallback must **remove** the node, not just fade it. The app reads
+    /// the loader's presence as "startup in progress" and holds off clearing the
+    /// composer while it exists, so a fade that leaves the node wedges the app
+    /// permanently — the fallback would then be worse than no fallback.
+    #[test]
+    fn the_loader_fallback_removes_the_node_rather_than_only_fading_it() {
+        assert!(
+            LOADER_SCRIPT.contains("FALLBACK_MS = 5000"),
+            "the fallback timing is part of the contract"
+        );
+        assert!(
+            LOADER_SCRIPT.contains("node.remove()"),
+            "the fallback must remove the overlay, or the app never finishes booting"
+        );
+        let remove_at = LOADER_SCRIPT
+            .find("node.remove()")
+            .expect("removal present");
+        let fade_at = LOADER_SCRIPT
+            .find("node.style.opacity = '0'")
+            .expect("fade present");
+        assert!(
+            fade_at < remove_at,
+            "the fade must run first and the node be removed after it, or it pops"
+        );
+    }
+
+    /// The stop hook is how the app halts the interval. It is exposed on `window`
+    /// because the interval is owned by this script, so the caller has no other
+    /// handle — the Python does the same with `__odysseusLoaderWaveStop`.
+    #[test]
+    fn the_loader_exposes_the_stop_hook_the_shell_depends_on() {
+        assert!(
+            LOADER_SCRIPT.contains("window.__odysseusLoaderWaveStop"),
+            "the app stops the wave through this hook"
+        );
+    }
 
     #[test]
     fn the_prepaint_script_is_actually_inlined() {
