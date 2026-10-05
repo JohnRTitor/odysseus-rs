@@ -13,12 +13,15 @@ use odysseus_store::model_endpoints::{
     discover_models, models_url, probe_headers,
 };
 
+/// One recorded request: URL, the headers sent, and the timeout it was given.
+type RecordedRequest = (String, BTreeMap<String, String>, Duration);
+
 /// A transport that records what it was asked and replies from a script.
 struct FakeTransport {
     /// Keyed by URL; the first URL whose key is a substring of the request wins.
     replies: Vec<(String, Result<ProbeResponse, TransportError>)>,
     /// Every request made, for assertions.
-    seen: RefCell<Vec<(String, BTreeMap<String, String>, Duration)>>,
+    seen: RefCell<Vec<RecordedRequest>>,
 }
 
 impl FakeTransport {
@@ -69,11 +72,15 @@ fn an_openai_compatible_server_yields_its_models() {
     )
     .expect("discovery");
 
+    assert!(
+        matches!(found, Discovery::Models(_)),
+        "expected models, got {found:?}"
+    );
     let Discovery::Models(ids) = found else {
-        panic!("expected models, got {found:?}")
+        return;
     };
     assert_eq!(
-        ids.iter().map(|s| s.as_ref()).collect::<Vec<_>>(),
+        ids.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
         ["llama3:8b", "qwen2.5", "mistral-nemo"]
     );
 }
@@ -251,7 +258,7 @@ fn a_body_that_is_not_a_model_list_is_reported_rather_than_silently_empty() {
     .expect("discovery");
     match found {
         Discovery::Unparseable(body) => assert!(body.contains("502")),
-        other => panic!("expected Unparseable, got {other:?}"),
+        other => assert!(matches!(other, Discovery::Unparseable(_)), "got {other:?}"),
     }
 }
 
@@ -272,7 +279,7 @@ fn an_unparseable_body_is_truncated_before_it_reaches_a_log() {
             "got {} chars",
             body.chars().count()
         ),
-        other => panic!("expected Unparseable, got {other:?}"),
+        other => assert!(matches!(other, Discovery::Unparseable(_)), "got {other:?}"),
     }
 }
 

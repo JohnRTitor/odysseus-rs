@@ -152,13 +152,13 @@ fn unknown_and_hostile_hosts_fall_back_to_the_openai_default() {
     }
 }
 
-/// The OpenCode branches need hostname **and** path, not a substring search.
+/// The `OpenCode` branches need hostname **and** path, not a substring search.
 ///
 /// `_detect_provider`'s docstring promises it "matches on hostname (exact or
 /// subdomain) rather than substring, so a URL that merely contains a provider's
 /// domain in its path or query ... is not misclassified". Every URL below carries
 /// `opencode.ai/zen/go` somewhere in it and must still fall back to the default:
-/// a `url.contains` transliteration would classify every one of them as OpenCode Go.
+/// a `url.contains` transliteration would classify every one of them as `OpenCode` Go.
 #[test]
 fn opencode_needs_the_host_and_the_path_not_a_substring() {
     for decoy in [
@@ -181,7 +181,7 @@ fn opencode_needs_the_host_and_the_path_not_a_substring() {
     }
 }
 
-/// The genuine OpenCode URLs, including a deeper path under the same prefix.
+/// The genuine `OpenCode` URLs, including a deeper path under the same prefix.
 #[test]
 fn opencode_matches_the_host_and_a_segment_wise_path_prefix() {
     for (url, expected) in [
@@ -200,7 +200,7 @@ fn opencode_matches_the_host_and_a_segment_wise_path_prefix() {
     }
 }
 
-/// The OpenCode decoys above must fall back because the parser genuinely resolves
+/// The `OpenCode` decoys above must fall back because the parser genuinely resolves
 /// the host and path -- not because the fragment or the userinfo happened to leave
 /// a string that matched nothing.
 ///

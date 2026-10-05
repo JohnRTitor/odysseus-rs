@@ -472,7 +472,7 @@ fn warmup_urls_swap_the_chat_path_for_the_cheap_probe() {
     let urls: Vec<String> = result
         .warmup_ping_urls(5)
         .into_iter()
-        .map(|u| u.into_string())
+        .map(str::into_string)
         .collect();
     assert_eq!(urls, ["http://h:8000/v1/models"]);
     assert!(result.warmup_ping_urls(0).is_empty(), "limit is honoured");

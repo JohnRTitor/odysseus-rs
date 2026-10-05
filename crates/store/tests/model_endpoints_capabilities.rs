@@ -90,8 +90,10 @@ fn an_entry_expires_exactly_at_the_ttl() {
     let _ = probe.probe(URL);
     assert_eq!(transport.calls(), 1);
 
-    // One second short of the TTL is still fresh.
-    clock.advance(LMSTUDIO_PROBE_TTL - Duration::from_secs(1));
+    // One second short of the TTL is still fresh. `saturating_sub` rather than
+    // `-`: a plain subtraction panics on underflow, and a test asserting on a
+    // boundary should not be able to panic on an arithmetic edge.
+    clock.advance(LMSTUDIO_PROBE_TTL.saturating_sub(Duration::from_secs(1)));
     let _ = probe.probe(URL);
     assert_eq!(transport.calls(), 1, "59s in is inside a 60s TTL");
 

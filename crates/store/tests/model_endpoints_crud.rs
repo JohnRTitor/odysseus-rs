@@ -4,13 +4,18 @@
 //! test here opens a fresh database, applies the real baseline migration, and
 //! talks to it through `ModelEndpointStore`.
 
+#![expect(
+    clippy::expect_used,
+    reason = "fixture helpers in an integration test; clippy does not class these as test code"
+)]
+
 use {
     fernet::Fernet,
     odysseus_store::{
         crypto::{is_encrypted, maybe_decrypt},
         model_endpoints::{
-            ApiKey, Caller, EndpointError, ModelEndpointStore, ModelIdList, NewEndpoint, Provider,
-            RefreshMode,
+            ApiKey, Caller, EndpointError, EndpointKind, EndpointPatch, ModelEndpointStore,
+            ModelIdList, NewEndpoint, Provider, RefreshMode,
         },
         pool,
         schema::migrate,
@@ -120,7 +125,7 @@ fn defaults_match_the_python_insert() {
             .unwrap()
             .kind()
             .expect("kind"),
-        Default::default()
+        EndpointKind::default()
     );
 }
 
@@ -129,7 +134,6 @@ fn a_shared_endpoint_has_a_null_owner_and_is_visible_to_everyone() {
     let f = Fixture::new();
     let store = f.store();
     let admin = Caller::admin("root");
-
     let mut shared = endpoint("Shared cloud", "https://api.openai.com/v1");
     shared.share_with_all = true;
     let created = store.create(&admin, &shared).expect("create");
@@ -155,7 +159,6 @@ fn a_listing_returns_your_own_endpoints_plus_shared_ones() {
     let f = Fixture::new();
     let store = f.store();
     let admin = Caller::admin("root");
-
     store
         .create(
             &Caller::user("alice"),
@@ -195,7 +198,6 @@ fn a_listing_returns_your_own_endpoints_plus_shared_ones() {
 fn a_row_owned_by_someone_else_looks_absent() {
     let f = Fixture::new();
     let store = f.store();
-    let admin = Caller::admin("root");
 
     let bobs_row = store
         .create(
@@ -214,7 +216,7 @@ fn a_row_owned_by_someone_else_looks_absent() {
     );
 
     let err = store
-        .update(&alice, &bobs_row.id, &Default::default())
+        .update(&alice, &bobs_row.id, &EndpointPatch::default())
         .expect_err("no write");
     assert!(matches!(err, EndpointError::NotFound(_)));
 }
@@ -231,8 +233,10 @@ fn an_admin_may_write_any_row() {
         )
         .expect("create");
 
-    let mut patch = odysseus_store::model_endpoints::EndpointPatch::default();
-    patch.name = Some("renamed by admin".to_owned());
+    let patch = EndpointPatch {
+        name: Some("renamed by admin".to_owned()),
+        ..EndpointPatch::default()
+    };
     let updated = store
         .update(&Caller::admin("root"), &row.id, &patch)
         .expect("admin update");
@@ -278,8 +282,10 @@ fn an_update_touches_only_the_fields_it_names() {
     new.model_refresh_interval = Some(60);
     let created = store.create(&caller, &new).expect("create");
 
-    let mut patch = odysseus_store::model_endpoints::EndpointPatch::default();
-    patch.name = Some("after".to_owned());
+    let patch = EndpointPatch {
+        name: Some("after".to_owned()),
+        ..EndpointPatch::default()
+    };
     let updated = store.update(&caller, &created.id, &patch).expect("update");
 
     assert_eq!(updated.name.as_ref(), "after");
@@ -313,8 +319,10 @@ fn a_patch_can_clear_the_credential_distinctly_from_omitting_it() {
     let created = store.create(&caller, &new).expect("create");
 
     // Omitted: the key survives.
-    let mut rename = odysseus_store::model_endpoints::EndpointPatch::default();
-    rename.name = Some("renamed".to_owned());
+    let rename = EndpointPatch {
+        name: Some("renamed".to_owned()),
+        ..EndpointPatch::default()
+    };
     let kept = store.update(&caller, &created.id, &rename).expect("update");
     assert_eq!(
         kept.api_key.expose(&f.key).ok().flatten().as_deref(),
@@ -323,8 +331,10 @@ fn a_patch_can_clear_the_credential_distinctly_from_omitting_it() {
 
     // `Some(None)`: the key is cleared. A plain `Option<String>` could not say this,
     // and getting it wrong silently deletes a credential on every unrelated edit.
-    let mut clear = odysseus_store::model_endpoints::EndpointPatch::default();
-    clear.api_key = Some(None);
+    let clear = EndpointPatch {
+        api_key: Some(None),
+        ..EndpointPatch::default()
+    };
     let cleared = store.update(&caller, &created.id, &clear).expect("update");
     assert!(!cleared.api_key.is_present());
 }
@@ -353,8 +363,10 @@ fn every_nullable_column_clears_and_omits_independently() {
     assert_eq!(created.model_type.as_deref(), Some("chat"));
 
     // Omitting all five leaves every one of them alone.
-    let mut rename = odysseus_store::model_endpoints::EndpointPatch::default();
-    rename.name = Some("renamed".to_owned());
+    let rename = EndpointPatch {
+        name: Some("renamed".to_owned()),
+        ..EndpointPatch::default()
+    };
     let kept = store.update(&caller, &created.id, &rename).expect("update");
     assert_eq!(kept.model_type.as_deref(), Some("chat"));
     assert_eq!(kept.provider_auth_id.as_deref(), Some("cred-7"));
@@ -363,12 +375,14 @@ fn every_nullable_column_clears_and_omits_independently() {
     assert_eq!(kept.supports_tools, Some(true));
 
     // `Some(None)` clears all five.
-    let mut clear = odysseus_store::model_endpoints::EndpointPatch::default();
-    clear.model_type = Some(None);
-    clear.provider_auth_id = Some(None);
-    clear.model_refresh_interval = Some(None);
-    clear.model_refresh_timeout = Some(None);
-    clear.supports_tools = Some(None);
+    let clear = EndpointPatch {
+        model_type: Some(None),
+        provider_auth_id: Some(None),
+        model_refresh_interval: Some(None),
+        model_refresh_timeout: Some(None),
+        supports_tools: Some(None),
+        ..EndpointPatch::default()
+    };
     let cleared = store.update(&caller, &created.id, &clear).expect("update");
     assert_eq!(cleared.model_type, None, "model_type must clear");
     assert_eq!(
@@ -492,7 +506,7 @@ fn a_null_owner_row_written_by_python_is_still_readable() {
     assert_eq!(row.model_type, None);
     assert_eq!(
         row.kind().expect("kind"),
-        Default::default(),
+        EndpointKind::default(),
         "a NULL kind reads as auto"
     );
 }
