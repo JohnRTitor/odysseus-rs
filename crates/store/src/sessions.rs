@@ -57,10 +57,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
-use thiserror::Error;
+use {
+    rusqlite::{Connection, OptionalExtension, Row, params},
+    thiserror::Error,
+};
 
-use crate::{Store, StoreError};
+use crate::{
+    Store, StoreError, blocking,
+    session_image_cleanup::{CleanupReport, ImageCleanup},
+};
 
 /// Failures from session persistence.
 ///
@@ -71,15 +76,6 @@ pub enum SessionError {
     /// The underlying database call failed.
     #[error("session db error: {0}")]
     Db(#[from] StoreError),
-
-    /// A row was malformed in a way that is not a SQLite error.
-    #[error("session {id} is malformed: {message}")]
-    Malformed {
-        /// The session id.
-        id: String,
-        /// What was wrong.
-        message: String,
-    },
 }
 
 /// Result alias for this module.
@@ -147,7 +143,7 @@ impl SessionMeta {
     ///
     /// Returns a [`rusqlite::Error`] if a column is missing or has the wrong
     /// type, which would mean the schema and this reader have diverged.
-    /// [`SessionStore::get_blocking`] wraps that into [`SessionError::Db`].
+    /// [`SessionStore::get`] wraps that into [`SessionError::Db`].
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         /// A nullable column that the Python treats as empty string
         /// (`db_session.owner` / `getattr(..., None)` at `session_manager.py:151`).
@@ -180,10 +176,14 @@ impl SessionMeta {
 
 /// The fields needed to create a session.
 ///
-/// A struct rather than seven positional parameters: `create_blocking` with
+/// A struct rather than seven positional parameters: `create` with
 /// `(id, name, endpoint_url, model, owner, rag, now)` invites the caller to
 /// transpose two adjacent `String`s, and the compiler cannot catch that. Naming
 /// them makes the call site readable and the order irrelevant.
+///
+/// The same reasoning is why [`NewMessage`] exists: `add_message` took
+/// `(session_id, message_id, role, content, …)` — four adjacent `String`s where
+/// swapping any two still typechecks.
 ///
 /// Fields are private so the invariants (a session starts unarchived, unpinned and
 /// with zero messages) cannot be set by a caller.
@@ -205,6 +205,54 @@ pub struct NewSession {
     /// under an injected clock (AGENTS.md §11).
     pub now: f64,
 }
+
+/// One message to append, as [`NewSession`] is one session to create.
+///
+/// Exists for the same reason: `add_message` used to take
+/// `(session_id, message_id, role, content, metadata, now)`, in which the first
+/// four are adjacent `String`s and transposing any two of them still compiles.
+/// Writing a user's prompt into the `session_id` slot would then silently
+/// target — or fail against — the wrong session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewMessage {
+    /// Primary key of the message row. Must be unique across the table.
+    pub id: String,
+    /// `user`, `assistant`, `system`, or a tool name.
+    pub role: String,
+    /// Message body.
+    pub content: String,
+    /// Optional JSON blob; the image-cleanup pass reads `tool_events` out of it.
+    pub metadata: Option<String>,
+    /// Unix timestamp of the message.
+    pub timestamp: f64,
+}
+
+impl NewMessage {
+    /// A message with no metadata, for the common case.
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        role: impl Into<String>,
+        content: impl Into<String>,
+        timestamp: f64,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            role: role.into(),
+            content: content.into(),
+            metadata: None,
+            timestamp,
+        }
+    }
+
+    /// Attaches a metadata blob.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: impl Into<String>) -> Self {
+        self.metadata = Some(metadata.into());
+        self
+    }
+}
+
 /// One cache entry: the id, kept alongside the metadata rather than inside it so
 /// eviction can check identity without cloning the row.
 type CacheEntry = (Box<str>, SessionMeta);
@@ -222,6 +270,17 @@ type CacheMap = BTreeMap<u64, CacheEntry>;
 /// "did you just touch this?" path is a single `last_mut` — no per-entry
 /// timestamp scan. `BTreeMap` is the right structure here precisely because the
 /// cache is small and the operations are O(log n) with no hashing of the keys.
+///
+/// # Why `std::sync::Mutex` and not `tokio::sync::Mutex`
+///
+/// Every method below is synchronous and self-contained: it takes the guard,
+/// copies or drops what it needs, and releases it before returning. No
+/// `MutexGuard` is ever live across an `.await` — the async methods on
+/// [`SessionStore`] read the cache, release it, then `await` the blocking pool
+/// (§6). A `tokio` lock would be a guard that outlives the function, which is
+/// the thing being avoided here, so a `std` one is both correct and cheaper.
+/// `await_holding_lock` is denied workspace-wide, so a regression would fail the
+/// build rather than a code review.
 #[derive(Debug)]
 pub struct SessionCache {
     inner: Mutex<CacheMap>,
@@ -286,7 +345,9 @@ impl SessionCache {
     /// over a panic raised somewhere unrelated. Poisoning means an earlier caller
     /// panicked, and that panic has already been reported.
     fn lock(&self) -> std::sync::MutexGuard<'_, CacheMap> {
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Reads a session by id, marking it most-recently-used on a hit.
@@ -295,7 +356,10 @@ impl SessionCache {
         let mut inner = self.lock();
         let tick = self.tick();
         // Find the slot whose key is the id; ids are unique so there is at most one.
-        let slot = inner.iter().find(|(_, (key, _))| &**key == id).map(|(slot, _)| *slot);
+        let slot = inner
+            .iter()
+            .find(|(_, (key, _))| &**key == id)
+            .map(|(slot, _)| *slot);
         let slot = slot?;
         let entry = inner.remove(&slot)?;
         // Re-insert at the newest tick so eviction order reflects this access.
@@ -308,14 +372,19 @@ impl SessionCache {
         let mut inner = self.lock();
         let tick = self.tick();
         // Drop any existing slot for this id so re-insert cannot duplicate it.
-        let existing = inner.iter().find(|(_, (key, _))| **key == *meta.id).map(|(slot, _)| *slot);
+        let existing = inner
+            .iter()
+            .find(|(_, (key, _))| **key == *meta.id)
+            .map(|(slot, _)| *slot);
         if let Some(slot) = existing {
             let _ = inner.remove(&slot);
         }
         inner.insert(tick, (meta.id.clone(), meta));
         while inner.len() > self.max_entries {
             // BTreeMap iterates ascending by tick, so the first key is the LRU.
-            let Some(oldest) = inner.keys().next().copied() else { break };
+            let Some(oldest) = inner.keys().next().copied() else {
+                break;
+            };
             let _ = inner.remove(&oldest);
         }
     }
@@ -323,7 +392,10 @@ impl SessionCache {
     /// Removes one entry.
     pub fn remove(&self, id: &str) -> bool {
         let mut inner = self.lock();
-        let slot = inner.iter().find(|(_, (key, _))| &**key == id).map(|(slot, _)| *slot);
+        let slot = inner
+            .iter()
+            .find(|(_, (key, _))| &**key == id)
+            .map(|(slot, _)| *slot);
         slot.is_some_and(|slot| inner.remove(&slot).is_some())
     }
 
@@ -335,7 +407,9 @@ impl SessionCache {
     /// Next monotonic tick. Saturates rather than wrapping: a wrap could make two
     /// entries share a tick and corrupt the eviction order.
     fn tick(&self) -> u64 {
-        let Ok(mut clock) = self.clock.lock() else { return 0 };
+        let Ok(mut clock) = self.clock.lock() else {
+            return 0;
+        };
         *clock = clock.saturating_add(1);
         *clock
     }
@@ -350,6 +424,24 @@ impl Default for SessionCache {
 ///
 /// Hold one per process and share it via `Arc`. Metadata reads go through a
 /// bounded [`SessionCache`]; SQLite remains the only source of truth.
+///
+/// # Every method is `async`, and that is load-bearing (AGENTS.md §6, D11)
+///
+/// `rusqlite` is synchronous. A `fn` that opened a connection would block an
+/// executor thread for the duration of the query, which is the single most
+/// likely reason a Rust port ends up slower than the Python it replaces. So no
+/// method here is callable without first yielding to the blocking pool:
+///
+/// * statements needing only [`rusqlite::Connection`] go through
+///   [`crate::blocking::with_conn`], which opens *and closes* the connection
+///   inside one blocking closure;
+/// * statements needing a real transaction — and therefore `&mut Connection`,
+///   which `with_conn` deliberately does not hand out — open their own
+///   connection with `store.connect()` inside a
+///   [`crate::blocking::spawn_blocking`] closure, via
+///   [`SessionStore::in_transaction`].
+///
+/// The cache is touched only before or after those calls, never across one.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     store: Store,
@@ -378,7 +470,7 @@ impl SessionStore {
         &self.cache
     }
 
-    /// The underlying store, for the `**Blocking.**` wrappers.
+    /// The underlying store, for a caller that needs its own connection.
     #[must_use]
     pub fn store(&self) -> Store {
         self.store.clone()
@@ -396,10 +488,17 @@ impl SessionStore {
     ///
     /// Returns [`SessionError::Db`] if the insert fails, including the
     /// unique-constraint violation when the id already exists.
-    pub fn create_blocking(&self, new: NewSession) -> Result<()> {
-        with_conn(&self.store, new, |conn_mut, new| {
-            let conn = &mut *conn_mut;
-            let NewSession { id, name, endpoint_url, model, owner, rag, now } = new;
+    pub async fn create(&self, new: NewSession) -> Result<()> {
+        let NewSession {
+            id,
+            name,
+            endpoint_url,
+            model,
+            owner,
+            rag,
+            now,
+        } = new;
+        blocking::with_conn(self.store.clone(), move |conn| -> Result<_> {
             conn.execute(
                 "INSERT INTO sessions
                     (id, name, endpoint_url, model, owner, rag, archived, is_important,
@@ -409,6 +508,7 @@ impl SessionStore {
             )?;
             Ok(())
         })
+        .await
     }
 
     /// Reads one session's metadata, consulting the cache first.
@@ -420,16 +520,23 @@ impl SessionStore {
     ///
     /// Returns [`SessionError::Db`] if the read fails. A missing session is
     /// `Ok(None)`, not an error: callers ask "does this exist" constantly.
-    pub fn get_blocking(&self, id: String) -> Result<Option<SessionMeta>> {
-        if let Some(hit) = self.cache.get(&id) {
+    pub async fn get(&self, id: &str) -> Result<Option<SessionMeta>> {
+        if let Some(hit) = self.cache.get(id) {
             return Ok(Some(hit));
         }
-        let meta = with_conn(&self.store, id, |conn_mut, id| {
-            let conn = &mut *conn_mut;
-            conn.query_row("SELECT * FROM sessions WHERE id = ?1", [id], SessionMeta::from_row)
-                .optional()
-                .map_err(SessionError::from)
-        })?;
+        // The closure is `Send + 'static`, so it cannot capture the caller's `&str`;
+        // the borrow is turned into an owned key here, at the call site.
+        let key = id.to_owned();
+        let meta = blocking::with_conn(self.store.clone(), move |conn| -> Result<_> {
+            conn.query_row(
+                "SELECT * FROM sessions WHERE id = ?1",
+                [&key],
+                SessionMeta::from_row,
+            )
+            .optional()
+            .map_err(SessionError::from)
+        })
+        .await?;
         if let Some(meta) = &meta {
             self.cache.insert(meta.clone());
         }
@@ -445,9 +552,9 @@ impl SessionStore {
     /// # Errors
     ///
     /// Returns [`SessionError::Db`] if the query fails.
-    pub fn list_blocking(&self, owner: String) -> Result<Vec<SessionMeta>> {
-        with_conn(&self.store, owner, |conn_mut, owner| {
-            let conn = &mut *conn_mut;
+    pub async fn list(&self, owner: &str) -> Result<Vec<SessionMeta>> {
+        let owner = owner.to_owned();
+        blocking::with_conn(self.store.clone(), move |conn| -> Result<_> {
             // An empty owner means "every owner", matching Python's
             // `get_sessions_for_user(None)` (`session_manager.py:701-707`).
             //
@@ -455,9 +562,12 @@ impl SessionStore {
             // no `?1`, so passing a parameter to it is `InvalidParameterCount`, not
             // a harmless no-op. Binding per branch keeps both queries valid.
             if owner.is_empty() {
-                let mut stmt = conn.prepare("SELECT * FROM sessions ORDER BY last_accessed DESC")?;
+                let mut stmt =
+                    conn.prepare("SELECT * FROM sessions ORDER BY last_accessed DESC")?;
                 let rows = stmt.query_map([], SessionMeta::from_row)?;
-                return rows.collect::<rusqlite::Result<Vec<_>>>().map_err(SessionError::from);
+                return rows
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(SessionError::from);
             }
             let mut stmt = conn
                 .prepare("SELECT * FROM sessions WHERE owner = ?1 ORDER BY last_accessed DESC")?;
@@ -465,6 +575,7 @@ impl SessionStore {
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(SessionError::from)
         })
+        .await
     }
 
     /// Renames a session, bumping `updated_at`.
@@ -472,19 +583,8 @@ impl SessionStore {
     /// # Errors
     ///
     /// Returns [`SessionError::Db`] if the update fails.
-    pub fn rename_blocking(&self, id: String, name: String, now: f64) -> Result<()> {
-        let target = id.clone();
-        with_conn(&self.store, (id, name, now), |conn_mut, d| {
-            let conn = &mut *conn_mut;
-            let (id, name, now) = d;
-            conn.execute(
-                "UPDATE sessions SET name = ?2, updated_at = ?3 WHERE id = ?1",
-                params![id, name, now],
-            )?;
-            Ok(())
-        })?;
-        self.cache.remove(&target);
-        Ok(())
+    pub async fn rename(&self, id: &str, name: &str, now: f64) -> Result<()> {
+        self.update_one(id, "name", name, now).await
     }
 
     /// Sets the pinned flag, bumping `updated_at`.
@@ -492,17 +592,19 @@ impl SessionStore {
     /// # Errors
     ///
     /// Returns [`SessionError::Db`] if the update fails.
-    pub fn set_important_blocking(&self, id: String, important: bool, now: f64) -> Result<()> {
-        let target = id.clone();
-        with_conn(&self.store, (id, important, now), |conn_mut, d| {
-            let conn = &mut *conn_mut;
-            let (id, important, now) = d;
+    pub async fn set_important(&self, id: &str, important: bool, now: f64) -> Result<()> {
+        // `is_important` holds a boolean, not text, so it cannot reuse the `&str`
+        // setter below without a stringly-typed round trip through SQL.
+        let target = id.to_owned();
+        let key = target.clone();
+        blocking::with_conn(self.store.clone(), move |conn| -> Result<_> {
             conn.execute(
                 "UPDATE sessions SET is_important = ?2, updated_at = ?3 WHERE id = ?1",
-                params![id, important, now],
+                params![key, important, now],
             )?;
             Ok(())
-        })?;
+        })
+        .await?;
         self.cache.remove(&target);
         Ok(())
     }
@@ -512,17 +614,17 @@ impl SessionStore {
     /// # Errors
     ///
     /// Returns [`SessionError::Db`] if the update fails.
-    pub fn set_archived_blocking(&self, id: String, archived: bool, now: f64) -> Result<()> {
-        let target = id.clone();
-        with_conn(&self.store, (id, archived, now), |conn_mut, d| {
-            let conn = &mut *conn_mut;
-            let (id, archived, now) = d;
+    pub async fn set_archived(&self, id: &str, archived: bool, now: f64) -> Result<()> {
+        let target = id.to_owned();
+        let key = target.clone();
+        blocking::with_conn(self.store.clone(), move |conn| -> Result<_> {
             conn.execute(
                 "UPDATE sessions SET archived = ?2, updated_at = ?3 WHERE id = ?1",
-                params![id, archived, now],
+                params![key, archived, now],
             )?;
             Ok(())
-        })?;
+        })
+        .await?;
         self.cache.remove(&target);
         Ok(())
     }
@@ -532,34 +634,107 @@ impl SessionStore {
     /// # Errors
     ///
     /// Returns [`SessionError::Db`] if the update fails.
-    pub fn touch_blocking(&self, id: String, now: f64) -> Result<()> {
-        let target = id.clone();
-        with_conn(&self.store, (id, now), |conn_mut, d| {
-            let conn = &mut *conn_mut;
-            let (id, now) = d;
+    pub async fn touch(&self, id: &str, now: f64) -> Result<()> {
+        let target = id.to_owned();
+        let key = target.clone();
+        blocking::with_conn(self.store.clone(), move |conn| -> Result<_> {
             conn.execute(
                 "UPDATE sessions SET last_accessed = ?2 WHERE id = ?1",
-                params![id, now],
+                params![key, now],
             )?;
             Ok(())
-        })?;
+        })
+        .await?;
+        // `last_accessed` is part of the cached row and part of `list`'s ORDER BY,
+        // so the entry has to go rather than be served stale.
         self.cache.remove(&target);
         Ok(())
     }
 
     /// Deletes a session. Messages go with it via `ON DELETE CASCADE`.
     ///
+    /// Images are **not** touched: `gallery_images.session_id` is
+    /// `ON DELETE SET NULL`, so the rows survive as orphans, which matches the
+    /// Python's intent (`session_manager.py:591-595` detaches documents the same
+    /// way). Use [`SessionStore::delete_with_image_cleanup`] to sweep the
+    /// generated files as well.
+    ///
     /// # Errors
     ///
     /// Returns [`SessionError::Db`] if the delete fails.
-    pub fn delete_blocking(&self, id: String) -> Result<usize> {
-        self.cache.remove(&id);
-        let deleted = with_conn(&self.store, id, |conn_mut, id| {
-            let conn = &mut *conn_mut;
-            conn.execute("DELETE FROM sessions WHERE id = ?1", [id])
+    pub async fn delete(&self, id: &str) -> Result<usize> {
+        let key = id.to_owned();
+        let deleted = blocking::with_conn(self.store.clone(), move |conn| -> Result<_> {
+            conn.execute("DELETE FROM sessions WHERE id = ?1", [&key])
                 .map_err(SessionError::from)
-        })?;
+        })
+        .await?;
+        self.cache.remove(id);
         Ok(deleted)
+    }
+
+    /// Deletes a session and soft-deletes the gallery images it owns, in one
+    /// transaction.
+    ///
+    /// This is the composition `session_manager.py:589-595` performs, and the
+    /// **order** is load-bearing: the image rows are read and deactivated *before*
+    /// the session row goes, because `ON DELETE SET NULL` would otherwise erase
+    /// the `session_id` they are found by, leaving orphaned files on disk forever.
+    ///
+    /// The Python logs an image-cleanup failure as a warning and deletes the
+    /// session anyway. Here the error propagates and the transaction rolls back,
+    /// so the caller decides; a caller that prefers the Python's behaviour can
+    /// `let _ = …` explicitly at the call site, which is where that judgement
+    /// belongs (§5).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::Db`] if the image cleanup or the delete fails, and
+    /// [`StoreError::Interrupted`] if the task is cancelled. Returns the number of
+    /// session rows deleted alongside a [`CleanupReport`] of the image work.
+    pub async fn delete_with_image_cleanup(
+        &self,
+        id: &str,
+        cleanup: &ImageCleanup,
+    ) -> Result<(usize, CleanupReport)> {
+        let session_id = id.to_owned();
+        let root = cleanup.root().to_path_buf();
+        let (deleted, report) = self
+            .in_transaction(move |conn| {
+                let report = crate::session_image_cleanup::cleanup_session_images(
+                    conn,
+                    &ImageCleanup::new(root),
+                    &session_id,
+                )?;
+                let deleted = conn
+                    .execute("DELETE FROM sessions WHERE id = ?1", [&session_id])
+                    .map_err(SessionError::from)?;
+                Ok((deleted, report))
+            })
+            .await?;
+        self.cache.remove(id);
+        Ok((deleted, report))
+    }
+
+    /// One `UPDATE sessions SET <column> = ?2, updated_at = ?3 WHERE id = ?1`,
+    /// then a cache invalidation.
+    ///
+    /// The column is a hard-coded literal from [`SessionStore::rename`] alone —
+    /// never caller-supplied — and the *value* is still bound as `?2` rather than
+    /// interpolated. That keeps all SQL parameterized while collapsing three
+    /// near-identical statements into one.
+    async fn update_one(&self, id: &str, column: &str, value: &str, now: f64) -> Result<()> {
+        let statement = format!("UPDATE sessions SET {column} = ?2, updated_at = ?3 WHERE id = ?1");
+        let target = id.to_owned();
+        let key = target.clone();
+        let value = value.to_owned();
+        blocking::with_conn(self.store.clone(), move |conn| -> Result<_> {
+            conn.execute(&statement, params![key, value, now])?;
+            Ok(())
+        })
+        .await?;
+        self.cache.remove(&target);
+        Ok(())
     }
 }
 
@@ -587,68 +762,6 @@ impl SessionStore {
     /// Because the recount is inside the transaction it sees the row just
     /// inserted, and a concurrent writer either commits before this transaction
     /// reads (and is counted) or after (and is not). There is no window in which
-    /// the column disagrees with the rows. That is what makes T0203's removal of
-    /// the per-read `COUNT(*)` safe rather than merely convenient.
-    ///
-    /// **Blocking.** rusqlite is synchronous (AGENTS.md D11); call from
-    /// `spawn_blocking`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SessionError::Db`] if the transaction fails. Unlike the Python,
-    /// which caught `Exception`, rolled back, logged and returned nothing
-    /// (`session_manager.py:305-308`), the failure is visible to the caller.
-    pub fn add_message_blocking(
-        &self,
-        session_id: String,
-        message_id: String,
-        role: String,
-        content: String,
-        metadata: Option<String>,
-        now: f64,
-    ) -> Result<()> {
-        let target = session_id.clone();
-        with_conn(
-            &self.store,
-            (session_id, message_id, role, content, metadata, now),
-            |conn_mut, d| {
-            let conn = &mut *conn_mut;
-            let (session_id, message_id, role, content, metadata, now) = d;
-            let tx = conn.transaction()?;
-            // The session must exist. The Python dropped the message instead
-            // (`session_manager.py:249-255`); the foreign key would reject it
-            // anyway, so this turns a late write into a clear error.
-            let exists: Option<String> =
-                tx.query_row("SELECT id FROM sessions WHERE id = ?1", [&session_id], |row| {
-                    row.get(0)
-                })
-                .optional()?;
-            if exists.is_none() {
-                return Err(SessionError::Db(StoreError::Sqlite(rusqlite::Error::InvalidQuery)));
-            }
-            tx.execute(
-                "INSERT INTO chat_messages (id, session_id, role, content, metadata, timestamp)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![&message_id, &session_id, &role, &content, &metadata, now],
-            )?;
-            // Authoritative by construction: same transaction, so it counts this row.
-            tx.execute(
-                "UPDATE sessions
-                    SET message_count = (SELECT COUNT(*) FROM chat_messages WHERE session_id = ?1),
-                        last_message_at = ?2,
-                        last_accessed = ?2,
-                        updated_at = ?2
-                  WHERE id = ?1",
-                params![&session_id, now],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })?;
-        // The cached count is now stale by definition.
-        self.cache.remove(&target);
-        Ok(())
-    }
-
     /// Truncates a session's history, keeping the first `keep_count` messages.
     ///
     /// Recomputes `message_count` from the surviving rows rather than trusting
@@ -656,58 +769,57 @@ impl SessionStore {
     /// `session_manager.py:331-334`: the AI tool defaults to `keep_count = 10`
     /// on a shorter session, and the column must reflect what actually remains.
     ///
-    /// **Blocking.**
-    ///
     /// # Errors
     ///
     /// Returns [`SessionError::Db`] if the transaction fails.
-    pub fn truncate_blocking(&self, session_id: String, keep_count: usize, now: f64) -> Result<usize> {
-        let target = session_id.clone();
-        let removed = with_conn(
-            &self.store,
-            (session_id, keep_count, now),
-            |conn_mut, d| {
-            let conn = &mut *conn_mut;
-            let (session_id, keep_count, now) = d;
-            let tx = conn.transaction()?;
-            // `id` breaks ties because timestamps can collide within a millisecond.
-            let ids: Vec<String> = {
-                let mut stmt = tx.prepare(
-                    "SELECT id FROM chat_messages WHERE session_id = ?1
-                     ORDER BY timestamp, id LIMIT -1 OFFSET ?2",
+    pub async fn truncate(&self, session_id: &str, keep_count: usize, now: f64) -> Result<usize> {
+        let target = session_id.to_owned();
+        let key = target.clone();
+        let removed = self
+            .in_transaction(move |conn| {
+                let tx = conn.transaction()?;
+                // `id` breaks ties because timestamps can collide within a millisecond.
+                let ids: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT id FROM chat_messages WHERE session_id = ?1
+                         ORDER BY timestamp, id LIMIT -1 OFFSET ?2",
+                    )?;
+                    #[expect(
+                        clippy::cast_possible_wrap,
+                        reason = "a keep_count beyond i64 is not reachable from a UI or a route"
+                    )]
+                    let keep = keep_count as i64;
+                    let rows = stmt.query_map(params![&key, keep], |row| row.get(0))?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                let deleted = ids.len();
+                // SQLite has no array binding, so this is one statement per row.
+                // Every `id` is still a bound `?1` parameter — none is interpolated
+                // into SQL text — and they come from this session's own rows rather
+                // than from caller input.
+                for id in &ids {
+                    tx.execute("DELETE FROM chat_messages WHERE id = ?1", [id])?;
+                }
+                tx.execute(
+                    "UPDATE sessions
+                        SET message_count = (SELECT COUNT(*) FROM chat_messages WHERE session_id = ?1),
+                            updated_at = ?2
+                      WHERE id = ?1",
+                    params![key, now],
                 )?;
-                #[expect(
-                    clippy::cast_possible_wrap,
-                    reason = "a keep_count beyond i64 is not reachable from a UI or a route"
-                )]
-                let keep = keep_count as i64;
-                let rows = stmt.query_map(params![&session_id, keep], |row| row.get(0))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            let deleted = ids.len();
-            for id in &ids {
-                tx.execute("DELETE FROM chat_messages WHERE id = ?1", [id])?;
-            }
-            tx.execute(
-                "UPDATE sessions
-                    SET message_count = (SELECT COUNT(*) FROM chat_messages WHERE session_id = ?1),
-                        updated_at = ?2
-                  WHERE id = ?1",
-                params![session_id, now],
-            )?;
-            tx.commit()?;
-            Ok(deleted)
-        })?;
+                tx.commit()?;
+                Ok(deleted)
+            })
+            .await?;
         self.cache.remove(&target);
         Ok(removed)
     }
 
     /// Replaces a session's whole history.
     ///
-    /// Each message is `(id, role, content, metadata, timestamp_offset)`, and the
-    /// offsets preserve insertion order without relying on `timestamp` resolution.
-    ///
-    /// **Blocking.**
+    /// Each message carries its own `timestamp`, and slice order is preserved, so
+    /// insertion order does not depend on timestamp resolution. `now` is the
+    /// moment of the edit and is what the session row is stamped with.
     ///
     /// # Errors
     ///
@@ -715,40 +827,44 @@ impl SessionStore {
     /// uploads before deleting rows (`session_manager.py:363-378`); that check
     /// needs the upload handler, which is not a store concern, so it is the
     /// caller's job to run first. Recorded rather than silently dropped.
-    pub fn replace_messages_blocking(
+    pub async fn replace_messages(
         &self,
-        session_id: String,
-        messages: Vec<(String, String, String, Option<String>, f64)>,
+        session_id: &str,
+        messages: Vec<NewMessage>,
         now: f64,
     ) -> Result<()> {
-        let target = session_id.clone();
-        with_conn(
-            &self.store,
-            (session_id, messages, now),
-            |conn_mut, d| {
-            let conn = &mut *conn_mut;
-            let (session_id, messages, now) = d;
+        let target = session_id.to_owned();
+        let key = target.clone();
+        self.in_transaction(move |conn| {
             let tx = conn.transaction()?;
-            tx.execute("DELETE FROM chat_messages WHERE session_id = ?1", [&session_id])?;
-            for (id, role, content, metadata, offset) in messages {
+            tx.execute("DELETE FROM chat_messages WHERE session_id = ?1", [&key])?;
+            for message in &messages {
                 tx.execute(
                     "INSERT INTO chat_messages (id, session_id, role, content, metadata, timestamp)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![id, session_id, role, content, metadata, now + offset],
+                    params![
+                        &message.id,
+                        &key,
+                        &message.role,
+                        &message.content,
+                        &message.metadata,
+                        message.timestamp
+                    ],
                 )?;
             }
-            // The recount, not `len(messages)`, so this stays correct if a caller
+            // The recount, not `messages.len()`, so this stays correct if a caller
             // ever filters what it passes in.
             tx.execute(
                 "UPDATE sessions
                     SET message_count = (SELECT COUNT(*) FROM chat_messages WHERE session_id = ?1),
                         last_message_at = ?2, last_accessed = ?2, updated_at = ?2
                   WHERE id = ?1",
-                params![session_id, now],
+                params![key, now],
             )?;
             tx.commit()?;
             Ok(())
-        })?;
+        })
+        .await?;
         self.cache.remove(&target);
         Ok(())
     }
@@ -760,25 +876,104 @@ impl SessionStore {
     /// (`session_manager.py:488-492`) precisely because the column could not be
     /// trusted — its docstring says the column "drifts in normal operation" and
     /// reconciles against the real rows instead. Now that
-    /// [`SessionStore::add_message_blocking`] computes the count inside the write
+    /// [`SessionStore::add_message`] computes the count inside the write
     /// transaction, the column cannot drift, so the query is redundant work on the
     /// hot read path.
     ///
     /// # Errors
     ///
     /// Returns [`SessionError::Db`] if the read fails.
-    pub fn message_count_blocking(&self, session_id: String) -> Result<i64> {
-        let count = with_conn(&self.store, session_id, |conn_mut, session_id| {
-            let conn = &mut *conn_mut;
+    pub async fn message_count(&self, session_id: &str) -> Result<i64> {
+        let key = session_id.to_owned();
+        let count = blocking::with_conn(self.store.clone(), move |conn| -> Result<_> {
             conn.query_row(
                 "SELECT message_count FROM sessions WHERE id = ?1",
-                [session_id],
+                [&key],
                 |row| row.get::<_, Option<i64>>(0),
             )
             .optional()
             .map_err(SessionError::from)
-        })?;
+        })
+        .await?;
         Ok(count.flatten().unwrap_or(0))
+    }
+
+    /// Appends a message, computing `message_count` in the same transaction.
+    ///
+    /// This is T0202, and the whole point is *where* the count is computed.
+    ///
+    /// The Python wrote `len(self.sessions[session_id].history)` into the column
+    /// (`session_manager.py:288`) — an in-memory length standing in for a
+    /// database fact, which drifts the moment the two disagree. Its own docstring
+    /// at `session_manager.py:457-464` documents the drift. Here the insert, the
+    /// recount and the timestamp bumps all happen inside one transaction:
+    ///
+    /// ```text
+    /// BEGIN
+    ///   INSERT INTO chat_messages ...
+    ///   UPDATE sessions SET message_count = (SELECT COUNT(*) FROM chat_messages
+    ///                                    WHERE session_id = ?), ... WHERE id = ?
+    /// COMMIT
+    /// ```
+    ///
+    /// Because the recount is inside the transaction it sees the row just
+    /// inserted, and a concurrent writer either commits before this transaction
+    /// reads (and is counted) or after (and is not). There is no window in which
+    /// the column disagrees with the rows. That is what makes T0203's removal of
+    /// the per-read `COUNT(*)` safe rather than merely convenient.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::Db`] if the transaction fails. Unlike the Python,
+    /// which caught `Exception`, rolled back, logged and returned nothing
+    /// (`session_manager.py:305-308`), the failure is visible to the caller.
+    pub async fn add_message(&self, session_id: &str, message: NewMessage) -> Result<()> {
+        let target = session_id.to_owned();
+        let key = target.clone();
+        self.in_transaction(move |conn| {
+            let tx = conn.transaction()?;
+            // The session must exist. The Python dropped the message instead
+            // (`session_manager.py:249-255`); the foreign key would reject it
+            // anyway, so this turns a late write into a clear error.
+            let exists: Option<String> = tx
+                .query_row("SELECT id FROM sessions WHERE id = ?1", [&key], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            if exists.is_none() {
+                return Err(SessionError::Db(StoreError::Sqlite(
+                    rusqlite::Error::InvalidQuery,
+                )));
+            }
+            tx.execute(
+                "INSERT INTO chat_messages (id, session_id, role, content, metadata, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    &message.id,
+                    &key,
+                    &message.role,
+                    &message.content,
+                    &message.metadata,
+                    message.timestamp
+                ],
+            )?;
+            // Authoritative by construction: same transaction, so it counts this row.
+            tx.execute(
+                "UPDATE sessions
+                    SET message_count = (SELECT COUNT(*) FROM chat_messages WHERE session_id = ?1),
+                        last_message_at = ?2,
+                        last_accessed = ?2,
+                        updated_at = ?2
+                  WHERE id = ?1",
+                params![&key, message.timestamp],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+        // The cached row now holds a stale count by definition.
+        self.cache.remove(&target);
+        Ok(())
     }
 
     /// The real number of message rows. For tests and repair, not for reads.
@@ -786,16 +981,17 @@ impl SessionStore {
     /// # Errors
     ///
     /// Returns [`SessionError::Db`] if the read fails.
-    pub fn count_message_rows_blocking(&self, session_id: String) -> Result<i64> {
-        with_conn(&self.store, session_id, |conn_mut, session_id| {
-            let conn = &mut *conn_mut;
+    pub async fn count_message_rows(&self, session_id: &str) -> Result<i64> {
+        let key = session_id.to_owned();
+        blocking::with_conn(self.store.clone(), move |conn| -> Result<_> {
             conn.query_row(
                 "SELECT COUNT(*) FROM chat_messages WHERE session_id = ?1",
-                [session_id],
+                [&key],
                 |row| row.get(0),
             )
             .map_err(SessionError::from)
         })
+        .await
     }
 
     /// Verifies `message_count` agrees with the rows, repairing it if not.
@@ -804,169 +1000,90 @@ impl SessionStore {
     /// drifted, and for tests asserting the invariant holds. Returns `true` when a
     /// repair was made.
     ///
-    /// **Blocking.**
+    /// The read and the repair are one transaction: a message committed between
+    /// the `COUNT(*)` and the `UPDATE` would otherwise be silently overwritten
+    /// with a count that excludes it.
     ///
     /// # Errors
     ///
     /// Returns [`SessionError::Db`] if the read or repair fails.
-    pub fn repair_message_count_blocking(&self, session_id: &str) -> Result<bool> {
+    pub async fn repair_message_count(&self, session_id: &str) -> Result<bool> {
         let target = session_id.to_owned();
-        let (stored, actual) = with_conn(&self.store, target.clone(), |conn_mut, sid| {
-            let conn = &mut *conn_mut;
-            let stored: Option<i64> = conn
-                .query_row(
-                    "SELECT message_count FROM sessions WHERE id = ?1",
-                    [&sid],
-                    // The column is nullable, so the row value is already an
-                    // `Option`; `.optional()` then adds "or no row at all". Both
-                    // collapse to None, which is the same answer as Python's
-                    // `getattr(db_session, "message_count", 0) or 0`.
-                    |row| row.get::<_, Option<i64>>(0),
-                )
-                .optional()
-                .map_err(SessionError::from)?
-                .flatten();
-            let actual: i64 = conn
-                .query_row(
+        let key = target.clone();
+        let repaired = self
+            .in_transaction(move |conn| {
+                let tx = conn.transaction()?;
+                let stored: Option<i64> = tx
+                    .query_row(
+                        "SELECT message_count FROM sessions WHERE id = ?1",
+                        [&key],
+                        // The column is nullable, so the row value is already an
+                        // `Option`; `.optional()` then adds "or no row at all". Both
+                        // collapse to None, which is the same answer as Python's
+                        // `getattr(db_session, "message_count", 0) or 0`.
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let actual: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM chat_messages WHERE session_id = ?1",
-                    [&sid],
+                    [&key],
                     |row| row.get(0),
-                )
-                .map_err(SessionError::from)?;
-            Ok((stored, actual))
-        })?;
-        if stored == Some(actual) {
-            return Ok(false);
+                )?;
+                if stored == Some(actual) {
+                    return Ok(false);
+                }
+                tx.execute(
+                    "UPDATE sessions SET message_count = ?2 WHERE id = ?1",
+                    params![&key, actual],
+                )?;
+                tx.commit()?;
+                Ok(true)
+            })
+            .await?;
+        if repaired {
+            self.cache.remove(&target);
         }
-        with_conn(&self.store, (target, actual), |conn_mut, d| {
-            let conn = &mut *conn_mut;
-            let (session_id, actual) = d;
-            conn.execute(
-                "UPDATE sessions SET message_count = ?2 WHERE id = ?1",
-                params![&session_id, actual],
-            )
-            .map_err(SessionError::from)
-        })?;
-        self.cache.remove(session_id);
-        Ok(true)
+        Ok(repaired)
     }
-}
 
-impl SessionStore {
-    // -- **Blocking.** wrappers ---------------------------------------------
-    //
-    // Each takes owned arguments because the closure is moved onto the blocking
-    // pool and must be `Send + 'static`.
+    // -- transactions -------------------------------------------------------
 
-    /// Reads one session's metadata, **on the blocking pool**.
+    /// Runs `f` inside a transaction, on the blocking pool, against a connection
+    /// opened here and closed here.
+    ///
+    /// [`crate::blocking::with_conn`] hands out `&Connection` on purpose, so a
+    /// genuine `BEGIN`/`COMMIT` — the message mutators above — cannot use it:
+    /// `rusqlite::transaction()` needs `&mut Connection`. Rather than widen that
+    /// shared helper's contract, this opens its own connection *inside* the
+    /// [`crate::blocking::spawn_blocking`] closure. The D11 guarantee is
+    /// unchanged: no SQLite call happens on an executor thread, and no
+    /// `Connection` value outlives the closure, so none can be held across an
+    /// `.await`.
     ///
     /// # Errors
     ///
-    /// Propagates [`SessionError::Db`] or a [`tokio::task::JoinError`].
-    pub async fn get_async(
-        &self,
-        id: String,
-    ) -> std::result::Result<Option<SessionMeta>, Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.clone();
-        crate::blocking::spawn_blocking(move || store.get_blocking(id))
-            .await?
-            .map_err(Into::into)
-    }
-
-    /// Lists sessions for one owner, **on the blocking pool**.
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`SessionError::Db`] or a [`tokio::task::JoinError`].
-    pub async fn list_async(
-        &self,
-        owner: String,
-    ) -> std::result::Result<Vec<SessionMeta>, Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.clone();
-        crate::blocking::spawn_blocking(move || store.list_blocking(owner))
-            .await?
-            .map_err(Into::into)
-    }
-
-    /// Appends a message, **on the blocking pool**.
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`SessionError::Db`] or a [`tokio::task::JoinError`].
-    pub async fn add_message_async(
-        &self,
-        session_id: String,
-        message_id: String,
-        role: String,
-        content: String,
-        metadata: Option<String>,
-        now: f64,
-    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.clone();
-        crate::blocking::spawn_blocking(move || {
-            store.add_message_blocking(session_id, message_id, role, content, metadata, now)
+    /// Returns [`SessionError::Db`] for a connection, statement or commit failure,
+    /// and [`StoreError::Interrupted`] if the task is cancelled. A panic inside
+    /// `f` is resumed on the caller so the original message and location survive,
+    /// rather than surfacing as an opaque `JoinError`.
+    async fn in_transaction<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let store = self.store.clone();
+        match blocking::spawn_blocking(move || {
+            let mut conn = store.connect()?;
+            f(&mut conn)
         })
-        .await?
-        .map_err(Into::into)
+        .await
+        {
+            Ok(result) => result,
+            Err(join_err) if join_err.is_panic() => {
+                std::panic::resume_unwind(join_err.into_panic());
+            }
+            Err(_) => Err(SessionError::Db(StoreError::Interrupted)),
+        }
     }
-
-    /// Deletes a session, **on the blocking pool**.
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`SessionError::Db`] or a [`tokio::task::JoinError`].
-    pub async fn delete_async(
-        &self,
-        id: String,
-    ) -> std::result::Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.clone();
-        crate::blocking::spawn_blocking(move || store.delete_blocking(id))
-            .await?
-            .map_err(Into::into)
-    }
-
-    /// Creates a session, **on the blocking pool**.
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`SessionError::Db`] or a [`tokio::task::JoinError`].
-    pub async fn create_async(
-        &self,
-        new: NewSession,
-    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.clone();
-        crate::blocking::spawn_blocking(move || store.create_blocking(new))
-            .await?
-            .map_err(Into::into)
-    }
-}
-
-/// Runs a synchronous `rusqlite` closure against a fresh connection, on the
-/// blocking pool, flattening the error into [`SessionError`].
-///
-/// The closure returns `rusqlite::Result<T>` and `SessionError` wraps it, so every
-/// call site is a single `?` rather than a nested `Result<Result<..>>`. That
-/// matters because the connection must be opened *and* the work run off the async
-/// runtime (AGENTS.md D11), and threading the pool's error type through to every
-/// call site would obscure that.
-///
-/// `f` is generic over the data it needs and receives it as an argument, because
-/// the closure is moved to another thread and so cannot capture a borrow of the
-/// caller's `&str` (E0521). Call sites write `with_conn(&store, data, |conn, d| …)`.
-///
-/// `spawn_blocking_sync` does not exist yet — see the request in the report.
-fn with_conn<D, F, T>(store: &Store, data: D, f: F) -> Result<T>
-where
-    D: Send + 'static,
-    F: FnOnce(&mut Connection, D) -> Result<T> + Send + 'static,
-    T: Send + 'static,
-{
-    let path = store.path().to_path_buf();
-    // Two errors meet here: the connection can fail as a `StoreError`, and the
-    // closure returns `SessionError`. Mapping the closure's into the pool's
-    // would lose the type, so the pool call is generic over `E` instead.
-    crate::blocking::spawn_blocking_sync_generic(move || {
-        let mut conn = Store::open(path.clone()).connect()?;
-        f(&mut conn, data)
-    })
 }

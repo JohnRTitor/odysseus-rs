@@ -13,57 +13,78 @@
 //!
 //! `Result` and `?` throughout rather than `expect` — `clippy.toml`'s
 //! `allow-expect-in-tests` covers `#[cfg(test)]` modules, not `crates/*/tests/`.
+//! The two `expect`s that remain are assertions about values, not about I/O.
 
 use std::sync::Arc;
 
 use odysseus_store::{
     Store,
-    sessions::{NewSession, SessionCache, SessionMeta, SessionStore},
+    session_actions::{
+        FRESH_GRACE_SECS, SweepAction, SweepReason, SweepRow, classify, is_recently_active,
+        preview_sessions, sweep_sessions,
+    },
+    session_image_cleanup::ImageCleanup,
+    sessions::{NewMessage, NewSession, SessionCache, SessionMeta, SessionStore},
 };
 
 /// A store over a fresh temp database with the baseline applied.
-fn store() -> (tempfile::TempDir, Store) {
-    let dir = tempfile::tempdir().expect("tempdir");
+///
+/// Returns the `TempDir` too: the tests need it to outlive the `Store`, since
+/// deleting it out from under an open connection would make the assertions
+/// meaningless rather than failing them.
+///
+/// # Errors
+///
+/// Returns an error if the temp directory cannot be created or the schema cannot
+/// be applied. Propagating rather than `expect`ing keeps this compatible with the
+/// workspace's `expect_used = "deny"`, which covers `crates/*/tests/`.
+fn store() -> Result<(tempfile::TempDir, Store), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
     let store = Store::open(dir.path().join("app.db"));
-    store.migrate().expect("migrate");
-    (dir, store)
+    store.migrate()?;
+    Ok((dir, store))
 }
 
 /// Creates a session with a fixed timestamp.
-fn create(
+async fn create(
     sessions: &SessionStore,
     id: &str,
     owner: &str,
     now: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    sessions.create_blocking(NewSession {
-        id: id.to_owned(),
-        name: format!("{id} name"),
-        endpoint_url: "http://127.0.0.1:11434/v1".to_owned(),
-        model: "llama3".to_owned(),
-        owner: owner.to_owned(),
-        rag: false,
-        now,
-    })?;
+    sessions
+        .create(NewSession {
+            id: id.to_owned(),
+            name: format!("{id} name"),
+            endpoint_url: "http://127.0.0.1:11434/v1".to_owned(),
+            model: "llama3".to_owned(),
+            owner: owner.to_owned(),
+            rag: false,
+            now,
+        })
+        .await?;
     Ok(())
 }
 
 /// Appends one message.
-fn add(
+async fn add(
     sessions: &SessionStore,
     session_id: &str,
     n: usize,
     role: &str,
     now: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    sessions.add_message_blocking(
-        session_id.to_owned(),
-        format!("msg-{session_id}-{n}"),
-        role.to_owned(),
-        format!("body {n}"),
-        None,
-        now,
-    )?;
+    sessions
+        .add_message(
+            session_id,
+            NewMessage::new(
+                format!("msg-{session_id}-{n}"),
+                role,
+                format!("body {n}"),
+                now,
+            ),
+        )
+        .await?;
     Ok(())
 }
 
@@ -71,15 +92,13 @@ fn add(
 // T0200 — CRUD
 // ---------------------------------------------------------------------------
 
-#[test]
-fn create_and_read_back_a_session() -> Result<(), Box<dyn std::error::Error>> {
-    let (_dir, store) = store();
+#[tokio::test]
+async fn create_and_read_back_a_session() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
     let sessions = SessionStore::new(store);
-    create(&sessions, "s1", "alice", 1_000.0)?;
+    create(&sessions, "s1", "alice", 1_000.0).await?;
 
-    let meta = sessions
-        .get_blocking("s1".to_owned())?
-        .expect("session must exist");
+    let meta = sessions.get("s1").await?.expect("session must exist");
     assert_eq!(meta.id.as_ref(), "s1");
     assert_eq!(meta.owner.as_ref(), "alice");
     assert_eq!(meta.model.as_ref(), "llama3");
@@ -88,80 +107,87 @@ fn create_and_read_back_a_session() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn a_missing_session_is_none_not_an_error() -> Result<(), Box<dyn std::error::Error>> {
-    let (_dir, store) = store();
+#[tokio::test]
+async fn a_missing_session_is_none_not_an_error() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
     let sessions = SessionStore::new(store);
-    assert!(sessions.get_blocking("nope".to_owned())?.is_none());
+    assert!(sessions.get("nope").await?.is_none());
     Ok(())
 }
 
-#[test]
-fn creating_the_same_id_twice_is_an_error_not_a_silent_overwrite()
+#[tokio::test]
+async fn creating_the_same_id_twice_is_an_error_not_a_silent_overwrite()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (_dir, store) = store();
+    let (_dir, store) = store()?;
     let sessions = SessionStore::new(store);
-    create(&sessions, "dup", "alice", 1_000.0)?;
+    create(&sessions, "dup", "alice", 1_000.0).await?;
     // Python's `create_session` would raise on the second insert too, but the
     // caller could not distinguish it from a crash; here it is a typed error.
-    assert!(create(&sessions, "dup", "alice", 1_000.0).is_err());
+    assert!(create(&sessions, "dup", "alice", 1_000.0).await.is_err());
     Ok(())
 }
 
-#[test]
-fn rename_and_flags_round_trip() -> Result<(), Box<dyn std::error::Error>> {
-    let (_dir, store) = store();
+#[tokio::test]
+async fn rename_and_flags_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
     let sessions = SessionStore::new(store);
-    create(&sessions, "s1", "alice", 1_000.0)?;
+    create(&sessions, "s1", "alice", 1_000.0).await?;
 
-    sessions.rename_blocking("s1".to_owned(), "renamed".to_owned(), 2_000.0)?;
-    sessions.set_important_blocking("s1".to_owned(), true, 3_000.0)?;
-    sessions.set_archived_blocking("s1".to_owned(), true, 4_000.0)?;
-    sessions.touch_blocking("s1".to_owned(), 5_000.0)?;
+    sessions.rename("s1", "renamed", 2_000.0).await?;
+    sessions.set_important("s1", true, 3_000.0).await?;
+    sessions.set_archived("s1", true, 4_000.0).await?;
+    sessions.touch("s1", 5_000.0).await?;
 
-    let meta = sessions.get_blocking("s1".to_owned())?.expect("exists");
+    let meta = sessions.get("s1").await?.expect("exists");
     assert_eq!(meta.name.as_ref(), "renamed");
     assert!(meta.is_important);
     assert!(meta.archived);
-    assert_eq!(meta.last_accessed, 5_000.0);
+    // `last_accessed` round-trips through SQLite as a REAL. The value was written
+    // as the exact double 5_000.0 and comes back bit-identical, so an epsilon
+    // comparison would only obscure that; the cast to bits asserts exactness
+    // without tripping `float_cmp`.
+    assert_eq!(
+        meta.last_accessed.to_bits(),
+        5_000.0_f64.to_bits(),
+        "touch must set last_accessed to exactly the timestamp it was given"
+    );
     Ok(())
 }
 
-#[test]
-fn list_is_scoped_to_owner_and_empty_owner_means_all() -> Result<(), Box<dyn std::error::Error>> {
-    let (_dir, store) = store();
+#[tokio::test]
+async fn list_is_scoped_to_owner_and_empty_owner_means_all()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
     let sessions = SessionStore::new(store);
-    create(&sessions, "a", "alice", 1_000.0)?;
-    create(&sessions, "b", "bob", 2_000.0)?;
+    create(&sessions, "a", "alice", 1_000.0).await?;
+    create(&sessions, "b", "bob", 2_000.0).await?;
 
-    let alice = sessions.list_blocking("alice".to_owned())?;
+    let alice = sessions.list("alice").await?;
     assert_eq!(alice.len(), 1, "alice must not see bob's session");
     assert_eq!(alice[0].id.as_ref(), "a");
 
-    let everyone = sessions.list_blocking(String::new())?;
+    let everyone = sessions.list("").await?;
     assert_eq!(everyone.len(), 2, "an empty owner means every owner");
     Ok(())
 }
 
-#[test]
-fn deleting_a_session_cascades_to_its_messages() -> Result<(), Box<dyn std::error::Error>> {
-    let (_dir, store) = store();
-    let sessions = SessionStore::new(store.clone());
-    create(&sessions, "s1", "alice", 1_000.0)?;
-    add(&sessions, "s1", 0, "user", 1_100.0)?;
+#[tokio::test]
+async fn deleting_a_session_cascades_to_its_messages() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
+    let sessions = SessionStore::new(store);
+    create(&sessions, "s1", "alice", 1_000.0).await?;
+    add(&sessions, "s1", 0, "user", 1_100.0).await?;
 
-    let remaining = store
-        .connect()?
-        .query_row(
-            "SELECT COUNT(*) FROM chat_messages WHERE session_id = 's1'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0);
+    let remaining = sessions.count_message_rows("s1").await?;
     assert_eq!(remaining, 1, "setup: the message exists");
 
-    assert_eq!(sessions.delete_blocking("s1".to_owned())?, 1);
-    assert!(sessions.get_blocking("s1".to_owned())?.is_none());
+    assert_eq!(sessions.delete("s1").await?, 1);
+    assert!(sessions.get("s1").await?.is_none());
+    assert_eq!(
+        sessions.count_message_rows("s1").await?,
+        0,
+        "ON DELETE CASCADE must remove the messages"
+    );
     Ok(())
 }
 
@@ -176,11 +202,11 @@ fn deleting_a_session_cascades_to_its_messages() -> Result<(), Box<dyn std::erro
 /// (`session_manager.py:457-464`) documents that the column "drifts in normal
 /// operation"; here it cannot, because the recount is inside the insert
 /// transaction.
-#[test]
-fn message_count_always_equals_the_row_count() -> Result<(), Box<dyn std::error::Error>> {
-    let (_dir, store) = store();
+#[tokio::test]
+async fn message_count_always_equals_the_row_count() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
     let sessions = SessionStore::new(store);
-    create(&sessions, "s1", "alice", 1_000.0)?;
+    create(&sessions, "s1", "alice", 1_000.0).await?;
 
     for n in 0..5 {
         add(
@@ -189,9 +215,10 @@ fn message_count_always_equals_the_row_count() -> Result<(), Box<dyn std::error:
             n,
             if n % 2 == 0 { "user" } else { "assistant" },
             1_100.0,
-        )?;
-        let column = sessions.message_count_blocking("s1".to_owned())?;
-        let rows = sessions.count_message_rows_blocking("s1".to_owned())?;
+        )
+        .await?;
+        let column = sessions.message_count("s1").await?;
+        let rows = sessions.count_message_rows("s1").await?;
         assert_eq!(
             column,
             rows,
@@ -199,7 +226,7 @@ fn message_count_always_equals_the_row_count() -> Result<(), Box<dyn std::error:
             n + 1
         );
     }
-    assert_eq!(sessions.message_count_blocking("s1".to_owned())?, 5);
+    assert_eq!(sessions.message_count("s1").await?, 5);
     Ok(())
 }
 
@@ -209,12 +236,12 @@ fn message_count_always_equals_the_row_count() -> Result<(), Box<dyn std::error:
 /// (`session_manager.py:249-255`) and `add_message` has already appended to
 /// memory, so the caller sees neither an error nor a row. T0202 requires the
 /// error to be visible.
-#[test]
-fn writing_to_a_missing_session_is_an_error() -> Result<(), Box<dyn std::error::Error>> {
-    let (_dir, store) = store();
+#[tokio::test]
+async fn writing_to_a_missing_session_is_an_error() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
     let sessions = SessionStore::new(store);
     assert!(
-        add(&sessions, "ghost", 0, "user", 1_000.0).is_err(),
+        add(&sessions, "ghost", 0, "user", 1_000.0).await.is_err(),
         "a message for a session that does not exist must be an error, not a no-op"
     );
     Ok(())
@@ -226,31 +253,29 @@ fn writing_to_a_missing_session_is_an_error() -> Result<(), Box<dyn std::error::
 /// `add_message` had already bumped the in-memory count, the next successful
 /// persist wrote rows+1. Here a failed write is transactional, so the column
 /// cannot move.
-#[test]
-fn a_failed_write_does_not_change_the_count() -> Result<(), Box<dyn std::error::Error>> {
-    let (_dir, store) = store();
+#[tokio::test]
+async fn a_failed_write_does_not_change_the_count() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
     let sessions = SessionStore::new(store);
-    create(&sessions, "s1", "alice", 1_000.0)?;
-    add(&sessions, "s1", 0, "user", 1_100.0)?;
-    let before = sessions.message_count_blocking("s1".to_owned())?;
+    create(&sessions, "s1", "alice", 1_000.0).await?;
+    add(&sessions, "s1", 0, "user", 1_100.0).await?;
+    let before = sessions.message_count("s1").await?;
 
     // A duplicate primary key. `chat_messages.id` is `PRIMARY KEY (id)`
     // (0001_baseline.sql:92), so this insert must fail inside the transaction and
     // take the recount with it.
-    let duplicate = sessions.add_message_blocking(
-        "s1".to_owned(),
-        "msg-s1-0".to_owned(),
-        "user".to_owned(),
-        "duplicate".to_owned(),
-        None,
-        1_200.0,
-    );
+    let duplicate = sessions
+        .add_message(
+            "s1",
+            NewMessage::new("msg-s1-0", "user", "duplicate", 1_200.0),
+        )
+        .await;
     assert!(
         duplicate.is_err(),
         "a duplicate message id must be an error"
     );
 
-    let after = sessions.message_count_blocking("s1".to_owned())?;
+    let after = sessions.message_count("s1").await?;
     assert_eq!(
         before, after,
         "a failed write must not move the count; Python wrote rows+1 here"
@@ -263,64 +288,388 @@ fn a_failed_write_does_not_change_the_count() -> Result<(), Box<dyn std::error::
 /// The Python's comment at `session_manager.py:331-334` says exactly this: the AI
 /// tool defaults to `keep_count = 10` on a shorter session, so trusting the cap
 /// would leave the column claiming 10 messages when 3 remain.
-#[test]
-fn truncate_counts_the_rows_that_actually_remain() -> Result<(), Box<dyn std::error::Error>> {
-    let (_dir, store) = store();
+#[tokio::test]
+async fn truncate_counts_the_rows_that_actually_remain() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
     let sessions = SessionStore::new(store);
-    create(&sessions, "s1", "alice", 1_000.0)?;
+    create(&sessions, "s1", "alice", 1_000.0).await?;
     for n in 0..3 {
-        add(&sessions, "s1", n, "user", 1_100.0 + n as f64)?;
+        add(
+            &sessions,
+            "s1",
+            n,
+            "user",
+            1_100.0 + f64::from(u16::try_from(n).unwrap_or(u16::MAX)),
+        )
+        .await?;
     }
 
     // Ask for more than exist, exactly as the Python's default does.
-    let removed = sessions.truncate_blocking("s1".to_owned(), 10, 2_000.0)?;
+    let removed = sessions.truncate("s1", 10, 2_000.0).await?;
     assert_eq!(
         removed, 0,
         "nothing to remove when the cap exceeds the history"
     );
     assert_eq!(
-        sessions.message_count_blocking("s1".to_owned())?,
+        sessions.message_count("s1").await?,
         3,
         "the count must reflect the rows that remain, not keep_count"
     );
 
-    sessions.truncate_blocking("s1".to_owned(), 1, 3_000.0)?;
-    assert_eq!(sessions.message_count_blocking("s1".to_owned())?, 1);
+    sessions.truncate("s1", 1, 3_000.0).await?;
+    assert_eq!(sessions.message_count("s1").await?, 1);
     Ok(())
 }
 
 /// Replacing history sets the count to the new length.
-#[test]
-fn replace_messages_resets_the_count() -> Result<(), Box<dyn std::error::Error>> {
-    let (_dir, store) = store();
+#[tokio::test]
+async fn replace_messages_resets_the_count() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
     let sessions = SessionStore::new(store);
-    create(&sessions, "s1", "alice", 1_000.0)?;
+    create(&sessions, "s1", "alice", 1_000.0).await?;
     for n in 0..4 {
-        add(&sessions, "s1", n, "user", 1_100.0 + n as f64)?;
+        add(
+            &sessions,
+            "s1",
+            n,
+            "user",
+            1_100.0 + f64::from(u16::try_from(n).unwrap_or(u16::MAX)),
+        )
+        .await?;
     }
-    assert_eq!(sessions.message_count_blocking("s1".to_owned())?, 4);
+    assert_eq!(sessions.message_count("s1").await?, 4);
 
-    let messages: Vec<(String, String, String, Option<String>, f64)> = (0..2)
+    let messages: Vec<NewMessage> = (0..2)
         .map(|n| {
-            (
+            NewMessage::new(
                 format!("new-{n}"),
-                "user".to_owned(),
+                "user",
                 format!("fresh {n}"),
-                None,
-                n as f64,
+                f64::from(n),
             )
         })
         .collect();
-    sessions.replace_messages_blocking("s1".to_owned(), messages, 5_000.0)?;
+    sessions.replace_messages("s1", messages, 5_000.0).await?;
     assert_eq!(
-        sessions.message_count_blocking("s1".to_owned())?,
+        sessions.message_count("s1").await?,
         2,
         "a replacement must leave the count equal to the new length"
+    );
+    assert_eq!(sessions.count_message_rows("s1").await?, 2);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// T0204 — the sweeper
+// ---------------------------------------------------------------------------
+
+/// The sweeper's decisions are a pure function of the row, so they can be
+/// asserted without a database.
+///
+/// Each case below is one branch of `classify`. The order is the interesting
+/// part: a pinned session is kept *even if* it is also empty and incognito, so
+/// `is_important` is checked first. A pin is the user's explicit "do not touch
+/// this" and nothing may override it.
+#[test]
+fn classify_keeps_pinned_and_fresh_sessions() {
+    let now = 100_000.0;
+    let row =
+        |name: &str, important: bool, count: i64, touched: f64, first: Option<&str>| SweepRow {
+            id: "s".to_owned(),
+            name: name.to_owned(),
+            is_important: important,
+            message_count: count,
+            last_touched: touched,
+            first_user_message: first.map(str::to_owned),
+        };
+
+    // Pinned wins over every other rule, including Incognito and empty.
+    assert_eq!(
+        classify(&row("Incognito", true, 0, 0.0, None), now),
+        (SweepAction::Keep, SweepReason::Important)
+    );
+    // Inside the grace window: kept, whatever else is true.
+    assert_eq!(
+        classify(&row("test", false, 0, now - 1.0, None), now),
+        (SweepAction::Keep, SweepReason::RecentlyActive)
+    );
+    // Past the grace window and empty: deleted.
+    assert_eq!(
+        classify(&row("Real work", false, 0, now - 5_000.0, None), now),
+        (SweepAction::Delete, SweepReason::Empty)
+    );
+    // Past grace, short, junk name: deleted.
+    assert_eq!(
+        classify(&row("test", false, 3, now - 5_000.0, None), now),
+        (SweepAction::Delete, SweepReason::ThrowawayName)
+    );
+    // A single unanswered user message is throwaway whatever the session is
+    // named — but only once the junk-name check has passed, so the first message
+    // here is deliberately *not* one of `THROWAWAY_NAMES`. With a junk first
+    // message it is `ThrowawayName`, and that ordering is the Python's.
+    assert_eq!(
+        classify(
+            &row(
+                "Weather",
+                false,
+                1,
+                now - 5_000.0,
+                Some("what is the weather")
+            ),
+            now
+        ),
+        (SweepAction::Delete, SweepReason::Unanswered)
+    );
+    // Same shape, but the junk first message is caught first.
+    assert_eq!(
+        classify(&row("Weather", false, 1, now - 5_000.0, Some("hello")), now),
+        (SweepAction::Delete, SweepReason::ThrowawayName)
+    );
+    // Long enough with a real name: kept. This is the case that must *not* change.
+    assert_eq!(
+        classify(&row("Weather", false, 9, now - 5_000.0, Some("hello")), now),
+        (SweepAction::Keep, SweepReason::RecentlyActive)
+    );
+}
+
+/// The grace window is `FRESH_GRACE_SECS` wide and inclusive at the edge.
+#[test]
+fn the_grace_window_boundary_is_inclusive() {
+    let now = 100_000.0;
+    assert!(is_recently_active(now - FRESH_GRACE_SECS, now));
+    assert!(!is_recently_active(now - FRESH_GRACE_SECS - 1.0, now));
+    // A timestamp in the future is treated as recent — fail-safe, per the Python's
+    // `if value >= now: return True`.
+    assert!(is_recently_active(now + 500.0, now));
+}
+
+/// A sweep deletes what it should, leaves the rest, and reports honestly.
+///
+/// Runs through the async [`sweep_sessions`] entry point rather than
+/// `sweep_blocking`, so this also pins that the transactional sweep really does
+/// run off the async runtime (AGENTS.md §6) rather than blocking an executor.
+#[tokio::test]
+async fn a_sweep_deletes_only_what_it_should() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
+    let sessions = SessionStore::new(store.clone());
+    let now = 100_000.0;
+
+    create(&sessions, "keep-fresh", "alice", now).await?;
+    create(&sessions, "keep-pinned", "alice", now - 5_000.0).await?;
+    create(&sessions, "drop-empty", "alice", now - 5_000.0).await?;
+    create(&sessions, "drop-junk", "alice", now - 5_000.0).await?;
+    sessions
+        .set_important("keep-pinned", true, now - 5_000.0)
+        .await?;
+    // `drop-junk` needs a junk *name*; `create` derives the name from the id.
+    sessions.rename("drop-junk", "test", now - 5_000.0).await?;
+
+    let report = sweep_sessions(store.clone(), "alice", now).await?;
+    assert_eq!(report.examined, 4, "every unarchived session is examined");
+    assert_eq!(report.deleted, 2, "the empty one and the junk-named one");
+
+    assert!(sessions.get("keep-fresh").await?.is_some(), "fresh is kept");
+    assert!(
+        sessions.get("keep-pinned").await?.is_some(),
+        "pinned is kept"
+    );
+    assert!(
+        sessions.get("drop-empty").await?.is_none(),
+        "empty is deleted"
+    );
+    assert!(
+        sessions.get("drop-junk").await?.is_none(),
+        "junk is deleted"
     );
     Ok(())
 }
 
-// PLACEHOLDER_SESSIONS_TESTS
+/// The dry run must agree with the real sweep, or it is worse than useless.
+///
+/// An operator who previews a sweep and then runs it has to get the same answer,
+/// so `preview_sessions` is checked against `sweep_sessions` on the same fixture.
+#[tokio::test]
+async fn the_dry_run_predicts_the_sweep_exactly() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
+    let sessions = SessionStore::new(store.clone());
+    let now = 100_000.0;
+    create(&sessions, "a", "alice", now - 5_000.0).await?;
+    create(&sessions, "b", "alice", now - 5_000.0).await?;
+    create(&sessions, "c", "alice", now - 5_000.0).await?;
+    sessions.set_important("c", true, now - 5_000.0).await?;
+
+    let predicted: Vec<String> = preview_sessions(store.clone(), "alice", now)
+        .await?
+        .into_iter()
+        .filter(|(_, action, _)| *action == SweepAction::Delete)
+        .map(|(id, _, _)| id)
+        .collect();
+
+    let report = sweep_sessions(store.clone(), "alice", now).await?;
+    assert_eq!(
+        predicted.len(),
+        report.deleted,
+        "the preview promised {} deletions but the sweep performed {}",
+        predicted.len(),
+        report.deleted
+    );
+    for id in predicted {
+        assert!(sessions.get(&id).await?.is_none(), "{id} was deleted");
+    }
+    Ok(())
+}
+
+/// A sweep is scoped to one owner and never touches another's sessions.
+#[tokio::test]
+async fn a_sweep_is_scoped_to_one_owner() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
+    let sessions = SessionStore::new(store.clone());
+    let now = 100_000.0;
+    create(&sessions, "mine", "alice", now - 5_000.0).await?;
+    create(&sessions, "theirs", "bob", now - 5_000.0).await?;
+
+    let report = sweep_sessions(store.clone(), "alice", now).await?;
+    assert_eq!(report.examined, 1, "bob's session is not alice's to sweep");
+    assert!(sessions.get("theirs").await?.is_some());
+    Ok(())
+}
+
+/// A brand-new session must survive the sweep. This is a regression test.
+///
+/// The sweep's `last_touched` originally took the max of only `last_message_at`
+/// and `last_accessed`, but a session created by `SessionStore::create` has
+/// `last_accessed = NULL` — nothing has ever opened it — so `COALESCE` yielded 0
+/// and the row read as infinitely old. An empty session created one second
+/// earlier was therefore deleted on the next sweep. The Python avoids this by
+/// checking all four of `last_message_at`, `last_accessed`, `updated_at` and
+/// `created_at` (`session_actions.py:44-48`), and so does this now.
+#[tokio::test]
+async fn a_brand_new_empty_session_survives_the_sweep() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
+    let sessions = SessionStore::new(store.clone());
+    let now = 100_000.0;
+    create(&sessions, "just-created", "alice", now).await?;
+
+    let report = sweep_sessions(store.clone(), "alice", now).await?;
+    assert_eq!(report.examined, 1);
+    assert_eq!(
+        report.deleted, 0,
+        "a session inside the grace window must not be swept"
+    );
+    assert!(sessions.get("just-created").await?.is_some());
+    Ok(())
+}
+
+/// A filename that escapes the images root is refused, not unlinked.
+///
+/// This is the directory-traversal guard. The name arrives inside a message's
+/// `metadata` JSON, which is attacker-influenceable content, so a crafted
+/// message could otherwise make session-delete unlink a file anywhere the
+/// process can write. The test creates a real file outside the root and asserts
+/// it survives.
+#[tokio::test]
+async fn a_traversing_filename_is_never_unlinked() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("generated_images");
+    std::fs::create_dir_all(&root)?;
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, b"do not delete me")?;
+
+    let cleanup = ImageCleanup::new(&root);
+    // Every one of these is the same attack in a different shape.
+    for name in [
+        "../victim.txt",
+        "../../victim.txt",
+        "./victim.txt",
+        "..",
+        "sub/child.png",
+        "",
+    ] {
+        assert!(
+            cleanup.safe_path(name)?.is_none(),
+            "{name:?} must be rejected as a traversal attempt"
+        );
+    }
+    assert!(
+        victim.exists(),
+        "the file outside the root must be untouched"
+    );
+    Ok(())
+}
+
+/// Deleting a session deactivates its gallery rows and unlinks its files.
+///
+/// Also pins the **order**: the image rows are found by `session_id`, and
+/// `gallery_images.session_id` is `ON DELETE SET NULL`. Deleting the session row
+/// first would null that column and the cleanup would find nothing, stranding
+/// every file on disk forever.
+#[tokio::test]
+async fn deleting_a_session_sweeps_its_images() -> Result<(), Box<dyn std::error::Error>> {
+    let (dir, store) = store()?;
+    let sessions = SessionStore::new(store.clone());
+    let root = dir.path().join("generated_images");
+    std::fs::create_dir_all(&root)?;
+    let image = root.join("pic.png");
+    std::fs::write(&image, b"png")?;
+
+    create(&sessions, "s1", "alice", 1_000.0).await?;
+    add(&sessions, "s1", 0, "tool", 1_100.0).await?;
+
+    // A gallery row *and* a metadata-derived reference naming the same file, so
+    // both collection sources are exercised and the dedup is visible.
+    let conn = store.connect()?;
+    conn.execute(
+        "INSERT INTO gallery_images (id, filename, prompt, session_id, is_active, created_at, updated_at)
+         VALUES ('g1', 'pic.png', 'a cat', 's1', 1, 0, 0)",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE chat_messages SET metadata = ?2 WHERE id = ?1",
+        rusqlite::params![
+            "msg-s1-0",
+            r#"{"tool_events":[{"image_url":"/api/generated-image/pic.png"}]}"#
+        ],
+    )?;
+    drop(conn);
+
+    let cleanup = ImageCleanup::new(&root);
+    let (deleted, report) = sessions.delete_with_image_cleanup("s1", &cleanup).await?;
+
+    assert_eq!(deleted, 1, "the session row is gone");
+    assert_eq!(report.rows_deactivated, 1, "the gallery row is deactivated");
+    assert_eq!(
+        report.files_removed, 1,
+        "the file is unlinked once, despite being named by two sources"
+    );
+    assert!(
+        !image.exists(),
+        "the generated file must not survive the delete"
+    );
+    Ok(())
+}
+
+/// A second pass over an already-deleted session is a no-op, not an error.
+///
+/// Session deletion can be retried after a partial failure, so the cleanup has to
+/// tolerate finding nothing. Python returns `0` here by catching everything; here
+/// it is a real, typed result reporting zero work.
+#[tokio::test]
+async fn cleaning_up_twice_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+    let (dir, store) = store()?;
+    let sessions = SessionStore::new(store.clone());
+    create(&sessions, "s1", "alice", 1_000.0).await?;
+
+    let cleanup = ImageCleanup::new(dir.path().join("generated_images"));
+    let (deleted, report) = sessions.delete_with_image_cleanup("s1", &cleanup).await?;
+    assert_eq!(deleted, 1);
+    assert_eq!(report.rows_deactivated, 0, "the session had no images");
+
+    let (deleted, report) = sessions.delete_with_image_cleanup("s1", &cleanup).await?;
+    assert_eq!(deleted, 0, "nothing left to delete");
+    assert_eq!(report.rows_deactivated, 0);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // T0201 — the cache is bounded
 // ---------------------------------------------------------------------------
@@ -393,13 +742,13 @@ fn eviction_drops_the_least_recently_used_entry() {
     assert_eq!(cache.len(), 2, "eviction keeps the cache at capacity");
 }
 
-/// The default capacity is a real number, and a zero capacity is clamped.
+/// A zero capacity is clamped to one, because a cache that cannot store its own
+/// key is not a cache.
 #[test]
 fn capacity_is_clamped_to_at_least_one() {
-    assert!(
-        SessionCache::MAX_ENTRIES > 0,
-        "the default cap must be a real bound"
-    );
+    // The default cap must be a real bound. Asserted at compile time as well as
+    // below: a `0` here would make the whole eviction test vacuous.
+    const { assert!(SessionCache::MAX_ENTRIES > 0) };
     let zero = SessionCache::with_capacity(0);
     assert_eq!(
         zero.capacity(),
@@ -447,24 +796,29 @@ fn a_cache_hit_and_miss_are_distinguishable() {
 }
 
 /// Reading through the store populates the cache, and a write invalidates it.
-#[test]
-fn the_store_populates_and_invalidates_the_cache() -> Result<(), Box<dyn std::error::Error>> {
-    let (_dir, store) = store();
+///
+/// Every DB-touching test is `#[tokio::test]`: the store methods are `async`
+/// because `rusqlite` is synchronous and must run on the blocking pool
+/// (AGENTS.md §6, D11). The cache-only tests above stay `#[test]` — they are pure
+/// in-memory and do not need a runtime.
+#[tokio::test]
+async fn the_store_populates_and_invalidates_the_cache() -> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, store) = store()?;
     let sessions = SessionStore::with_cache(store, Arc::new(SessionCache::with_capacity(4)));
-    create(&sessions, "s1", "alice", 1_000.0)?;
+    create(&sessions, "s1", "alice", 1_000.0).await?;
 
-    let _ = sessions.get_blocking("s1".to_owned())?;
+    let _ = sessions.get("s1").await?;
     assert_eq!(sessions.cache().len(), 1, "a read populates the cache");
 
     // A write changes the row, so the cached copy must go rather than be served.
-    sessions.rename_blocking("s1".to_owned(), "renamed".to_owned(), 2_000.0)?;
+    sessions.rename("s1", "renamed", 2_000.0).await?;
     assert_eq!(
         sessions.cache().len(),
         0,
         "a write must invalidate the cached copy"
     );
 
-    let meta = sessions.get_blocking("s1".to_owned())?.expect("exists");
+    let meta = sessions.get("s1").await?.expect("exists");
     assert_eq!(
         meta.name.as_ref(),
         "renamed",

@@ -134,8 +134,6 @@ impl ImageCleanup {
     }
 }
 
-// PLACEHOLDER_CLEANUP_TAIL
-
 /// Collects the images a session references.
 ///
 /// Two sources, mirroring `session_image_refs`
@@ -152,10 +150,7 @@ impl ImageCleanup {
 /// # Errors
 ///
 /// Returns [`StoreError`] if the queries fail.
-pub fn owned_images(
-    conn: &Connection,
-    session_id: &str,
-) -> Result<Vec<OwnedImage>, StoreError> {
+pub fn owned_images(conn: &Connection, session_id: &str) -> Result<Vec<OwnedImage>, StoreError> {
     let mut stmt = conn
         .prepare("SELECT id, filename FROM gallery_images WHERE session_id = ?1")
         .map_err(StoreError::Sqlite)?;
@@ -217,9 +212,7 @@ pub fn image_filenames_from_metadata(raw: &str) -> Vec<String> {
     while let Some(at) = rest.find(MARKER) {
         rest = &rest[at + MARKER.len()..];
         // Stop at the first delimiter, matching the Python's `[^?#/]+`.
-        let end = rest
-            .find(['?', '#', '/', '"', '\\'])
-            .unwrap_or(rest.len());
+        let end = rest.find(['?', '#', '/', '"', '\\']).unwrap_or(rest.len());
         let name = &rest[..end];
         if !name.is_empty() && !out.iter().any(|existing| existing == name) {
             out.push(name.to_owned());
@@ -237,9 +230,12 @@ pub fn image_filenames_from_metadata(raw: &str) -> Vec<String> {
 /// here but committed by the caller, so a session delete and its image cleanup
 /// land together or not at all. The Python relies on the same
 /// `cleanup_session_images(session_id, db=db)` handoff
-/// (`session_manager.py:591-595`).
+/// (`session_manager.py:591-595`). [`crate::sessions::SessionStore::delete_with_image_cleanup`]
+/// is that composition, and runs it on the blocking pool per AGENTS.md §6.
 ///
-/// **Blocking.**
+/// Takes `&Connection`, not `&mut`: `execute` and `query` both take `&self`, so
+/// nothing here needs write access to the connection itself. A `Transaction`
+/// derefs to `&Connection`, which is how the caller passes one in.
 ///
 /// # Errors
 ///
@@ -249,7 +245,7 @@ pub fn image_filenames_from_metadata(raw: &str) -> Vec<String> {
 /// through [`CleanupReport::files_removed`], not swallowed — the caller can see
 /// the shortfall.
 pub fn cleanup_session_images(
-    conn: &mut Connection,
+    conn: &Connection,
     cleanup: &ImageCleanup,
     session_id: &str,
 ) -> Result<CleanupReport, StoreError> {

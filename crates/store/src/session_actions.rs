@@ -29,17 +29,17 @@
 
 use rusqlite::Connection;
 
-use crate::StoreError;
+use crate::{Store, StoreError};
 
 /// Names that mark a throwaway session (`_THROWAWAY_NAMES`, `session_actions.py:16-23`).
 ///
 /// Kept as a sorted set so the membership test is a binary search rather than a
 /// linear scan over a `HashSet` that would need construction on every call.
 const THROWAWAY_NAMES: &[&str] = &[
-    "abc", "asd", "asdf", "bar", "baz", "blah", "bruh", "delete", "foo", "hello", "hey",
-    "heyo", "hi", "hii", "hiii", "hm", "hmm", "idk", "junk", "lol", "meh", "new chat", "ok",
-    "qwerty", "remove", "scratch", "stuff", "sup", "temp", "test", "testing", "tmp", "trash",
-    "untitled", "whatever", "xxx", "yo",
+    "abc", "asd", "asdf", "bar", "baz", "blah", "bruh", "delete", "foo", "hello", "hey", "heyo",
+    "hi", "hii", "hiii", "hm", "hmm", "idk", "junk", "lol", "meh", "new chat", "ok", "qwerty",
+    "remove", "scratch", "stuff", "sup", "temp", "test", "testing", "tmp", "trash", "untitled",
+    "whatever", "xxx", "yo",
 ];
 
 /// At most this many messages for a session to count as throwaway
@@ -159,7 +159,12 @@ pub fn classify(row: &SweepRow, now: f64) -> (SweepAction, SweepReason) {
     }
     if row.message_count <= THROWAWAY_MAX_MESSAGES {
         let name = row.name.trim().to_lowercase();
-        let first = row.first_user_message.as_deref().unwrap_or("").trim().to_lowercase();
+        let first = row
+            .first_user_message
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
         let junk_name = THROWAWAY_NAMES.contains(&name.as_str())
             || name.starts_with("chat:")
             || THROWAWAY_NAMES.contains(&first.as_str());
@@ -177,24 +182,28 @@ pub fn classify(row: &SweepRow, now: f64) -> (SweepAction, SweepReason) {
     (SweepAction::Keep, SweepReason::RecentlyActive)
 }
 
-// PLACEHOLDER_ACTIONS_TAIL
-
 /// Reads the rows a sweep would consider, for `owner` (all owners when empty).
 ///
 /// # Errors
 ///
 /// Returns [`StoreError`] if the queries fail.
-pub fn load_rows(
-    conn: &Connection,
-    owner: &str,
-    now: f64,
-) -> Result<Vec<SweepRow>, StoreError> {
+pub fn load_rows(conn: &Connection, owner: &str, now: f64) -> Result<Vec<SweepRow>, StoreError> {
     // Archived sessions are excluded (the Python's `DbSession.archived == False`
     // filter at `session_actions.py:78-81`): an archived session is a deliberate
     // keep, and re-examining it every sweep would resurrect archived work.
+    //
+    // All four columns the Python checks (`session_actions.py:44-48`) are in this
+    // `MAX`: `last_message_at`, `last_accessed`, `updated_at` **and** `created_at`.
+    // Dropping the last two is not a simplification — `sessions.last_accessed` is
+    // nullable and a freshly created row has never been touched, so `COALESCE`
+    // yields 0 and a session created a second ago reads as infinitely old. With
+    // only the two "activity" columns, an empty session created inside the grace
+    // window is deleted the moment the sweep runs. The Python's four-column
+    // `any()` is what prevents that, and `is_recently_active` documents it.
     let sql = if owner.is_empty() {
         "SELECT s.id, s.name, s.is_important, s.message_count,
-                MAX(COALESCE(s.last_message_at, 0), COALESCE(s.last_accessed, 0)),
+                MAX(COALESCE(s.last_message_at, 0), COALESCE(s.last_accessed, 0),
+                    COALESCE(s.updated_at, 0), COALESCE(s.created_at, 0)),
                 (SELECT LOWER(c.content) FROM chat_messages c
                   WHERE c.session_id = s.id AND c.role = 'user'
                   ORDER BY c.timestamp, c.id LIMIT 1)
@@ -203,7 +212,8 @@ pub fn load_rows(
           ORDER BY s.last_accessed DESC"
     } else {
         "SELECT s.id, s.name, s.is_important, s.message_count,
-                MAX(COALESCE(s.last_message_at, 0), COALESCE(s.last_accessed, 0)),
+                MAX(COALESCE(s.last_message_at, 0), COALESCE(s.last_accessed, 0),
+                    COALESCE(s.updated_at, 0), COALESCE(s.created_at, 0)),
                 (SELECT LOWER(c.content) FROM chat_messages c
                   WHERE c.session_id = s.id AND c.role = 'user'
                   ORDER BY c.timestamp, c.id LIMIT 1)
@@ -224,7 +234,8 @@ pub fn load_rows(
             })
         })
         .map_err(StoreError::Sqlite)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(StoreError::Sqlite)
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(StoreError::Sqlite)
 }
 
 /// Deletes the sessions `classify` marks for deletion.
@@ -240,7 +251,9 @@ pub fn load_rows(
 /// clause. That is a guard against a concurrent pin: `classify` ran against a row
 /// read earlier, and a user marking a session important in between must win.
 ///
-/// **Blocking.**
+/// Takes `&mut Connection` because `transaction()` requires it. Callers on the
+/// async runtime should use [`sweep_sessions`], which runs this off the executor
+/// (AGENTS.md §6).
 ///
 /// # Errors
 ///
@@ -283,7 +296,11 @@ pub fn sweep_blocking(
 /// this rather than only the deleting variant is deliberate — a destructive
 /// background job whose decisions cannot be inspected is one nobody enables.
 #[must_use]
-pub fn preview(conn: &Connection, owner: &str, now: f64) -> Vec<(String, SweepAction, SweepReason)> {
+pub fn preview(
+    conn: &Connection,
+    owner: &str,
+    now: f64,
+) -> Vec<(String, SweepAction, SweepReason)> {
     load_rows(conn, owner, now)
         .unwrap_or_default()
         .iter()
@@ -292,4 +309,50 @@ pub fn preview(conn: &Connection, owner: &str, now: f64) -> Vec<(String, SweepAc
             (row.id.clone(), action, reason)
         })
         .collect()
+}
+
+/// Runs a sweep on the blocking pool, for callers on the async runtime.
+///
+/// [`sweep_blocking`] needs `&mut Connection`, which
+/// [`crate::blocking::with_conn`] does not hand out, so this opens its own
+/// connection with `store.connect()` inside a
+/// [`crate::blocking::spawn_blocking`] closure. No SQLite call runs on an
+/// executor thread (AGENTS.md §6), and no `Connection` value outlives the closure,
+/// so none can be held across an `.await`.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] if a query fails, or [`StoreError::Interrupted`] if the
+/// task is cancelled.
+pub async fn sweep_sessions(
+    store: Store,
+    owner: &str,
+    now: f64,
+) -> Result<SweepReport, StoreError> {
+    let owner = owner.to_owned();
+    match crate::blocking::spawn_blocking(move || {
+        let mut conn = store.connect()?;
+        sweep_blocking(&mut conn, &owner, now)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(join_err) if join_err.is_panic() => std::panic::resume_unwind(join_err.into_panic()),
+        Err(_) => Err(StoreError::Interrupted),
+    }
+}
+
+/// A dry run of [`sweep_sessions`]: the same decisions, deleting nothing.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] if a query fails, or [`StoreError::Interrupted`] if the
+/// task is cancelled.
+pub async fn preview_sessions(
+    store: Store,
+    owner: &str,
+    now: f64,
+) -> Result<Vec<(String, SweepAction, SweepReason)>, StoreError> {
+    let owner = owner.to_owned();
+    crate::blocking::with_conn(store, move |conn| Ok(preview(conn, &owner, now))).await
 }
