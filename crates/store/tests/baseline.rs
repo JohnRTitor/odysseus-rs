@@ -219,7 +219,7 @@ fn store_migrates_a_file_backed_database_and_restricts_its_permissions()
     let store = Store::open(&path);
     let report = store.migrate()?;
     assert_eq!(report.from, 0);
-    assert_eq!(report.to, 1);
+    assert_eq!(report.to, 2);
     assert!(path.exists(), "migrate() must create the database file");
 
     store.restrict_permissions()?;

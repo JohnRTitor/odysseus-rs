@@ -1268,7 +1268,7 @@ fn replaceable<'a>(patched: Option<Option<&'a str>>, existing: Option<&'a str>) 
 /// guessable by anyone who can read a row, and an id collision would surface as a
 /// confusing primary-key violation on an unrelated insert. Refusing to mint the id
 /// names the actual problem.
-fn short_id() -> Result<String, EndpointError> {
+pub(crate) fn short_id() -> Result<String, EndpointError> {
     use std::fmt::Write as _;
 
     let mut bytes = [0u8; 4];

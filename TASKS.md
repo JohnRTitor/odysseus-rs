@@ -191,10 +191,10 @@ vertical slice.
 - [x] T0305 Model capability detection; LM Studio probe with 60 s TTL
 - [x] T0306 Endpoint resolution + normalisation — one implementation, not four
 - [x] T0307 `_first_chat_model` skips `text-embedding`, `tts-`, `whisper`, `dall-e`, `moderation`, `rerank`, `clip`, `stable-diffusion` — **two corrections to the task text**: matching is *substring*, not prefix, and the list has **10** entries, not 8 (`embedding` and `reranker` were missing). The `models[0]` fallback is preserved and pinned: when every id is non-chat it returns the first rather than `None`, so this is a best-effort pick, not a filter
-- [ ] T0308 Provider OAuth device flow — 3 providers × 3 routes; `device_code` stays server-side, browser gets only `poll_id`
-- [ ] T0309 Copilot headers (`x-initiator`, `Openai-Intent`, `Copilot-Integration-Id`)
-- [ ] T0310 ChatGPT subscription + PKCE + refresh (120 s skew)
-- [ ] T0311 Provider list cache (30 s)
+- [x] T0308 Provider OAuth device flow — 3 providers × 3 routes; `device_code` stays server-side, browser gets only `poll_id`
+- [x] T0309 Copilot headers (`x-initiator`, `Openai-Intent`, `Copilot-Integration-Id`)
+- [x] T0310 ChatGPT subscription + PKCE + refresh (120 s skew)
+- [x] T0311 Provider list cache (30 s)
 - [ ] T0312 Model picker UI; shares the favourites key with the models list
 - [ ] T0313 Model capabilities route
 - [ ] T0314 **TEST: 4 LLM request shapes (Anthropic / Ollama / ChatGPT / OpenAI) asserted against fixtures**

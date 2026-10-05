@@ -31,9 +31,11 @@ use crate::{MigrationReport, Result};
 
 /// The baseline DDL, generated from a live `app.db` (see module docs).
 const BASELINE: &str = include_str!("../migrations/0001_baseline.sql");
+/// T0308: pending OAuth device-flow sessions.
+const STEP_2: &str = include_str!("../migrations/0002_pending_device_flows.sql");
 
 /// The schema version this build expects.
-pub const TARGET_VERSION: u32 = 1;
+pub const TARGET_VERSION: u32 = 2;
 
 /// Version bookkeeping lives in a table that is itself created if absent, so
 /// the very first run on a fresh database works.
@@ -82,6 +84,11 @@ pub fn migrate(conn: &Connection) -> Result<MigrationReport> {
     if from == 0 {
         conn.execute_batch(BASELINE)?;
         applied.push("0001_baseline");
+    }
+
+    if from <= 1 {
+        conn.execute_batch(STEP_2)?;
+        applied.push("0002_pending_device_flows");
     }
 
     // Future steps are appended here, each bumping `to` by one. Do not edit
@@ -146,8 +153,11 @@ mod tests {
         let report = migrate(&conn).unwrap();
 
         assert_eq!(report.from, 0);
-        assert_eq!(report.to, 1);
-        assert_eq!(report.applied, vec!["0001_baseline"]);
+        assert_eq!(report.to, 2);
+        assert_eq!(
+            report.applied,
+            vec!["0001_baseline", "0002_pending_device_flows"]
+        );
         assert!(!report.is_noop());
     }
 
@@ -161,14 +171,16 @@ mod tests {
 
         let (tables, indexes, triggers) = counts(&conn);
         assert_eq!(
-            tables, 28,
-            "27 ORM tables plus the chat_messages_fts virtual table"
+            tables, 29,
+            "27 ORM tables plus the chat_messages_fts virtual table, plus \
+             pending_device_flows (0002)"
         );
         assert_eq!(triggers, 3, "chat_messages_fts_ai / _ad / _au");
-        // 81 explicit CREATE INDEX statements. The remaining ~28 index entries
-        // in the live database are implicit `sqlite_autoindex_*` rows created by
-        // UNIQUE constraints, which have no SQL of their own.
-        assert_eq!(indexes, 81, "explicit indexes only");
+        // 81 explicit CREATE INDEX statements in the baseline, plus the
+        // ix_pending_device_flows_expires_at index from 0002. The remaining ~29
+        // index entries in the live database are implicit `sqlite_autoindex_*`
+        // rows created by UNIQUE constraints, which have no SQL of their own.
+        assert_eq!(indexes, 82, "explicit indexes only");
     }
 
     #[test]
@@ -212,8 +224,8 @@ mod tests {
         // Second run must be a no-op, not a re-apply that would fail on
         // "table already exists".
         let second = migrate(&conn).unwrap();
-        assert_eq!(second.from, 1);
-        assert_eq!(second.to, 1);
+        assert_eq!(second.from, 2);
+        assert_eq!(second.to, 2);
         assert!(second.is_noop(), "second migrate() must do nothing");
 
         let third = migrate(&conn).unwrap();
