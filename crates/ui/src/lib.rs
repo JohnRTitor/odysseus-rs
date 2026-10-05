@@ -10,6 +10,9 @@
 pub mod app;
 pub mod theme;
 
+#[cfg(feature = "hydrate")]
+mod hydrate;
+
 pub use {
     app::{App, Nonce, PREPAINT_SCRIPT},
     theme::{SyntaxVars, THEMES, Theme, syntax_vars, theme},

@@ -188,3 +188,59 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+# --- cargo-leptos ---
+#
+# `REWRITE_PLAN.md:186` (D3) requires "No Node runtime in deployment", so
+# Tailwind is compiled by cargo-leptos, which downloads and drives the standalone
+# native Tailwind compiler itself rather than shelling out to `@tailwindcss/cli`.
+# That is why there is no `build.rs` running a 111 MB vendored binary.
+#
+# This workspace is a *split* SSR/hydrate layout: the server binary is
+# `apps/odysseus-server`, while the component library and the wasm hydrate entry
+# point both live in `crates/ui`. cargo-leptos therefore needs `lib-package` and
+# `bin-package` to be told which is which — without them it looks for a `bin`
+# target in the package holding the metadata and finds none.
+[[workspace.metadata.leptos]]
+# Project name, as cargo-leptos reports it. Must be present even for a
+# single-project workspace; the field is required, not a label.
+name = "odysseus"
+# The SSR library. `crates/ui/src/app.rs::App` is the root component.
+lib-package = "odysseus-ui"
+# The **real** server. cargo-leptos supports this split (it is the shape
+# its `start-axum-workspacely` template generates): the lib of `lib-package`
+# becomes the wasm front end, the bin of `bin-package` becomes the server.
+# Pointing this at `odysseus-ui` instead would have cargo-leptos build a *second*
+# server that duplicates the listener, bootstrap and shutdown handling.
+bin-package = "odysseus-server"
+
+# Output name. Also the basename cargo-leptos gives the compiled stylesheet, which
+# is why `crates/ui/src/app.rs` references `/pkg/odysseus-ui.css`.
+output-name = "odysseus-ui"
+
+# `crates/web`'s ServeDir mounts read from here, so the paths agree by
+# construction rather than by two independently-edited constants.
+#
+# `assets-dir` is deliberately ABSENT. cargo-leptos does not merely read that
+# directory — it treats it as its own and **deletes and recreates it** as the copy
+# destination, so a hand-written asset committed there is destroyed by the next
+# build. Source assets therefore live in `static/` (mirroring the Python layout)
+# and are served straight from the working tree; cargo-leptos owns `site/pkg`
+# alone, and nothing else in `site/` is its business.
+site-root = "site"
+site-pkg-dir = "pkg"
+
+# Tailwind, not a plain `style-file`: the input is `@import "tailwindcss"` and has
+# to go through the Tailwind compiler. `tailwind-config-file` is deliberately
+# absent — v4 is CSS-first and needs no `tailwind.config.js`, and supplying one
+# makes cargo-leptos error rather than silently ignore it.
+tailwind-input-file = "crates/ui/style/tailwind.css"
+
+# cargo-leptos splits the pair the opposite way round from what the
+# names suggest: `lib-features` are the features for the **wasm front**, and
+# `bin-features` are for the **server binary**. Getting this backwards does not
+# fail here -- it asks for `cargo build --lib --target=wasm32 --features=ssr`,
+# which fails far downstream in `mio` with "This wasm target is unsupported by
+# mio", a message that names neither Leptos nor cargo-leptos.
+lib-features = ["hydrate"]
+bin-features = ["ssr"]
+

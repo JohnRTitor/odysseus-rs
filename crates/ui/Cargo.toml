@@ -8,6 +8,22 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# cargo-leptos compiles the **lib** to wasm (that cdylib is what `wasm-bindgen`
+# turns into the `.wasm`/`.js` the browser loads) and the **bin** of
+# `bin-package` as the server.
+#
+# `cdylib` is therefore mandatory for the lib, and `rlib` is kept alongside it so
+# the tests and `odysseus-web` have something static to link against.
+#
+# There is deliberately **no `[[bin]]` here**. The server is
+# `apps/odysseus-server`, which owns the axum listener, the store bootstrap and
+# shutdown handling; a second server entry point inside this crate would duplicate
+# all three. `bin-package` in the workspace `Cargo.toml` points there instead.
+[lib]
+name = "odysseus_ui"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
 [lints]
 workspace = true
 
@@ -17,7 +33,16 @@ workspace = true
 # mode is selected by features and cannot be inferred, so the leptos feature is
 # NOT hardcoded on the dependency — doing that would force `ssr` into the wasm
 # build and the two are mutually exclusive.
-default = ["ssr"]
+#
+# **`default` is deliberately empty.** cargo-leptos builds the wasm entry point
+# with `bin-features = ["hydrate"]` *merged with the package's default features*,
+# so a default of `["ssr"]` silently hands the browser build both modes at once.
+# The result is not a compile error in this crate — it is `server_fn` enabling
+# tokio's `net` feature, which makes `mio` refuse the wasm target:
+# "This wasm target is unsupported by mio". Enabling `ssr` is the consumer's job:
+# `odysseus-web` does it explicitly, which also makes the dependency visible at
+# the call site instead of implicit.
+default = []
 
 # `ResponseOptions` is how a component amends the server response (the NotFound
 # route sets 404 on it). It is axum-specific, so it is not dragged into the

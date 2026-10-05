@@ -13,3 +13,7 @@
 # Runtime data directory (DATABASE_URL / DATA_DIR). Never committed -- this
 # holds the real app.db, .app_key, uploads, and secrets.
 /data/
+
+# cargo-leptos client build output (T0100). `site/static` IS committed -- those
+# are hand-written source assets, unlike the compiled CSS and wasm beside them.
+/site/pkg

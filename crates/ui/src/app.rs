@@ -17,7 +17,7 @@
 
 use {
     leptos::prelude::*,
-    leptos_meta::{Link, Meta, Title, provide_meta_context},
+    leptos_meta::{Link, Meta, Stylesheet, Title, provide_meta_context},
     leptos_router::{
         components::{Route, Router, Routes},
         path,
@@ -82,6 +82,16 @@ pub fn App() -> impl IntoView {
                 />
                 <Meta name="theme-color" content="#282c34"/>
                 <Link rel="icon" href="/static/favicon.svg"/>
+                // The compiled Tailwind output. cargo-leptos names it after
+                // `output-name` in the workspace metadata, and `crates/web`
+                // serves that directory at `/pkg`. It is a `<Stylesheet>` rather
+                // than a `<Link>` so `leptos_meta` owns its placement and a
+                // per-route override can replace it later.
+                //
+                // Without this the page renders completely unstyled — the shell
+                // is semantic HTML and nothing else. INCOMPLETE.md 2.4 records
+                // that rather than claiming styling that is not built.
+                <Stylesheet id="leptos" href="/pkg/odysseus-ui.css"/>
                 // Emitted inside <head> and before any styled content so the
                 // browser runs it during head parsing. That ordering *is* the
                 // mechanism: a script arriving after the stylesheet has painted

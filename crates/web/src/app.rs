@@ -15,6 +15,7 @@ use {
         auth::{AuthOwners, AuthStore},
         ratelimit,
     },
+    tower_http::services::ServeDir,
 };
 
 use crate::middleware::{auth, compression_layer, cors_layer, security, slow_log, timeout};
@@ -418,9 +419,59 @@ fn base(state: &AppState) -> Router {
         .route("/api/version", get(crate::routes::system::version))
         .route("/api/ready", get(crate::routes::system::ready))
         .route("/api/runtime", get(crate::routes::system::runtime))
+        // Static assets are mounted before the fallback, because a `fallback`
+        // catches everything: without these two the `/pkg/*.css` and `/pkg/*.wasm`
+        // that cargo-leptos emits would be answered by the Leptos shell, and the
+        // browser would receive an HTML document where it asked for CSS.
+        .nest_service("/static", ServeDir::new(static_dir()))
+        .nest_service("/pkg", ServeDir::new(pkg_dir()))
         .route("/", get(crate::routes::system::ui_shell))
         .fallback(crate::routes::system::ui_shell)
         .with_state(state.clone())
+}
+
+/// Where hand-written static assets live (`favicon.svg`, the service worker).
+///
+/// `static/`, mirroring the Python layout — **not** cargo-leptos' `assets-dir`.
+/// That directory is deleted and recreated on every build, so a committed asset
+/// placed there does not survive; `site/pkg` is the only directory
+/// `cargo leptos build` is allowed to own.
+///
+/// An environment override exists so a deployment can point at a directory outside
+/// the binary without a rebuild. It is read once at router construction rather than
+/// per request: a missing override is a deployment mistake that should surface as a
+/// 404 on a real asset, not as a per-request env lookup.
+fn static_dir() -> std::path::PathBuf {
+    std::env::var_os("ODYSSEUS_STATIC_DIR")
+        .map_or_else(|| workspace_dir().join("static"), std::path::PathBuf::from)
+}
+
+/// Where cargo-leptos writes the compiled CSS and the wasm bundle.
+///
+/// `site-root` + `site-pkg-dir` from `[[workspace.metadata.leptos]]`. `LEPTOS_SITE_PKG_DIR`
+/// is cargo-leptos' own override, so it is honoured too rather than being second-guessed.
+fn pkg_dir() -> std::path::PathBuf {
+    std::env::var_os("LEPTOS_SITE_PKG_DIR")
+        .or_else(|| std::env::var_os("ODYSSEUS_PKG_DIR"))
+        .map_or_else(|| site_dir().join("pkg"), std::path::PathBuf::from)
+}
+
+/// The cargo-leptos `site-root`, i.e. `<workspace>/site`.
+fn site_dir() -> std::path::PathBuf {
+    workspace_dir().join("site")
+}
+
+/// The workspace root, derived from this crate's manifest directory.
+///
+/// `CARGO_MANIFEST_DIR` is `<root>/crates/web`, so the workspace root is two levels
+/// up. Derived rather than hard-coded so a checkout at any path works — and so the
+/// served directories cannot drift from the leptos metadata by being typed twice.
+fn workspace_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf()
 }
 
 /// Build the full router **with** the authentication gate.

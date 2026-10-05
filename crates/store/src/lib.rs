@@ -18,9 +18,16 @@ pub mod atomic;
 pub mod auth;
 pub mod blocking;
 pub mod crypto;
+pub mod model_endpoints;
+pub mod model_endpoints_capabilities;
+pub mod model_endpoints_discovery_scan;
+pub mod model_endpoints_resolver;
 pub mod pool;
 pub mod ratelimit;
 pub mod schema;
+pub mod session_actions;
+pub mod session_image_cleanup;
+pub mod sessions;
 pub mod totp;
 
 use std::path::{Path, PathBuf};

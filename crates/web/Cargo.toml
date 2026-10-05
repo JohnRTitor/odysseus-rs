@@ -11,13 +11,26 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Server-side rendering. Default-on because every route in this crate is a server
+# route — `routes::system::ui_shell` renders the Leptos document, and the router
+# fallback renders its NotFound route.
+#
+# The feature exists so `ssr` means something concrete in the graph rather than
+# being a bare marker: cargo-leptos passes `--features=ssr` to `bin-package`, and
+# `odysseus-server` forwards it here, so the SSR build of `odysseus-ui` is
+# requested explicitly by the binary that needs it. `odysseus-ui` itself keeps
+# `default = []` precisely so this edge is the only thing that turns SSR on.
+default = ["ssr"]
+ssr = ["dep:odysseus-ui", "odysseus-ui/ssr", "dep:leptos", "leptos/ssr", "dep:leptos_axum"]
+
 [dependencies]
 odysseus-domain = { workspace = true }
 odysseus-store = { workspace = true }
 any_spawner = { workspace = true }
-odysseus-ui = { workspace = true, features = ["ssr"] }
-leptos = { workspace = true, features = ["ssr"] }
-leptos_axum = { workspace = true }
+odysseus-ui = { workspace = true, optional = true }
+leptos = { workspace = true, optional = true }
+leptos_axum = { workspace = true, optional = true }
 axum = { workspace = true }
 axum-extra = { version = "0.10", features = ["cookie"] }
 getrandom = "0.3"

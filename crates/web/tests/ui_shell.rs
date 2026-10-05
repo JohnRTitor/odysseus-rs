@@ -202,6 +202,75 @@ async fn the_shell_advertises_that_chat_is_not_built_yet() {
     );
 }
 
+/// T0100: the compiled Tailwind stylesheet must be both referenced and servable.
+///
+/// Two independent failure modes, and only the pair catches both. The `<Stylesheet>`
+/// tag can exist while `/pkg` is not mounted at all — the browser then gets the Leptos
+/// fallback, which is a 200 HTML document where CSS was requested, and the page
+/// silently renders unstyled. Conversely `/pkg` can be mounted while the tag is
+/// missing, which is equally unstyled.
+///
+/// A missing stylesheet file is asserted rather than treated as a skip: `cargo
+/// leptos build --frontend-only` is the step that produces it, and this test is
+/// meant to fail loudly when someone edits the CSS input without rebuilding.
+#[tokio::test]
+async fn the_compiled_stylesheet_is_referenced_and_actually_served() {
+    const HREF: &str = "/pkg/odysseus-ui.css";
+
+    let (status, body, _) = get_root().await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(HREF),
+        "the shell must reference the compiled stylesheet at {HREF}; body was: {body}"
+    );
+
+    let response = odysseus_web::app::router(&state())
+        .oneshot(from_loopback(HREF))
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("body reads");
+    let css = String::from_utf8_lossy(&body).into_owned();
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{HREF} must be served from site/pkg — run `cargo leptos build \
+         --frontend-only` if the client bundle has not been built yet"
+    );
+    assert!(
+        css.contains("tailwindcss"),
+        "{HREF} was served but is not Tailwind output ({} bytes); a stale or empty \
+         file would leave the page unstyled",
+        css.len()
+    );
+}
+
+/// The favicon is a committed source asset under `site/static`, not a data URI.
+/// A data-URI icon would need `img-src data:` in the CSP, which this deployment does
+/// not grant, so the file has to be served for the icon to appear at all.
+#[tokio::test]
+async fn the_favicon_is_served_from_the_static_mount() {
+    let response = odysseus_web::app::router(&state())
+        .oneshot(from_loopback("/static/favicon.svg"))
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("body reads");
+
+    assert_eq!(status, StatusCode::OK, "/static is not mounted");
+    let svg = String::from_utf8_lossy(&body);
+    assert!(
+        svg.contains("<svg"),
+        "the favicon must be an SVG, got {} bytes",
+        svg.len()
+    );
+}
+
 /// An unknown path must reach the Leptos `NotFound` route rather than axum's
 /// default empty 404 — the shell owns the 404 body, since it owns the document.
 #[tokio::test]

@@ -15,6 +15,14 @@ workspace = true
 name = "odysseus-server"
 path = "src/main.rs"
 
+[features]
+# Forwarded from cargo-leptos, which passes `--features=ssr` when building this
+# package as `bin-package`. It exists so the SSR request is an explicit edge in
+# the feature graph: this binary is what serves the Leptos document, so it is the
+# thing that should be asking for the SSR build of `odysseus-ui`.
+default = ["ssr"]
+ssr = ["odysseus-web/ssr"]
+
 [dependencies]
 odysseus-domain = { workspace = true }
 odysseus-store = { workspace = true }

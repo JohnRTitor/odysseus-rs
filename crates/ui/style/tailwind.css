@@ -1,0 +1,30 @@
+/* Tailwind CSS v4 entry point for `odysseus-ui`.
+ *
+ * `REWRITE_PLAN.md:186` (D3) requires "No Node runtime in deployment", so the
+ * `@tailwindcss/cli` npm package is not an option. `cargo-leptos` downloads and
+ * drives the standalone native compiler itself, so this file is compiled by a
+ * Rust build step rather than by Node — see the `tailwind-input-file` key in
+ * `crates/ui/Cargo.toml` under `[package.metadata.leptos]`.
+ *
+ * Tailwind v4 is CSS-first: there is no `tailwind.config.js`, and the theme is
+ * declared with `@theme` here rather than in JS. The colour palette that feeds
+ * the syntax-highlighting variables is **not** defined here — it is derived in
+ * `crates/ui/src/theme.rs` and applied at runtime by the pre-paint script, so
+ * putting it in this file would create a second, divergent source of truth.
+ *
+ * `@source` is required in v4 because automatic content detection only covers
+ * files git-ignores will let it read; naming the Rust sources explicitly is what
+ * makes `class="..."` attributes inside `view! { }` macros visible to the
+ * scanner. Without it the build succeeds and emits an empty stylesheet.
+ */
+
+@import "tailwindcss";
+
+/* Every `view!` macro in the crate is a content source. The path is relative to
+ * this file (`crates/ui/style/`). */
+@source "../src/**/*.rs";
+
+/* Unstyled by default: `crates/ui` had no Tailwind classes when this was wired,
+ * so the first build legitimately emits preflight and little else. That is the
+ * honest output, and INCOMPLETE.md 2.4 records it rather than claiming styling
+ * that does not exist. */

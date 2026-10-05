@@ -118,25 +118,62 @@ implementation has not started. Grouped by phase for planning convenience; see
 ### 2.4 Phase 0 UI shell — partial
 
 Phase 0's UI work is tracked as tasks rather than features, so it has no
-`F###` id. Two items are genuinely incomplete and are recorded here so the
-Definition-of-Done gate cannot read a ticked box as a finished UI.
+`F###` id. Tailwind is now wired end to end; the remaining item is T0107.
 
 | Item | Status | Missing | Why it is not simply ticked | Next |
 |---|---|---|---|---|
-| T0100 Tailwind | UNIMPLEMENTED | Tailwind itself | The `odysseus-ui` crate exists, `ssr` and `hydrate` build, and the shell server-renders. **No CSS is served and no styling exists**, so the page renders unstyled. Ticking this box would mean "Tailwind wired" for a crate that contains no Tailwind. | Wire `tailwindcss` v4 (crate or `build.rs`, decision open) and serve the output |
-| T0107 no-FOUC test | UNIMPLEMENTED | A browser | SSR is proven: the pre-paint script is inlined in `<head>` before any styled content, carries the CSP nonce that authorises it, and sets every `--hl-*` variable `theme.rs` derives. What no test here can show is that the browser **executes** it before the first painted frame. | Headless-browser assertion on computed `getComputedStyle` at first paint |
+| T0107 no-FOUC test | UNIMPLEMENTED | A browser | SSR is proven and the Tailwind pipeline is real: `cargo leptos build --frontend-only` exits 0 and emits `site/pkg/{odysseus-ui.css,.js,.wasm}`, and a test asserts the stylesheet is both referenced by the document **and** served (200, real Tailwind output) — a tag without a mount, or a mount without a tag, each leaves the page unstyled. What no test here can show is that the browser **executes** the pre-paint script before the first painted frame. | Headless-browser assertion on computed `getComputedStyle` at first paint |
 
-### 2.5 Leptos/axum facts worth not rediscovering
+**The page is still visually bare, and that is honest.** `crates/ui` contains no
+Tailwind utility classes, so the compiled stylesheet is preflight plus the theme
+layer and nothing else. Tailwind being wired is a claim about the *pipeline*; it is
+not a claim that the UI is styled. The shell's components use semantic HTML and
+hand-written classes only.
 
-Recorded because each cost a wrong first attempt, and each fails in a way that
-looks like a different bug:
+### 2.5 cargo-leptos / Tailwind build facts
+
+Each of these cost a wrong first attempt, and each fails with a message that names
+neither the cause nor the tool:
+
+- **`lib-features` is the wasm front; `bin-features` is the server.** The names
+  read the other way round. Getting it backwards makes cargo-leptos run
+  `cargo build --lib --target=wasm32-unknown-unknown --features=ssr`, which fails
+  far downstream in `mio` with *"This wasm target is unsupported by mio"* — a
+  message mentioning neither Leptos nor cargo-leptos.
+- **cargo-leptos 0.3.8 requires `wasm-bindgen` and `tailwindcss` on `PATH` and does
+  not download either**, despite what the blog posts imply. Both are needed *after*
+  the Rust build has already succeeded, so a missing build tool looks like a code
+  error. `wasm-bindgen` must also match the `Cargo.lock` version exactly; nixpkgs
+  carried 0.2.127 while the lock pins 0.2.129.
+- **`tailwindcss` must be the standalone native binary**, not
+  `@tailwindcss/cli`. That is what satisfies `REWRITE_PLAN.md:186` ("No Node
+  runtime in deployment") without a `build.rs` invoking a 111 MB vendored
+  executable.
+- **`assets-dir` is not a place to put committed assets.** cargo-leptos deletes and
+  recreates it as its copy destination, so a hand-written asset committed there is
+  destroyed by the next build. Source assets live in `static/`; cargo-leptos owns
+  `site/pkg` alone.
+- **The wasm entry is a module inside the lib, not a `[[bin]]`.** cargo-leptos
+  compiles the lib's **cdylib** to wasm and runs `wasm-bindgen` over it; the bin is
+  the server. A wasm entry behind a `[[bin]]` would never reach the artifact the
+  browser loads.
+- **`odysseus-ui` has `default = []`.** cargo-leptos merges `bin-features` with the
+  package's default features, so a default of `["ssr"]` hands the browser build both
+  Leptos rendering modes at once — which surfaces as the same `mio` error.
+- **`RUSTFLAGS` applies to cross-compilation too.** devenv's `mold.enable` exports
+  `-C link-arg=-fuse-ld=mold`, which `rust-lld` rejects with *"unknown argument"*.
+  Because an environment `RUSTFLAGS` replaces `[target.*] rustflags` entirely, this
+  cannot be corrected per-target from the repo side; `mold` is disabled in
+  `devenv.nix`.
+
+### 2.6 Leptos/axum facts worth not rediscovering
 
 - **Leptos does not initialise an SSR executor on non-wasm.** `leptos::task::spawn`
-  reaches `any_spawner::Executor::spawn`, which panics with *"tried to spawn a
-  Future with Executor::spawn() before a global executor was initialized"* unless
-  `any_spawner::Executor::init_tokio()` was called. Leptos auto-inits only on wasm
-  (`init_wasm_bindgen`). `main` now calls it; without it every `/` request aborts
-  mid-render and no component-level unit test notices.
+  reaches `any_spawner::Executor::spawn`, which panics with *"tried to spawn a Future
+  with Executor::spawn() before a global executor was initialized"* unless
+  `any_spawner::Executor::init_tokio()` was called. Leptos auto-inits only on wasm.
+  `main` now calls it; without it every `/` request aborts mid-render and no
+  component-level unit test notices.
 - **`leptos_meta` injects by string-searching the rendered HTML for `</head>`.**
   `MetaContext::inject_meta_context` panics with *"you are using leptos_meta
   without a </head> tag"*. So the app must render real `<html>`/`<head>`/`<body>`.
@@ -149,10 +186,11 @@ looks like a different bug:
   copy that is discarded — the 404 page rendered with a 200 until this was removed.
 - **`LeptosOptions` is a `TypedBuilder` and `#[non_exhaustive]`**, with
   `#[builder(default)]` on every field but `output_name`. A struct literal cannot
-  be written, which is why `leptos_routes` needs no options plumbing here at all:
-  `render_app_to_stream_with_context` is called directly with the real `Request`.
+  be written, which is why `leptos_routes` needs no options plumbing here: the
+  render handler is called directly with the real `Request`.
 - **`leptos_routes` takes `Vec<AxumRouteListing>`** from `generate_route_list(App)`
-  and its `app_fn`/`additional_context` are `'static` closures taking no arguments.
+  and its `app_fn`/`additional_context` are `'static` closures taking no arguments —
+  which is why a per-request CSP nonce cannot reach them.
 - **`#[component]` does not carry a `#[must_use]` placed before it through**, so
   `clippy::must_use_candidate` needs `#[expect(..., reason = "...")]`.
 - **Axum `Extension` needs `ConnectInfo`** for the auth gate to apply the loopback
@@ -235,6 +273,37 @@ prevent. Covered by
 | — | Browser globals | **234 `window.*` writes.** 5 documented, ~229 more, including re-entrancy guards (`_suppressSidebarClose` ×14), pinned state (`_persistentChatSession` ×10), and cross-module function callbacks. | Leptos context + signals. | Untestable coupling. `sidebar-layout.js:5-13` deliberately defers its own export because a `let` binding cannot be mutated across module boundaries — a workaround for the wrong language. |
 | — | Asset cache-busting | Manual `?v=YYYYMMDDlabel` query strings, kept in sync across every importer. A mismatch causes duplicate module instances. **`chatRenderer.js` currently loads 3×; 11 modules 2× each.** `app.js:42-46` documents the production incident. | Content-hashed filenames. | Structurally eliminates the bug class. Build-time duplicate detection. |
 | — | Vector store | ChromaDB as an **external HTTP service** (`app.py:559-578`), lazily initialised, returning `None` when unreachable so routes 503 instead of busy-retrying. 4 collections. | `sqlite-vec` in-process. | Removes a whole service and its RSS; removes a startup ordering problem. **Cost:** thresholds must be re-validated (F118). |
+| — | **LLM endpoint base-URL resolution** | Four separate builder functions, each hard-coding its own suffix arithmetic. Python's own code disagrees with itself here — see §4.3 | One table of `(root, suffix)` rows, so a new provider enum variant **fails to compile** until a row exists. There is no `if` in either `build_*_url` |
+
+### 4.3 Upstream defects found while porting model endpoints
+
+Four places where the Python behaves in a way that looks unintended. Ported as-is
+for now, because a port is correct only if the original behaviour was *read* — but
+each is a decision that should be made deliberately rather than inherited. None is
+a security hole.
+
+1. **`build_models_url` 404s on a LAN LM Studio.** Port 1234 is LM Studio's default
+   and serves `/v1/models`, but `is_local` covers loopback and
+   `host.docker.internal` only — **no private ranges**. A LAN host therefore gets
+   `/models` instead of `/v1/models`. The asymmetry with every other local-backend
+   check suggests an omission in the allow-list rather than a decision.
+2. **`_is_ollama_native_url` classifies bare `localhost:1234` as native Ollama**, so a
+   loopback LM Studio gets probed at `/api/tags`. Both frameworks are commonly run on
+   1234; the probe fails and discovery falls through, so the cost is a wasted
+   request rather than a wrong answer. Pinned by a dedicated test so the behaviour
+   cannot change silently.
+3. **`enabled_models` keeps whitespace-only ids.** Python guards with `not m`, and
+   `"  "` is truthy, so it survives and becomes an auto-pick candidate — an empty
+   model id in a request. Pinned rather than trimmed, pending a decision.
+4. **`normalize_base` must cut `len(suffix)`, not `len("/api" + suffix)`.** The
+   longer cut preserves the API root; the shorter one leaves a bare `…/` base with
+   the root gone. A LAN endpoint is what exposed it.
+
+Also corrected during the port, and worth stating because the task text was wrong:
+`_first_chat_model` matches **substring**, not prefix, and its skip list has **10**
+entries, not 8 — `embedding` and `reranker` were missing from the summary. The
+`models[0]` fallback is preserved deliberately: when every id is non-chat it returns
+the first rather than `None`, making it a best-effort pick rather than a filter.
 
 ---
 

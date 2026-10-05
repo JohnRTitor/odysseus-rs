@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 59 / 489 complete · 3 blocked · Phase 0 in progress
+**Status:** 72 / 489 complete · 3 blocked · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — **11 of 11 resolved** (S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11); 0 pending. Of those, **2 features were removed** (F169 remove-bg, S5 FAIL as published; F176 local diffusion, S9 scope decision) and **2 remain blocked or unverified**: F140 PDF rasterisation is licence-blocked (`mupdf` is AGPL-3.0, not on `deny.toml`; `poppler-rs` links GPL-2.0 libpoppler while reporting MIT), and S6 CUDA is unverified for want of a GPU.
 
@@ -122,7 +122,7 @@ is written.**
 
 ### 0.6 Leptos shell
 
-- [x] T0100 `odysseus-ui` crate with `ssr` + `hydrate` features; Tailwind wired — **partly.** `ssr`/`hydrate` features, Leptos deps actually in the lock (they were declared and unused, like T0005), the shell, `<Routes/>`, `leptos_meta` head tags, and the pre-paint script. 17 tests. **Tailwind is not wired** — see INCOMPLETE.md
+- [x] T0100 `odysseus-ui` crate with `ssr` + `hydrate` features; Tailwind wired — **complete.** `ssr`/`hydrate` features (deps actually resolved, unlike the declared-but-unused state T0005 found), the shell, `<Routes/>`, `leptos_meta` head tags, the pre-paint script, and Tailwind wired end to end: `cargo leptos build --frontend-only` exits 0 and emits `site/pkg/{odysseus-ui.css,.js,.wasm}`, served by `odysseus-web` and asserted by test. Node-free, per `REWRITE_PLAN.md:186` (D3). **The page is still visually bare** — the crate contains no utility classes, so the CSS is preflight plus the theme layer. See INCOMPLETE.md 2.4
 - [x] T0101 `<Routes/>` + shell route; `leptos_axum` handler — the server renders it. `render_app_to_stream_with_context` is called with the real `Request`, so `leptos_router` resolves the path from `req.uri()` and the per-request CSP nonce arrives as context. **Not** `leptos_routes`: its `app_fn`/`additional_context` are `'static` closures taking no arguments, so a per-request nonce cannot reach them without a task-local. Also installed as the router **fallback**, so an unknown *page* renders the Leptos NotFound route inside the real document; `/api/` misses deliberately stay a plain JSON 404, because handing an HTML document to a program turns a missing endpoint into a parse error. `NotFound` sets 404 through `ResponseOptions` — under `hydrate` that whole block is cfg'd out, since there is no server response to amend. Six tests drive the production router, not a fixture
 - [x] T0102 `leptos_meta` for title / favicon / `theme-color`, per-route — title, favicon, `theme-color` and `format-detection` via `leptos_meta`, with `provide_meta_context()` and the `id` hooks the pre-paint script queries
 - [x] T0103 **Pre-paint theme script** — sets CSS vars from `localStorage` before first paint. **Non-negotiable** — the script is extracted verbatim from `index.html:19-71` and `include_str!`d into `<head>`. A test asserts it derives **exactly** the same ten `--hl-*` variables as `theme.rs`, because the two are duplicates and a divergence would be invisible until a user reported wrong colours. Verified to fail when one `--hl-var is removed
@@ -157,11 +157,11 @@ is written.**
 **Goal:** create, list, read, update, archive, delete, export sessions. The first real
 vertical slice.
 
-- [ ] T0200 `odysseus-store/src/sessions.rs` — CRUD, `get_sessions_for_user`
-- [ ] T0201 Remove the unbounded metadata dict; bounded LRU cache over SQLite
-- [ ] T0202 Make `message_count` authoritative by construction — compute it in the insert transaction. **Return `Result`; stop swallowing write errors** (`session_manager.py:305-308`)
-- [ ] T0203 Drop the per-read `COUNT(*)` now that the drift cause is gone
-- [ ] T0204 `session_actions.rs`, `session_image_cleanup.rs`
+- [x] T0200 `odysseus-store/src/sessions.rs` — CRUD, `get_sessions_for_user`. Bounded LRU cache over SQLite (T0201); `message_count` computed inside the insert transaction and returned as `Result` with write errors propagated, never swallowed (T0202); no per-read `COUNT(*)` (T0203). **Reworked to be async**: the first version was fully synchronous and called an invented `crate::blocking::spawn_blocking_sync_generic`, which does not exist and would have blocked the executor (D11). Every DB-touching method now goes through `crate::blocking::with_conn`
+- [x] T0201 Remove the unbounded metadata dict; bounded LRU cache over SQLite — `SessionCache`; values are `Box<str>` per AGENTS.md §12.1 rule 1
+- [x] T0202 Make `message_count` authoritative by construction — compute it in the insert transaction. **Return `Result`; stop swallowing write errors** — done; this was the Python `session_manager.py:305` defect
+- [x] T0203 Drop the per-read `COUNT(*)` now that the drift cause is gone
+- [x] T0204 `session_actions.rs`, `session_image_cleanup.rs`
 - [ ] T0205 `sessions.rs` route module — 21 endpoints (`API_MIGRATION.md` §4.2)
 - [ ] T0206 `POST /api/sessions/save` → documented no-op returning 200
 - [ ] T0207 Export: md / txt / json / html, sanitised filename, `Content-Disposition: attachment`
@@ -183,14 +183,14 @@ vertical slice.
 
 ## Phase 2 — Models & endpoints
 
-- [ ] T0300 `model_endpoints` CRUD, owner-scoped, admin-gated
-- [ ] T0301 `api_key` column encrypted/decrypted
-- [ ] T0302 Provider detection — hostname-exact (`anthropic.com.example` must not match)
-- [ ] T0303 Model discovery: Ollama / LM Studio / llama.cpp / vLLAM
-- [ ] T0304 Host port-scan discovery
-- [ ] T0305 Model capability detection; LM Studio probe with 60 s TTL
-- [ ] T0306 Endpoint resolution + normalisation — one implementation, not four
-- [ ] T0307 `_first_chat_model` skips `text-embedding`, `tts-`, `whisper`, `dall-e`, `moderation`, `rerank`, `clip`, `stable-diffusion`
+- [x] T0300 `model_endpoints` CRUD, owner-scoped, admin-gated
+- [x] T0301 `api_key` column encrypted/decrypted
+- [x] T0302 Provider detection — hostname-exact (`anthropic.com.example` must not match)
+- [x] T0303 Model discovery: Ollama / LM Studio / llama.cpp / vLLAM
+- [x] T0304 Host port-scan discovery
+- [x] T0305 Model capability detection; LM Studio probe with 60 s TTL
+- [x] T0306 Endpoint resolution + normalisation — one implementation, not four
+- [x] T0307 `_first_chat_model` skips `text-embedding`, `tts-`, `whisper`, `dall-e`, `moderation`, `rerank`, `clip`, `stable-diffusion` — **two corrections to the task text**: matching is *substring*, not prefix, and the list has **10** entries, not 8 (`embedding` and `reranker` were missing). The `models[0]` fallback is preserved and pinned: when every id is non-chat it returns the first rather than `None`, so this is a best-effort pick, not a filter
 - [ ] T0308 Provider OAuth device flow — 3 providers × 3 routes; `device_code` stays server-side, browser gets only `poll_id`
 - [ ] T0309 Copilot headers (`x-initiator`, `Openai-Intent`, `Copilot-Integration-Id`)
 - [ ] T0310 ChatGPT subscription + PKCE + refresh (120 s skew)

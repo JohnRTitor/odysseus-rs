@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Odysseus">
+  <!--
+    Ported verbatim from the Python shell's inline favicon
+    (`static/index.html`: `rel="icon" type="image/svg+xml" href="data:image/svg+xml,..."`).
+
+    A served file rather than a data URI for one concrete reason: the page is served
+    under a CSP that does not grant `img-src data:`, so an inline data-URI icon would
+    be blocked exactly like any other disallowed source.
+
+    Lives in `static/`, not in cargo-leptos' `assets-dir`: that directory is deleted
+    and recreated on every build, so a committed asset placed there does not survive.
+  -->
+  <path d="M16 4L16 22L6 22Z" fill="#e06c75"/>
+  <path d="M16 8L16 22L24 22Z" fill="#e06c75" opacity="0.6"/>
+  <path d="M4 24Q10 20 16 24Q22 28 28 24" stroke="#e06c75" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+</svg>
