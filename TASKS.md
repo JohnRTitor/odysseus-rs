@@ -23,7 +23,7 @@ in the same commit that completes it.
 **Commit message format:** `<type>(<scope>): <summary> [T<NNNN>]`
 e.g. `feat(store): baseline migration from live sqlite_master [T0105]`
 
-**Status:** 79 / 489 complete · 4 blocked · Phase 0 in progress
+**Status:** 83 / 489 complete · 4 blocked · Phase 0 in progress
 
 **Spike outcomes:** see `SPIKE_RESULTS.md` — **11 of 11 resolved** (S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11); 0 pending. Of those, **2 features were removed** (F169 remove-bg, S5 FAIL as published; F176 local diffusion, S9 scope decision) and **2 remain blocked or unverified**: F140 PDF rasterisation is licence-blocked (`mupdf` is AGPL-3.0, not on `deny.toml`; `poppler-rs` links GPL-2.0 libpoppler while reporting MIT), and S6 CUDA is unverified for want of a GPU.
 
@@ -166,9 +166,9 @@ vertical slice.
 - [ ] T0206 `POST /api/sessions/save` → documented no-op returning 200
 - [ ] T0207 Export: md / txt / json / html, sanitised filename, `Content-Disposition: attachment`
 - [ ] T0208 `SessionManager.ensure_task_session`
-- [ ] T0209 `cleanup_empty_sessions` (auto-archive 30 d, min age 1 h)
-- [ ] T0210 FTS5 message search; LIKE fallback when FTS5 is absent
-- [ ] T0211 `_parse_msg_content` JSON heuristic ported **exactly** — a string that *looks* like JSON must stay a string
+- [x] T0209 `cleanup_empty_sessions` (auto-archive 30 d, min age 1 h) — `session_cleanup.rs`. `classify` is a pure function of the row, the policy and an injected `now`, so the sweep is testable without a clock. The nullable columns are read as `Option<f64>` and **not** coalesced: `COALESCE(last_accessed, 0)` makes a never-accessed row look infinitely stale, and it is compared against a cutoff — the same class of bug as the `last_accessed` NULL one found earlier in T0200. Guard order matches the Python's `elif` chain, so a NULL `last_accessed` short-circuits to "keep" exactly as the truthiness check does. 12 integration + 16 unit tests, including both cutoff boundaries (29 d 23 h keeps, 30 d 1 h archives) and a NULL `created_at`
+- [x] T0210 FTS5 message search; LIKE fallback when FTS5 is absent — `session_search.rs`. Availability is a **runtime probe, never a `cfg`**, and `SessionSearch::like_only` drives the fallback in tests, because a fallback nobody exercises is a fallback that is broken; the bundled SQLite has FTS5, so without that constructor the `LIKE` path would be unreachable. `_sanitize_fts_query` is hand-rolled from the Python regex `"([^"]+)"|[\w][\w._-]*` — six characters of grammar, not worth a `regex` dependency (AGENTS.md §12.3) — and an unterminated quote is dropped rather than swallowing the rest. `LIKE` escapes `\`, `%` and `_` with an explicit `ESCAPE`, since a search box is attacker-controlled. 17 tests
+- [x] T0211 `_parse_msg_content` JSON heuristic ported **exactly** — a string that *looks* like JSON must stay a string. Both cheap guards (`[{` prefix, `"type"` with its quotes) run before any parse; the parse target is `Vec<Value>` so a valid JSON *object* is rejected the way Python's `isinstance(parsed, list)` rejects it; and every element must be an object whose `type` is one of the 8 recognised block kinds. 13 tests covering the case the task warns about — an array with one good and one bad element, i.e. a user pasting an API schema. **Verified by mutation**: relaxing the block-type check to "any object" fails exactly three tests, including that one
 - [ ] T0212 Leptos session list, SSR + hydration
 - [ ] T0213 Session create/rename/archive/delete/favorite UI
 - [ ] T0214 History paging: 8 mobile / 24 desktop; `HISTORY_DISPLAY_CHAR_LIMIT = 160000`, tail 20000
@@ -177,7 +177,7 @@ vertical slice.
 - [ ] T0217 Session folders, max 5 visible, `SIDEBAR_MAX_VISIBLE = 10`
 - [ ] T0218 **TEST: create → read back exact values; owner isolation; auth denial**
 - [ ] T0219 **TEST: SSR list renders real sessions from a real DB**
-- [ ] T0220 **TEST: FTS index contains no base64 media** — `test_sqlite_base64_media` sibling
+- [x] T0220 **TEST: FTS index contains no base64 media** — `test_sqlite_base64_media` sibling. Asserts against **the index, not the row**: the row keeping a pasted image is correct and expected, the index keeping it is the defect — the index is scanned on every keystroke, replicated into the WAL, and copied by every backup. 6 tests, including that an UPDATE introducing media is re-scrubbed and that deleting a message removes its index entry
 
 ---
 
