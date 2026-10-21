@@ -592,3 +592,236 @@ async fn limit_and_context_are_clamped_to_the_python_bounds() -> Result<(), Box<
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// The FTS/LIKE merge
+// ---------------------------------------------------------------------------
+//
+// The Python does not prefer one search over the other: it runs both and merges
+// them (`session_search.py:326-356`), FTS hits first, then LIKE hits, first
+// occurrence of a `message_id` winning. This matters because the two searches
+// do not find the same rows — FTS matches whole words, LIKE matches
+// substrings — so the merged list is a strict superset of either.
+
+/// A substring that only `LIKE` can find must still be returned.
+#[tokio::test]
+async fn a_substring_only_like_can_find_is_still_returned() -> Result<(), Box<dyn Error>> {
+    let (_dir, store) = store()?;
+    let sessions = SessionStore::new(store.clone());
+    add_session(&sessions, "s1", "Chat", "alice", false).await?;
+    // "jazzer" contains "jazz" but is not a whole-word match.
+    add_message(&sessions, "s1", "m1", "user", "the jazzer played", 0.0).await?;
+    add_message(&sessions, "s1", "m2", "user", "modal jazz theory", 60.0).await?;
+
+    let hits = SessionSearch::new(store.clone())
+        .search("jazz", &options())
+        .await?;
+    let ids: Vec<&str> = hits.iter().map(|h| h.message_id.as_str()).collect();
+
+    assert!(
+        ids.contains(&"m1"),
+        "the LIKE match for 'jazzer' must survive the merge: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"m2"),
+        "the FTS match for 'modal jazz theory' must be present: {ids:?}"
+    );
+    Ok(())
+}
+
+/// The FTS hit comes first, because the Python chains `[fts, like]`.
+#[tokio::test]
+async fn fts_hits_are_ordered_before_like_hits() -> Result<(), Box<dyn Error>> {
+    let (_dir, store) = store()?;
+    let sessions = SessionStore::new(store.clone());
+    add_session(&sessions, "s1", "Chat", "alice", false).await?;
+    // m2 is the word-boundary match; m1 is the substring match.
+    add_message(&sessions, "s1", "m1", "user", "jazzer", 0.0).await?;
+    add_message(&sessions, "s1", "m2", "user", "jazz", 60.0).await?;
+
+    let hits = SessionSearch::new(store).search("jazz", &options()).await?;
+    let ids: Vec<&str> = hits.iter().map(|h| h.message_id.as_str()).collect();
+
+    assert_eq!(ids, vec!["m2", "m1"], "FTS hits precede LIKE hits");
+    Ok(())
+}
+
+/// A message found by both searches appears once.
+#[tokio::test]
+async fn a_message_found_by_both_searches_appears_once() -> Result<(), Box<dyn Error>> {
+    let (_dir, store) = store()?;
+    let sessions = SessionStore::new(store.clone());
+    add_session(&sessions, "s1", "Chat", "alice", false).await?;
+    add_message(&sessions, "s1", "m1", "user", "modal jazz", 0.0).await?;
+
+    let hits = SessionSearch::new(store).search("jazz", &options()).await?;
+    let ids: Vec<&str> = hits.iter().map(|h| h.message_id.as_str()).collect();
+    assert_eq!(ids, vec!["m1"], "the merge must deduplicate by message_id");
+    Ok(())
+}
+
+/// The merged list is capped at `limit`, counting both sources.
+#[tokio::test]
+async fn the_merged_list_respects_the_limit() -> Result<(), Box<dyn Error>> {
+    let (_dir, store) = store()?;
+    let sessions = SessionStore::new(store.clone());
+    add_session(&sessions, "s1", "Chat", "alice", false).await?;
+    // Two word-boundary matches and two substring matches.
+    add_message(&sessions, "s1", "m1", "user", "jazz one", 0.0).await?;
+    add_message(&sessions, "s1", "m2", "user", "jazz two", 60.0).await?;
+    add_message(&sessions, "s1", "m3", "user", "jazzer three", 120.0).await?;
+    add_message(&sessions, "s1", "m4", "user", "jazzy four", 180.0).await?;
+
+    let hits = SessionSearch::new(store)
+        .search(
+            "jazz",
+            &SearchOptions {
+                limit: 3,
+                ..options()
+            },
+        )
+        .await?;
+    assert_eq!(hits.len(), 3, "the cap applies to the merged list");
+    Ok(())
+}
+
+/// The merge must not weaken the filters: a LIKE-only match must still respect
+/// the owner and role filters.
+#[tokio::test]
+async fn the_merge_does_not_weaken_the_filters() -> Result<(), Box<dyn Error>> {
+    let (_dir, store) = store()?;
+    let sessions = SessionStore::new(store.clone());
+    add_session(&sessions, "mine", "Mine", "alice", false).await?;
+    add_session(&sessions, "theirs", "Theirs", "bob", false).await?;
+    add_message(&sessions, "mine", "m1", "user", "jazzer here", 0.0).await?;
+    add_message(&sessions, "theirs", "m2", "user", "jazzer here", 60.0).await?;
+
+    let hits = SessionSearch::new(store)
+        .search(
+            "jazz",
+            &SearchOptions {
+                owner: Some("alice".to_string()),
+                restrict_owner: true,
+                ..options()
+            },
+        )
+        .await?;
+    let ids: Vec<&str> = hits.iter().map(|h| h.message_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["m1"],
+        "the LIKE branch of the merge must apply the owner filter too"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Two known gaps, pinned so they cannot be forgotten
+// ---------------------------------------------------------------------------
+
+/// **Gap 1 — the index is not backfilled for rows that predate it.**
+///
+/// The Python's `_migrate_chat_messages_fts` backfills every existing
+/// `chat_messages` row into the index (`database.py:2243-2251`) and then scrubs
+/// legacy index rows that already hold inline media
+/// (`_scrub_legacy_chat_message_fts_media`, `database.py:2262-2291`).
+///
+/// The Rust baseline creates the table and the triggers but does **not**
+/// backfill, and does not scrub.
+///
+/// The trigger fires on every INSERT, so for a *fresh* Rust database the index
+/// is always complete. A row can only miss it if it was inserted **before the
+/// trigger existed** — that is, in a database adopted from the Python
+/// implementation. This test builds exactly that state: the message row is
+/// written first, and the trigger is created afterwards.
+///
+/// This is currently **latent, not live**: the baseline uses no
+/// `IF NOT EXISTS`, so `migrate()` fails outright on a Python-era database
+/// ("table `chat_messages` already exists"), and the Rust store therefore never
+/// opens one. The moment an adoption path is added, this gap becomes live and
+/// the backfill must be added with it.
+///
+/// The LIKE branch still finds such a message, so the merge keeps it
+/// reachable — which is the other reason the merge matters.
+#[tokio::test]
+async fn a_message_predating_the_trigger_is_only_reachable_through_like()
+-> Result<(), Box<dyn Error>> {
+    let (_dir, store) = store()?;
+    let sessions = SessionStore::new(store.clone());
+    add_session(&sessions, "s1", "Chat", "alice", false).await?;
+
+    // Write the message first, then drop the insert trigger, so the row exists
+    // with no index entry — the state an adopted Python database is in.
+    let conn = store.connect()?;
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS chat_messages_fts_ai;
+         INSERT INTO chat_messages (id, session_id, role, content, metadata, timestamp)
+         VALUES ('m1', 's1', 'user', 'an orphaned needle', NULL, 1.0);
+         CREATE TRIGGER chat_messages_fts_ai
+         AFTER INSERT ON chat_messages BEGIN
+             INSERT INTO chat_messages_fts(content, message_id, session_id, role)
+             VALUES (CASE WHEN instr(COALESCE(new.content, ''), ';base64,') > 0 OR instr(COALESCE(new.content, ''), 'data:image/') > 0 OR instr(COALESCE(new.content, ''), 'data:audio/') > 0 THEN '[inline media omitted from search index]' ELSE COALESCE(new.content, '') END, new.id, new.session_id, new.role);
+         END;",
+    )?;
+    drop(conn);
+
+    let conn = store.connect()?;
+    let fts_rows: i64 = conn.query_row(
+        "SELECT count(*) FROM chat_messages_fts WHERE message_id = 'm1'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(fts_rows, 0, "precondition: the row is not in the index");
+
+    // The merged search still finds it, through the LIKE branch.
+    let hits = SessionSearch::new(store)
+        .search("needle", &options())
+        .await?;
+    assert_eq!(
+        hits.len(),
+        1,
+        "the LIKE branch of the merge is what keeps an unindexed row reachable"
+    );
+    assert_eq!(hits[0].message_id, "m1");
+    Ok(())
+}
+
+/// **Gap 2 — a legacy index row holding inline media is not scrubbed.**
+///
+/// The Python's `_scrub_legacy_chat_message_fts_media` replaces already-indexed
+/// rows that contain inline media with searchable text
+/// (`database.py:2262-2291`). The Rust side has no equivalent, because the
+/// baseline's triggers only scrub rows as they are written.
+///
+/// The consequence: a database that already has media in the index keeps it.
+/// That is the exact defect T0220 exists to prevent, so it is pinned here as a
+/// known gap rather than left to be discovered.
+#[tokio::test]
+async fn a_legacy_index_row_with_media_is_not_scrubbed() -> Result<(), Box<dyn Error>> {
+    let (_dir, store) = store()?;
+    let sessions = SessionStore::new(store.clone());
+    add_session(&sessions, "s1", "Chat", "alice", false).await?;
+
+    // Write a media-bearing row straight into the index, the way a pre-scrub
+    // Python database would contain one.
+    let conn = store.connect()?;
+    conn.execute(
+        "INSERT INTO chat_messages_fts (content, message_id, session_id, role)
+         VALUES ('data:image/png;base64,AAAA', 'm1', 's1', 'user')",
+        [],
+    )?;
+    drop(conn);
+
+    let conn = store.connect()?;
+    let indexed: String = conn.query_row(
+        "SELECT content FROM chat_messages_fts WHERE message_id = 'm1'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(
+        indexed.contains("base64"),
+        "precondition: the legacy index row must still hold the payload, \
+         which is exactly the gap"
+    );
+    Ok(())
+}

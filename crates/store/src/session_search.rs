@@ -244,9 +244,37 @@ pub fn search_blocking(
     if mode == FtsMode::Auto && fts_available(conn) {
         // Any FTS error falls through to LIKE, as in the Python's
         // `except Exception: return None` (`session_search.py:281-283`).
-        if let Some(hits) = search_fts(conn, query, &clamped)? {
-            return Ok(hits);
+        //
+        // `None` also means "no hits", not merely "failed" — the Python returns
+        // `None` for an empty result set too (`session_search.py:285-286`).
+        let Some(fts_hits) = search_fts(conn, query, &clamped)? else {
+            return search_like(conn, query, &clamped);
+        };
+
+        // The Python *merges* the two result sets rather than preferring one
+        // (`session_search.py:326-356`): FTS hits first, then LIKE hits, with
+        // the first occurrence of a `message_id` winning, and the list cut at
+        // `limit`.
+        //
+        // This matters because the two searches do not find the same rows. FTS
+        // matches whole *words*; `LIKE` matches substrings. "modal jazz" finds
+        // "modal jazz theory" through the index but also "jazzy" through LIKE,
+        // and a message containing "jazzer" is reachable only by LIKE. The
+        // merged list is strictly a superset of either alone.
+        let like_hits = search_like(conn, query, &clamped)?;
+
+        let mut merged: Vec<SessionSearchResult> = Vec::with_capacity(clamped.limit);
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for result in fts_hits.iter().chain(like_hits.iter()) {
+            if !seen.insert(result.message_id.as_str()) {
+                continue;
+            }
+            merged.push(result.clone());
+            if merged.len() >= clamped.limit {
+                break;
+            }
         }
+        return Ok(merged);
     }
     search_like(conn, query, &clamped)
 }
@@ -451,6 +479,14 @@ fn search_fts(
             snip
         };
         out.push(finish_hit(conn, hit, &excerpt, options)?);
+    }
+    // The Python returns `None` for an empty hit set, not an empty list
+    // (`session_search.py:285-286`). The caller then falls back to `LIKE`,
+    // which is what makes a substring match reachable when the index has no
+    // word-boundary hit. Returning `Some(vec![])` here would silently drop
+    // every LIKE-only match.
+    if out.is_empty() {
+        return Ok(None);
     }
     Ok(Some(out))
 }
