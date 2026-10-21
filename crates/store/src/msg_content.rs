@@ -293,6 +293,24 @@ mod tests {
         assert!(!parse_msg_content("[]").is_blocks());
     }
 
+    /// The `[{` prefix guard is a *pre-filter*, not a semantic rule.
+    ///
+    /// It is implied by the block check — if every element is an object with a
+    /// `type` key then the text necessarily starts with `[{` — so dropping it
+    /// changes no outcome. What it does change is the work done: without it,
+    /// text that merely contains `"type"` is handed to the JSON parser, and
+    /// that is the expensive path. This test pins the *observable* part, which
+    /// is that such text is still returned as a string.
+    #[test]
+    fn the_prefix_guard_is_only_a_pre_filter() {
+        // Starts with `[` but not `[{`, contains `"type"`, and is not valid
+        // JSON. It must come back as the original string.
+        let raw = r#"[ "type": "text" "#;
+        assert!(!raw.starts_with(super::STRUCTURED_PREFIX));
+        assert!(raw.contains(super::TYPE_KEY));
+        assert_eq!(parse_msg_content(raw), MsgContent::Text(raw.into()));
+    }
+
     #[test]
     fn plain_prose_is_untouched() {
         for raw in ["", "hello", "a { b } c", "  ", "[not json"] {
